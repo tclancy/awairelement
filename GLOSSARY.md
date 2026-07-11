@@ -29,6 +29,7 @@ same PR that lands the code.
 - **series** — A bucketed time-window of readings for the dashboard, produced by `awair.series.bucket(points, bucket_seconds)`. **Not** a synonym for `metric_history` (which returns raw points).
 - **spike** — An event triggered by threshold + hysteresis logic in `awair.spikes`; distinct from a **stale device**, which is the health-check equivalent handled by `monitor` + `DeviceHealth`.
 - **suppressor** — A metric that *blocks* fan mitigation rather than triggering it. PM2.5 is the current sole suppressor (fans re-suspend particulate); an elevated pm25 forces fans off regardless of co2/voc.
+- **TEMPERATURE_UNIT** — Environment variable that flips the display unit for temperature. Accepts `C` (default), `F`, or `K`. Read by `awair.units.get_temperature_unit`; storage in the `readings` table is always Celsius.
 
 ## Related decisions
 

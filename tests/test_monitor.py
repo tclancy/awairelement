@@ -12,6 +12,13 @@ from awair import db
 from awair.monitor import DeviceHealth, check_metrics
 from tests._helpers import FakeNotifier
 
+
+@pytest.fixture(autouse=True)
+def default_celsius(monkeypatch):
+    """Isolate each test from any inherited TEMPERATURE_UNIT override."""
+    monkeypatch.delenv("TEMPERATURE_UNIT", raising=False)
+
+
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
 
 
@@ -101,3 +108,21 @@ def test_mixed_statuses_do_not_trip():
     for _ in range(20):  # alternating: never 10 consecutive of one kind
         assert health.observe("error") is None
         assert health.observe("inserted") is None
+
+
+# --- notification value formatting under TEMPERATURE_UNIT ---
+
+
+def test_notification_format_non_temp_metric_ignores_unit():
+    from awair.monitor import _fmt
+
+    assert _fmt("co2", 1400.0, "F") == "1400"
+    assert _fmt("co2", 1400.0, "C") == "1400"
+
+
+def test_notification_format_temp_converts_and_suffixes():
+    from awair.monitor import _fmt
+
+    assert _fmt("temp", 22.5, "C") == "22.5°C"
+    assert _fmt("temp", 22.5, "F") == "72.5°F"
+    assert _fmt("temp", 0.0, "K") == "273.15K"
