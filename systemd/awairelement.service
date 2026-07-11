@@ -1,0 +1,20 @@
+# Dev reference copy — the canonical unit is templated by the native-apps
+# Ansible role in the homelab repo (awairelement.service.j2). The unit name
+# matches the app name per itguy's systemd-shape convention, so
+# `itguy deploy|status|logs awairelement` resolve it.
+# Manual install (non-Ansible boxes):
+#   ln -sf ~/sources/awairelement/systemd/awairelement.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now awairelement
+[Unit]
+Description=Awair Element air quality poller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/sources/awairelement
+ExecStart=%h/sources/awairelement/.venv/bin/python -m awair.poller
+EnvironmentFile=-%h/.config/awairelement/environment
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
