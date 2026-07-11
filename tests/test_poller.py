@@ -9,9 +9,7 @@ import pytest
 from awair import db
 from awair.poller import parse_reading, poll_once
 
-FIXTURE_TEXT = (
-    Path(__file__).parent / "fixtures" / "air_data_latest.json"
-).read_text()
+FIXTURE_TEXT = (Path(__file__).parent / "fixtures" / "air_data_latest.json").read_text()
 FIXTURE = json.loads(FIXTURE_TEXT)
 
 RECEIVED = "2026-07-11T01:24:20+00:00"

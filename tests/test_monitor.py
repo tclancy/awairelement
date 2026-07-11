@@ -39,8 +39,7 @@ def seed(conn, co2_values, end=NOW):
         ts = end - timedelta(seconds=30 * (n - 1 - i))
         rows.append((iso_z(ts), iso_z(ts), co2, 100, 3.0))
     conn.executemany(
-        "INSERT INTO readings (ts, received_at, co2, voc, pm25)"
-        " VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO readings (ts, received_at, co2, voc, pm25) VALUES (?, ?, ?, ?, ?)",
         rows,
     )
     conn.commit()
@@ -81,7 +80,9 @@ def test_recovery_closes_event_and_sends_cleared(conn):
 
     assert db.get_open_events(conn) == {}
     assert len(notifier.sent) == 2
-    assert "clear" in notifier.sent[1][0].lower() or "clear" in notifier.sent[1][1].lower()
+    assert (
+        "clear" in notifier.sent[1][0].lower() or "clear" in notifier.sent[1][1].lower()
+    )
 
 
 # --- device health: unreachable and stale ---

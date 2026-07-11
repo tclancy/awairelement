@@ -34,11 +34,22 @@ CREATE TABLE IF NOT EXISTS alert_events (
 """
 
 READING_COLUMNS = (
-    "ts", "received_at",
-    "score", "temp", "humid", "abs_humid", "dew_point",
-    "co2", "co2_est", "co2_est_baseline",
-    "voc", "voc_baseline", "voc_h2_raw", "voc_ethanol_raw",
-    "pm25", "pm10_est",
+    "ts",
+    "received_at",
+    "score",
+    "temp",
+    "humid",
+    "abs_humid",
+    "dew_point",
+    "co2",
+    "co2_est",
+    "co2_est_baseline",
+    "voc",
+    "voc_baseline",
+    "voc_h2_raw",
+    "voc_ethanol_raw",
+    "pm25",
+    "pm10_est",
 )
 
 
@@ -88,9 +99,7 @@ def readings_since(conn, columns, since) -> list:
         f"SELECT ts, {', '.join(columns)} FROM readings WHERE ts >= ? ORDER BY ts",
         (iso_z(since),),
     )
-    return [
-        (datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows
-    ]
+    return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
 
 def events_since(conn, since) -> list:
@@ -140,12 +149,22 @@ def get_open_events(conn) -> dict:
     }
 
 
-def open_event(conn, metric, tier, opened_at, value, baseline, threshold, notified) -> int:
+def open_event(
+    conn, metric, tier, opened_at, value, baseline, threshold, notified
+) -> int:
     cursor = conn.execute(
         "INSERT INTO alert_events"
         " (metric, tier, opened_at, peak_value, baseline, threshold, open_notified)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (metric, tier, opened_at.isoformat(), value, baseline, threshold, int(notified)),
+        (
+            metric,
+            tier,
+            opened_at.isoformat(),
+            value,
+            baseline,
+            threshold,
+            int(notified),
+        ),
     )
     conn.commit()
     return cursor.lastrowid
