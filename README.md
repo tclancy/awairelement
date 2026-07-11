@@ -120,6 +120,11 @@ systemctl --user enable --now awairelement awairelement-web
 journalctl --user -u awairelement -f       # follow poller logs
 ```
 
+Config (environment): `AWAIR_URL` (default `http://192.168.68.51/air-data/latest`),
+`AWAIR_DB` (default `~/data/awairelement/awair.db`), `AWAIR_POLL_SECONDS` (default 30),
+`TEMPERATURE_UNIT` (default `C`, also accepts `F` and `K`; display-only — storage
+stays Celsius).
+
 If your checkout isn't at `~/sources/awairelement`, edit `WorkingDirectory=`
 and `ExecStart=` in each unit before symlinking.
 

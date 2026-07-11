@@ -3,7 +3,7 @@
 import logging
 from datetime import timedelta
 
-from awair import db
+from awair import db, units
 from awair.spikes import METRICS, evaluate
 
 log = logging.getLogger("awair.monitor")
@@ -12,10 +12,23 @@ PRIORITY = {"ceiling": "high", "relative": "default"}
 HISTORY_WINDOW = timedelta(hours=24)
 
 
+def _fmt(name, value, temp_unit):
+    """Format a metric value for a notification message.
+
+    Temp values are converted to the configured display unit and suffixed
+    with the symbol; all other metrics render as `%g` unchanged.
+    """
+    if name == "temp":
+        converted = units.from_celsius(value, temp_unit)
+        return f"{converted:g}{units.symbol(temp_unit)}"
+    return f"{value:g}"
+
+
 def check_metrics(conn, notifier, now):
     """Run detection for every metric; persist and notify on decisions."""
     open_events = db.get_open_events(conn)
     since = now - HISTORY_WINDOW
+    temp_unit = units.get_temperature_unit()
     for name, cfg in METRICS.items():
         history = db.metric_history(conn, name, since)
         event = open_events.get(name)
@@ -27,8 +40,9 @@ def check_metrics(conn, notifier, now):
         log.info("%s: %s (%s)", name, decision.action, decision.tier)
         if decision.action == "open":
             notified = notifier.send(
-                f"{name.upper()} at {decision.value:g}"
-                f" (baseline {decision.baseline:g}, threshold {decision.threshold:g})",
+                f"{name.upper()} at {_fmt(name, decision.value, temp_unit)}"
+                f" (baseline {_fmt(name, decision.baseline, temp_unit)},"
+                f" threshold {_fmt(name, decision.threshold, temp_unit)})",
                 title=f"{name.upper()} spike",
                 priority=PRIORITY[decision.tier],
             )
@@ -44,14 +58,15 @@ def check_metrics(conn, notifier, now):
             )
         elif decision.action == "close":
             notified = notifier.send(
-                f"{name.upper()} back to {decision.value:g}",
+                f"{name.upper()} back to {_fmt(name, decision.value, temp_unit)}",
                 title=f"{name.upper()} cleared",
             )
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
         elif decision.action == "renotify":
             notifier.send(
-                f"{name.upper()} still elevated at {decision.value:g}"
-                f" (peak {event['peak_value']:g})",
+                f"{name.upper()} still elevated at"
+                f" {_fmt(name, decision.value, temp_unit)}"
+                f" (peak {_fmt(name, event['peak_value'], temp_unit)})",
                 title=f"{name.upper()} still elevated",
             )
             db.mark_renotified(conn, event["id"], now)

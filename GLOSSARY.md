@@ -21,6 +21,7 @@ same PR that lands the code.
 - **reading** — One row in the `readings` table; produced by `poller.parse_reading(payload, received_at)`.
 - **series** — A bucketed time-window of readings for the dashboard, produced by `awair.series.bucket(points, bucket_seconds)`. **Not** a synonym for `metric_history` (which returns raw points).
 - **spike** — An event triggered by threshold + hysteresis logic in `awair.spikes`; distinct from a **stale device**, which is the health-check equivalent handled by `monitor` + `DeviceHealth`.
+- **TEMPERATURE_UNIT** — Environment variable that flips the display unit for temperature. Accepts `C` (default), `F`, or `K`. Read by `awair.units.get_temperature_unit`; storage in the `readings` table is always Celsius.
 
 ## Related decisions
 
