@@ -3,7 +3,8 @@
 Continuous local logging of the Awair Element air quality monitor, spike alerting
 via ntfy, and a small dashboard for spotting trends in CO2, TVOC, and PM2.5.
 
-**Status:** DRAFT v2 (post-review) — awaiting Tom's sign-off
+**Status:** v3 — decisions resolved (lightweight stack, LAN-only, hall placement,
+dedicated ntfy topic); awaiting final sign-off before slice 1
 **Last updated:** 2026-07-10
 
 ## Goals
@@ -44,33 +45,42 @@ via ntfy, and a small dashboard for spotting trends in CO2, TVOC, and PM2.5.
 
 ## Architecture
 
-Django project, one app (`readings`). Django is Tom's default and earns its keep
-here: the poller runs as a management command sharing the ORM with the dashboard,
-and the Django admin gives free browsing/filtering of raw readings.
+No framework for the core. The poller is a single stdlib-only script (`urllib`,
+`sqlite3`, `json` — zero dependencies); the dashboard is a small Flask app (the
+only runtime deps in the project: `flask` + `gunicorn`). Django was considered
+and rejected as overkill — no auth, no forms, no admin need (ad-hoc browsing of a
+SQLite file is what `sqlite3`/Datasette are for).
 
 ```
 awairelement/  (this repo)
 ├── SCOPE.md
-├── pyproject.toml            # uv-managed
-├── manage.py
-├── awairelement/             # Django project (settings, urls, wsgi)
-└── readings/
-    ├── models.py             # Reading, AlertEvent
-    ├── management/commands/poll_awair.py   # the 30s poller loop
-    ├── spikes.py             # baseline + detection logic (pure functions, unit-tested)
-    ├── alerts.py             # ntfy client (pure-ish, unit-tested with mocked HTTP)
-    ├── views.py              # dashboard + JSON series endpoints
-    └── templates/readings/dashboard.html
+├── pyproject.toml            # uv-managed; deps: flask, gunicorn only
+├── restart.sh                # uv sync --frozen, restart both units
+├── awair/
+│   ├── db.py                 # connection + PRAGMAs + idempotent schema bootstrap
+│   ├── spikes.py             # baseline + detection logic (pure functions, unit-tested)
+│   ├── alerts.py             # ntfy client (unit-tested with mocked HTTP)
+│   ├── poller.py             # the 30s loop: fetch → store → detect → alert
+│   └── web.py                # Flask app: dashboard page + JSON series/events endpoints
+├── templates/dashboard.html
+├── static/                   # vendored chart lib (single file)
+├── systemd/                  # unit files (dev reference; Ansible template is canonical)
+└── tests/
 ```
+
+Schema lives in `db.py` as idempotent `CREATE TABLE IF NOT EXISTS` statements run
+at startup by both processes; future schema changes are small hand-rolled
+migrations gated on `PRAGMA user_version`. No ORM.
 
 Two long-running processes on homelab, both systemd **user** units
 (`systemctl --user`, sandy pattern):
 
-- `awair-poller.service` — `manage.py poll_awair`: fetch → store → detect → alert,
-  loop with a 30s sleep. A persistent process rather than cron: consecutive-failure
-  tracking stays trivial and we avoid 2,880 process spawns/day. All detection
-  state is DB-backed (see Spike Detection), so restarts are safe by construction.
-- `awair-web.service` — gunicorn serving the dashboard on a LAN port.
+- `awair-poller.service` — `python -m awair.poller`: fetch → store → detect →
+  alert, loop with a 30s sleep. A persistent process rather than cron because
+  cron's floor is 1 minute (can't do 30s), consecutive-failure tracking stays
+  trivial, and we avoid 2,880 process spawns/day. All detection state is
+  DB-backed (see Spike Detection), so restarts are safe by construction.
+- `awair-web.service` — gunicorn serving the Flask dashboard on a LAN port.
 
 `Restart=always` on both units covers crashes. All timestamps stored in UTC.
 SQLite runs in **WAL mode with a busy_timeout** (set via connection PRAGMAs in
@@ -83,8 +93,8 @@ request must never stall the poll loop.
 ## Data Model
 
 ```sql
--- Reading: one row per poll, all fields the device gives us
-CREATE TABLE readings_reading (
+-- readings: one row per poll, all fields the device gives us
+CREATE TABLE readings (
     id INTEGER PRIMARY KEY,
     ts TIMESTAMP NOT NULL,              -- device timestamp, UTC
     received_at TIMESTAMP NOT NULL,     -- server clock, UTC; exposes staleness & clock skew
@@ -93,11 +103,11 @@ CREATE TABLE readings_reading (
     voc INTEGER, voc_baseline INTEGER, voc_h2_raw INTEGER, voc_ethanol_raw INTEGER,
     pm25 REAL, pm10_est INTEGER
 );
-CREATE UNIQUE INDEX ON readings_reading (ts);   -- device ts; dedupes double-polls
+CREATE UNIQUE INDEX ON readings (ts);   -- device ts; dedupes double-polls
 
--- AlertEvent: ONE ROW PER EVENT (not per notification) — restart-safe and
+-- alert_events: ONE ROW PER EVENT (not per notification) — restart-safe and
 -- directly queryable for "currently open?" and dashboard overlays
-CREATE TABLE readings_alertevent (
+CREATE TABLE alert_events (
     id INTEGER PRIMARY KEY,
     metric TEXT NOT NULL,               -- co2 | voc | pm25 | device
     tier TEXT NOT NULL,                 -- relative | ceiling | unreachable | stale
@@ -110,7 +120,7 @@ CREATE TABLE readings_alertevent (
 );
 ```
 
-(Expressed as Django models; SQL shown for clarity.) The unique `ts` index is the
+The unique `ts` index is the
 idempotency guard: the device only updates every ~10s, so a 30s poll can
 occasionally see a repeated device timestamp — colliding inserts are skipped.
 A dup-skip **pauses** (does not reset) the consecutive-poll counters below.
@@ -137,8 +147,9 @@ Per metric (CO2, TVOC, PM2.5):
   polls (start K=6, M=4 ≈ two minutes sustained — tune with real data).
 - **Tier 2 — absolute ceiling:** value over the ceiling for **2 consecutive polls**
   (~1 min; never a single sample — optical PM sensors blip). Ceilings:
-  CO2 1200 ppm, TVOC 1000 ppb, PM2.5 35 µg/m³. The CO2 ceiling assumes the device
-  is NOT in an occupied bedroom overnight — see Decisions.
+  CO2 1200 ppm, TVOC 1000 ppb, PM2.5 35 µg/m³. The device sits in an open hall
+  above the living room (not an occupied bedroom), so 1200 ppm is a sane starting
+  ceiling; it's a tunable if whole-house evening occupancy proves to trip it.
 - **Close condition (hysteresis):** an open event closes only when the value is
   **both** below baseline + (K/2) × spread **and** below the ceiling, sustained
   for 10 minutes. One "spike" notification at open, one "cleared" at close.
@@ -160,10 +171,10 @@ events. Detection stays simple (relative-to-recent-median absorbs slow drift; th
 
 ## Alerts
 
-- ntfy POST with token from the environment (systemd `EnvironmentFile`, sourced
-  from Ansible vault — never committed). Topic: see Decisions (dedicated `/awair`
-  topic proposed so air-quality alerts don't share a phone channel/sound with
-  Claude task notifications).
+- ntfy POST to the dedicated **`awair` topic** on notifications.tomclancy.info
+  (Tom is creating it), so air-quality alerts get their own phone channel/sound
+  separate from Claude task notifications. Token from the environment (systemd
+  `EnvironmentFile`, sourced from Ansible vault — never committed).
 - Message includes metric, value, baseline, and a link to the dashboard.
 - Priority: default for tier-1 spikes; high for tier-2 ceilings and
   unreachable/stale.
@@ -172,7 +183,7 @@ events. Detection stays simple (relative-to-recent-median absorbs slow drift; th
 
 ## Dashboard
 
-Single page, no login (LAN-only), served by Django + one JSON endpoint per range.
+Single page, no login (LAN-only), served by Flask + one JSON endpoint per range.
 
 - Range toggle: **7 days** / **30 days**. Charts render in **browser-local time**
   (storage stays UTC).
@@ -191,10 +202,11 @@ Single page, no login (LAN-only), served by Django + one JSON endpoint per range
 Native-daemon pattern (sandy/estimatedtaxes precedent), NOT an itguy docker app:
 
 - Clone at `/home/tom/sources/awairelement` on homelab.
-- `restart.sh` in-repo: `uv sync --frozen`, run migrations, restart both units.
+- `restart.sh` in-repo: `uv sync --frozen`, restart both units (schema bootstrap
+  is idempotent and runs at process startup — no separate migrate step).
 - Systemd user units + env file templated by the `native-apps` Ansible role in the
-  homelab repo (same as `sandy.service.j2`). Secrets (ntfy token,
-  `DJANGO_SECRET_KEY`) via Ansible vault → env file.
+  homelab repo (same as `sandy.service.j2`). The only secret is the ntfy token,
+  via Ansible vault → env file.
 - Update flow: `ssh tom@192.168.68.67 'cd ~/sources/awairelement && git pull && ./restart.sh'`.
 - SQLite DB lives outside the repo checkout (e.g. `~/data/awairelement/awair.db`)
   so a re-clone never touches data.
@@ -211,30 +223,28 @@ Native-daemon pattern (sandy/estimatedtaxes precedent), NOT an itguy docker app:
 - Poller parsing tested against a captured real JSON response (fixture recorded
   from 192.168.68.51 at build time).
 - ntfy client tested with mocked HTTP (mock at the library boundary).
-- Dashboard endpoints: Django test client against seeded readings.
+- Dashboard endpoints: Flask test client against seeded readings.
 
 ## Project Plan
 
 | Slice | Deliverable | Proves |
 |-------|-------------|--------|
-| 1 | Poller + models (incl. AlertEvent schema) + systemd unit, running on homelab, rows accumulating | Ingestion works unattended |
+| 1 | Poller + schema (incl. full alert_events table) + systemd unit, running on homelab, rows accumulating | Ingestion works unattended |
 | 2 | Spike detection + ntfy alerts (unit-tested first) | Alerting works; tune K/M/floors with a real cooking event |
 | 3 | Dashboard (7d/30d charts + event overlays) + web unit | Trends visible |
 | 4 | Ansible role wiring + backups + docs | Reproducible deploy |
 
 Slice 1 ships value immediately (data starts accumulating while we build 2–3, and
-2–3 benefit from having real data to tune against). The full `AlertEvent` schema
+2–3 benefit from having real data to tune against). The full `alert_events` schema
 lands in slice 1 so no migration-with-data is needed for slice 2.
 
-## DECISION NEEDED
+## Decisions (resolved 2026-07-10)
 
-1. **Django vs. lighter (FastAPI/Flask):** Scope assumes Django per Tom's default;
-   recommendation stands (management-command poller + free admin). Confirm.
-2. **LAN-only vs. Cloudflare Tunnel + Authelia:** Scope assumes LAN-only for v1.
-   Exposing later via the tunnel is a small, known lift. Confirm.
-3. **Which room is the Element in?** The CO2 ceiling (1200 ppm) is calibrated for
-   living space. An occupied bedroom overnight routinely hits 1200–2000 ppm and
-   would alert every night — if it's a bedroom, the ceiling moves to ~1800 ppm.
-4. **ntfy topic:** dedicated `/awair` topic (proposed — separate phone sound from
-   Claude task notifications) vs. reusing `/claude`. Depends on whether the
-   existing token is scoped to the `/claude` topic.
+1. **Stack:** stdlib poller + Flask dashboard. Django rejected as overkill —
+   no auth/forms/admin need; ad-hoc data browsing via sqlite3/Datasette.
+2. **Exposure:** LAN-only for v1. Cloudflare Tunnel + Authelia is a small, known
+   lift later if wanted.
+3. **Placement:** open hall on the top floor above the living room — CO2 ceiling
+   stays at 1200 ppm (not a bedroom); tunable.
+4. **ntfy:** dedicated `awair` topic (Tom creating it) rather than reusing
+   `claude`.
