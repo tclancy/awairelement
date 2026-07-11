@@ -80,10 +80,22 @@ def _migrate(conn) -> None:
     CREATE TABLE IF NOT EXISTS leaves existing tables untouched, so columns
     added to SCHEMA after first deploy need an explicit ALTER here.
     """
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
-    if "notified_value" not in columns:
-        conn.execute("ALTER TABLE alert_events ADD COLUMN notified_value REAL")
+    _add_column(conn, "alert_events", "notified_value REAL")
+
+
+def _add_column(conn, table: str, column_def: str) -> None:
+    """ALTER ADD COLUMN that tolerates the column already existing.
+
+    Poller and web both run connect() after restart.sh; a check-then-ALTER
+    would let the loser of that race crash on "duplicate column name", so
+    the ALTER is attempted unconditionally and duplicates read as success.
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
         conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
 
 
 def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:

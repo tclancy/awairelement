@@ -135,16 +135,17 @@ def _maybe_escalate(cfg, values, open_event, baseline):
 
     reference = open_event.get("notified_value") or open_event.get("peak_value")
     window = values[-ESCALATION_WINDOW:]
-    if (
-        reference
-        and len(window) == ESCALATION_WINDOW
-        and median(window) >= ESCALATION_FACTOR * reference
-    ):
-        return Decision(
-            "escalate",
-            open_event["tier"],
-            values[-1],
-            baseline,
-            ESCALATION_FACTOR * reference,
-        )
+    if reference and len(window) == ESCALATION_WINDOW:
+        # The window median is both the trigger and the Decision value: it
+        # becomes the next notified_value, and re-arming on a raw sample
+        # (an outlier dropout) would page again on the very next poll.
+        level = median(window)
+        if level >= ESCALATION_FACTOR * reference:
+            return Decision(
+                "escalate",
+                open_event["tier"],
+                level,
+                baseline,
+                ESCALATION_FACTOR * reference,
+            )
     return None

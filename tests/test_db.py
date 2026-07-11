@@ -68,6 +68,12 @@ def test_connect_adds_notified_value_column_to_legacy_db(tmp_path):
     assert "notified_value" in columns
 
 
+def test_migration_tolerates_losing_the_startup_race(conn):
+    # Poller and web both run connect() after restart.sh; the loser's ALTER
+    # hits "duplicate column name", which must read as success.
+    db._add_column(conn, "alert_events", "notified_value REAL")
+
+
 def test_insert_reading_stores_all_fields(conn):
     assert db.insert_reading(conn, reading_from_fixture()) is True
     row = conn.execute(

@@ -205,6 +205,19 @@ def test_escalation_reference_falls_back_to_peak_for_legacy_rows():
     assert decision.action == "escalate"
 
 
+def test_escalation_rearms_on_window_median_not_last_sample():
+    # A dropout as the latest sample must not become the ladder reference:
+    # monitor stores decision.value as notified_value, and a low re-arm
+    # would page again on the very next poll.
+    h = hours_of(500, 8)[:-4] + history([2700, 2700, 2700, 700], end=NOW)
+    event = open_event(
+        tier="ceiling", baseline=500.0, threshold=1200.0, notified_value=1300.0
+    )
+    decision = evaluate(CO2, h, event, NOW)
+    assert decision.action == "escalate"
+    assert decision.value == 2700.0  # the sustained level, not the outlier
+
+
 def test_ceiling_tier_event_does_not_repromote():
     h = hours_of(500, 8)[:-40] + history([1300] * 40, end=NOW)
     event = open_event(

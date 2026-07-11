@@ -33,7 +33,9 @@ def check_metrics(conn, notifier, now):
         history = db.metric_history(conn, name, since)
         event = open_events.get(name)
         if event and history:
-            db.update_peak(conn, event["id"], history[-1][1])
+            latest = history[-1][1]
+            db.update_peak(conn, event["id"], latest)
+            event["peak_value"] = max(event["peak_value"] or latest, latest)
         decision = evaluate(cfg, history, event, now)
         if decision is None:
             continue
