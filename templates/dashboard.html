@@ -62,8 +62,13 @@ main {
   color: var(--ink-2); font-size: 13px;
 }
 .plot { min-height: 150px; }
-/* recessive uPlot legend: small, muted, tabular values */
-.u-legend { font-size: 11px !important; color: var(--ink-muted) !important; }
+/* recessive uPlot legend: small, muted, tabular values. Locked to one
+   line — a populated legend wrapping taller than the idle "--" state
+   shifts every card below it on hover. */
+.u-legend {
+  font-size: 11px !important; color: var(--ink-muted) !important;
+  white-space: nowrap; overflow: hidden;
+}
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
