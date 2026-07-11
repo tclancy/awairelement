@@ -10,17 +10,9 @@ import pytest
 
 from awair import db
 from awair.monitor import DeviceHealth, check_metrics
+from tests._helpers import FakeNotifier
 
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
-
-
-class FakeNotifier:
-    def __init__(self):
-        self.sent = []
-
-    def send(self, message, title="", priority="default"):
-        self.sent.append((title, message, priority))
-        return True
 
 
 @pytest.fixture

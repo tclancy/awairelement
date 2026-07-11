@@ -17,7 +17,7 @@ same PR that lands the code.
 - **DeviceHealth** — Snapshot of last-successful-fetch state used to detect the transition between healthy and stale/unreachable readings; owns the `ok`, `since`, and `last_status` fields on `awair.monitor.DeviceHealth`.
 - **event** — A row in the `events` table representing an open or closed spike/threshold violation. Rows are opened by `spikes.evaluate` and closed by `db.close_event`.
 - **fan mitigation** — The whole loop: `desired_action` → `decide` → `actuate`. Turns ceiling fans on when co2/voc spike and off when air clears; gated by `AWAIR_FAN_MITIGATION_ENABLED` (default off).
-- **fan_state** — SQLite row (one per fan) tracking `last_action`, `last_changed_at`, `last_command_at` so restart-safe rate limiting and no-op filtering survive the poller process bouncing.
+- **fan_state** — SQLite row (one per fan) tracking `last_action` (last known / last confirmed physical state) and `last_command_at` (when the poller last tried to command the fan — used for the 1-cmd/min rate limit).
 - **FansConfig** — Immutable config for fan mitigation: `enabled`, `fan_host`, `fan_ids`. Built from env by `awair.fans.config_from_env`.
 - **fetch** — The single-shot HTTP GET against the Awair Element Local API that returns one reading payload; built by `poller.make_fetch(url)`.
 - **metric** — A named channel on a reading (`co2`, `voc`, `pm25`, `temp`, `humid`, etc.); the `MetricConfig` dataclass in `awair.spikes` binds a metric to its thresholds.

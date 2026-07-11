@@ -39,8 +39,7 @@ CREATE TABLE IF NOT EXISTS alert_events (
 
 CREATE TABLE IF NOT EXISTS fan_state (
     fan_id INTEGER PRIMARY KEY,
-    last_action TEXT NOT NULL,
-    last_changed_at TEXT NOT NULL,
+    last_action TEXT NOT NULL CHECK (last_action IN ('off', 'speed1', 'speed2', 'speed3')),
     last_command_at TEXT NOT NULL
 );
 """
@@ -207,10 +206,18 @@ def mark_renotified(conn, event_id, at) -> None:
     conn.commit()
 
 
-def latest_pm25(conn) -> float | None:
-    """Most recent pm25 reading, or None if the table is empty / null."""
+def latest_pm25(conn, since) -> float | None:
+    """Most recent pm25 reading at or after `since`, or None.
+
+    Bounded by `since` because pm25 is used as a suppressor — a stale value
+    (from an old cooking event, days ago) must not silently keep fans off.
+    Returns None when the last read is older than the window; the caller
+    treats that the same as 'no sensor data' rather than trusting old.
+    """
     row = conn.execute(
-        "SELECT pm25 FROM readings WHERE pm25 IS NOT NULL ORDER BY ts DESC LIMIT 1"
+        "SELECT pm25 FROM readings"
+        " WHERE ts >= ? AND pm25 IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (iso_z(since),),
     ).fetchone()
     return float(row[0]) if row else None
 
@@ -222,35 +229,36 @@ def get_fan_state(conn, fan_id: int) -> dict:
     is not blocking on first use.
     """
     row = conn.execute(
-        "SELECT last_action, last_changed_at, last_command_at"
-        " FROM fan_state WHERE fan_id = ?",
+        "SELECT last_action, last_command_at FROM fan_state WHERE fan_id = ?",
         (fan_id,),
     ).fetchone()
     if row is None:
         return {
             "fan_id": fan_id,
             "last_action": "off",
-            "last_changed_at": _NEVER,
             "last_command_at": _NEVER,
         }
-    last_action, last_changed_at, last_command_at = row
+    last_action, last_command_at = row
     return {
         "fan_id": fan_id,
         "last_action": last_action,
-        "last_changed_at": datetime.fromisoformat(last_changed_at),
         "last_command_at": datetime.fromisoformat(last_command_at),
     }
 
 
-def upsert_fan_state(conn, fan_id: int, action: str, changed_at, command_at) -> None:
-    """Persist a fan transition. changed_at and command_at may be the same."""
+def upsert_fan_state(conn, fan_id: int, action: str, command_at) -> None:
+    """Persist last-known fan state.
+
+    On a failed actuate the caller should pass the pre-existing action here
+    (unchanged) but still stamp command_at — the rate limit doubles as a
+    backoff so a broken NodeMCU is retried every RATE_LIMIT, not every poll.
+    """
     conn.execute(
-        "INSERT INTO fan_state (fan_id, last_action, last_changed_at, last_command_at)"
-        " VALUES (?, ?, ?, ?)"
+        "INSERT INTO fan_state (fan_id, last_action, last_command_at)"
+        " VALUES (?, ?, ?)"
         " ON CONFLICT(fan_id) DO UPDATE SET"
         " last_action = excluded.last_action,"
-        " last_changed_at = excluded.last_changed_at,"
         " last_command_at = excluded.last_command_at",
-        (fan_id, action, changed_at.isoformat(), command_at.isoformat()),
+        (fan_id, action, command_at.isoformat()),
     )
     conn.commit()

@@ -25,7 +25,11 @@ log = logging.getLogger("awair.fans")
 
 FAN_TRIGGERS = ("co2", "voc")
 PM25_SUPPRESS_THRESHOLD = 25.0
+PM25_SUPPRESS_REASON_PREFIX = "pm25 "  # decide() uses this to detect safety-off
 RATE_LIMIT = timedelta(seconds=60)
+# Trust pm25 only within this window — the suppressor must not act on a hours-old
+# reading if the sensor drops pm25 for a while.
+PM25_FRESHNESS = timedelta(minutes=5)
 FAN_CMD_TIMEOUT_SECONDS = 5
 DEFAULT_FAN_HOST = "192.168.68.68"
 DEFAULT_FAN_IDS = (1, 2)
@@ -65,7 +69,7 @@ def desired_action(open_events: dict, latest_pm25: float | None) -> tuple[str, s
       - Both open, either at ceiling tier → speed3.
     """
     if latest_pm25 is not None and latest_pm25 >= PM25_SUPPRESS_THRESHOLD:
-        return "off", f"pm25 {latest_pm25:g} suppresses fans"
+        return "off", f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans"
     active = [open_events[m] for m in FAN_TRIGGERS if m in open_events]
     if not active:
         return "off", "no co2/voc spike"
@@ -86,12 +90,15 @@ def decide(
 ) -> MitigationDecision | None:
     """Rate-limit + no-op filter around desired_action's verdict.
 
-    Returns None if there's no change to make, or if we're inside the 1-cmd/min
-    per-fan cooldown from the last command.
+    Returns None if there's no change to make. The 1-cmd/min rate limit applies
+    to routine transitions but is bypassed for pm25-driven safety-off (fans
+    stirring dust into a particulate spike is the exact failure mode the
+    suppressor exists to prevent — don't let a recent command block it).
     """
     if state["last_action"] == action:
         return None
-    if now - state["last_command_at"] < RATE_LIMIT:
+    is_safety_off = action == "off" and reason.startswith(PM25_SUPPRESS_REASON_PREFIX)
+    if not is_safety_off and now - state["last_command_at"] < RATE_LIMIT:
         return None
     return MitigationDecision(fan_id=fan_id, action=action, reason=reason)
 
@@ -99,9 +106,9 @@ def decide(
 def actuate(decision: MitigationDecision, config: FansConfig, opener=None) -> bool:
     """Fire-and-forget GET at the NodeMCU. Returns True on 2xx, False otherwise.
 
-    Failure never raises — the caller writes the intended state and moves on
-    (soft-partial: a wall control or manual remote can change fan state out of
-    band and we won't know, same trade-off Tom accepted on #10).
+    Failure never raises — the caller only advances last_action on success
+    (avoids silent DB/physical desync on a transient NodeMCU blip). Wall-
+    control / manual-remote changes remain a soft-partial: we can't observe them.
     """
     open_url = opener or urllib.request.urlopen
     url = f"http://{config.fan_host}/fan/{decision.fan_id}/{decision.action}"
@@ -118,7 +125,7 @@ def check_fans(conn, notifier, config: FansConfig, now) -> None:
     if not config.enabled:
         return
     open_events = db.get_open_events(conn)
-    latest_pm25 = db.latest_pm25(conn)
+    latest_pm25 = db.latest_pm25(conn, since=now - PM25_FRESHNESS)
     action, reason = desired_action(open_events, latest_pm25)
     for fan_id in config.fan_ids:
         state = db.get_fan_state(conn, fan_id)
@@ -133,11 +140,14 @@ def check_fans(conn, notifier, config: FansConfig, now) -> None:
             decision.reason,
             ok,
         )
+        # On failure, keep last_action == whatever the DB already believed —
+        # don't record the failed target as "current." Stamp last_command_at
+        # either way so the rate limit doubles as backoff (retry once per
+        # RATE_LIMIT, not every poll).
         db.upsert_fan_state(
             conn,
             fan_id=fan_id,
-            action=decision.action,
-            changed_at=now,
+            action=decision.action if ok else state["last_action"],
             command_at=now,
         )
         if ok:

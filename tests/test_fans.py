@@ -5,7 +5,6 @@ Each scenario maps to a rule in issue #10 / #14. Trigger surface is
 """
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -13,22 +12,14 @@ from awair import db, fans
 from awair.fans import (
     FansConfig,
     MitigationDecision,
+    actuate,
     check_fans,
     decide,
     desired_action,
-    actuate,
 )
+from tests._helpers import FakeNotifier, fake_url_opener
 
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
-
-
-class FakeNotifier:
-    def __init__(self):
-        self.sent = []
-
-    def send(self, message, title="", priority="default"):
-        self.sent.append((title, message, priority))
-        return True
 
 
 def _event(metric, tier="relative"):
@@ -109,7 +100,6 @@ def _state(action="off", last_cmd_seconds_ago=3600):
     return {
         "fan_id": 1,
         "last_action": action,
-        "last_changed_at": NOW - timedelta(seconds=last_cmd_seconds_ago),
         "last_command_at": NOW - timedelta(seconds=last_cmd_seconds_ago),
     }
 
@@ -143,11 +133,29 @@ def test_fresh_fan_state_never_blocks():
     state = {
         "fan_id": 1,
         "last_action": "off",
-        "last_changed_at": datetime(1970, 1, 1, tzinfo=timezone.utc),
         "last_command_at": datetime(1970, 1, 1, tzinfo=timezone.utc),
     }
     d = decide(1, "speed1", "co2 spike", state, NOW)
     assert d is not None
+
+
+def test_pm25_safety_off_bypasses_rate_limit():
+    # Fans were just kicked to speed3 for a co2 spike; 20s later pm25 crosses
+    # the suppressor threshold. Waiting the rest of the 60s to turn them off
+    # would keep them stirring particulate — the safety-off must fire now.
+    reason = "pm25 40 suppresses fans"
+    d = decide(1, "off", reason, _state("speed3", last_cmd_seconds_ago=20), NOW)
+    assert d is not None
+    assert d.action == "off"
+
+
+def test_non_pm25_off_still_respects_rate_limit():
+    # Ordinary "spike closed → off" transitions are not safety-critical; they
+    # still respect the rate limit.
+    d = decide(
+        1, "off", "no co2/voc spike", _state("speed1", last_cmd_seconds_ago=20), NOW
+    )
+    assert d is None
 
 
 # --- actuate: fire-and-forget urllib GET ---
@@ -155,27 +163,10 @@ def test_fresh_fan_state_never_blocks():
 
 def test_actuate_hits_the_fan_endpoint():
     calls = []
-
-    def opener(url, timeout):
-        calls.append((url, timeout))
-        return MagicMock().__enter__.return_value.__exit__
-
-    # opener protocol expects a context manager
-    class _CM:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, *a):
-            return False
-
-    def real_opener(url, timeout):
-        calls.append((url, timeout))
-        return _CM()
-
     ok = actuate(
         MitigationDecision(fan_id=2, action="speed1", reason="voc"),
         FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2)),
-        opener=real_opener,
+        opener=fake_url_opener(calls),
     )
     assert ok is True
     assert calls == [("http://host.local/fan/2/speed1", fans.FAN_CMD_TIMEOUT_SECONDS)]
@@ -202,7 +193,7 @@ def conn(tmp_path):
 
 
 def _seed_reading(conn, pm25, ts=NOW):
-    ts_iso = ts.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts.microsecond // 1000:03d}Z"
+    ts_iso = db.iso_z(ts)
     conn.execute(
         "INSERT INTO readings (ts, received_at, co2, voc, pm25) VALUES (?, ?, ?, ?, ?)",
         (ts_iso, ts_iso, 500, 100, pm25),
@@ -226,8 +217,6 @@ def _seed_event(conn, metric, tier="relative"):
 def test_check_fans_no_op_when_disabled(conn):
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1, 2))
-    _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "co2", tier="ceiling")
     check_fans(conn, notifier, cfg, NOW)
     assert notifier.sent == []
     assert conn.execute("SELECT COUNT(*) FROM fan_state").fetchone()[0] == 0
@@ -235,20 +224,7 @@ def test_check_fans_no_op_when_disabled(conn):
 
 def test_check_fans_drives_both_fans_on_co2_ceiling(conn, monkeypatch):
     calls = []
-
-    def opener(url, timeout):
-        calls.append(url)
-
-        class _CM:
-            def __enter__(self):
-                return None
-
-            def __exit__(self, *a):
-                return False
-
-        return _CM()
-
-    monkeypatch.setattr("urllib.request.urlopen", opener)
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
     _seed_reading(conn, pm25=5.0)
@@ -256,35 +232,22 @@ def test_check_fans_drives_both_fans_on_co2_ceiling(conn, monkeypatch):
     check_fans(conn, notifier, cfg, NOW)
 
     # One event open only (co2) => speed1 on both fans.
-    assert calls == ["http://host.local/fan/1/speed1", "http://host.local/fan/2/speed1"]
+    urls = [url for url, _ in calls]
+    assert urls == ["http://host.local/fan/1/speed1", "http://host.local/fan/2/speed1"]
     assert len(notifier.sent) == 2
     assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
     assert db.get_fan_state(conn, 2)["last_action"] == "speed1"
 
 
 def test_check_fans_forces_off_when_pm25_suppresses(conn, monkeypatch):
-    """PM2.5 suppressor even overrides a prior speed1 the poller set itself."""
+    """PM2.5 suppressor overrides a prior speed1 the poller set itself."""
     calls = []
-
-    def opener(url, timeout):
-        calls.append(url)
-
-        class _CM:
-            def __enter__(self):
-                return None
-
-            def __exit__(self, *a):
-                return False
-
-        return _CM()
-
-    monkeypatch.setattr("urllib.request.urlopen", opener)
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     # Seed: fan 1 already at speed1 from an earlier tick, 5 min ago.
     db.upsert_fan_state(
         conn,
         fan_id=1,
         action="speed1",
-        changed_at=NOW - timedelta(minutes=5),
         command_at=NOW - timedelta(minutes=5),
     )
     _seed_reading(conn, pm25=30.0)
@@ -293,22 +256,18 @@ def test_check_fans_forces_off_when_pm25_suppresses(conn, monkeypatch):
     notifier = FakeNotifier()
     check_fans(conn, notifier, cfg, NOW)
 
-    assert calls == ["http://host.local/fan/1/off"]
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
 def test_check_fans_holds_when_rate_limited(conn, monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        "urllib.request.urlopen",
-        lambda url, timeout: calls.append(url),
-    )
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     # Fan 1 changed 30s ago — inside the 60s cooldown.
     db.upsert_fan_state(
         conn,
         fan_id=1,
         action="off",
-        changed_at=NOW - timedelta(seconds=30),
         command_at=NOW - timedelta(seconds=30),
     )
     _seed_reading(conn, pm25=5.0)
@@ -321,7 +280,13 @@ def test_check_fans_holds_when_rate_limited(conn, monkeypatch):
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
-def test_check_fans_no_notification_when_actuate_fails(conn, monkeypatch):
+def test_check_fans_actuate_failure_does_not_advance_last_action(conn, monkeypatch):
+    """A transient NodeMCU failure must not desync the DB from physical state.
+
+    Without the guard, next tick sees state.last_action == desired and skips
+    the retry entirely; the fan stays physically off while the DB claims on.
+    """
+
     def broken(url, timeout):
         raise OSError("boom")
 
@@ -332,11 +297,14 @@ def test_check_fans_no_notification_when_actuate_fails(conn, monkeypatch):
     notifier = FakeNotifier()
     check_fans(conn, notifier, cfg, NOW)
 
-    # Even when the NodeMCU is unreachable, we record the intent so the next
-    # tick's rate-limit gate uses this attempt's timestamp — but we don't
-    # falsely ntfy "fan changed" when the command didn't land.
+    # No user-visible notification when nothing physical changed.
     assert notifier.sent == []
-    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+    # last_action stays "off" (the pre-existing state), NOT "speed1".
+    state = db.get_fan_state(conn, 1)
+    assert state["last_action"] == "off"
+    # But last_command_at IS stamped so the rate limit gates the retry to
+    # 1 attempt / RATE_LIMIT — a broken NodeMCU is not spammed every poll.
+    assert state["last_command_at"] == NOW
 
 
 # --- config: env parsing ---
