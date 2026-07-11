@@ -5,6 +5,7 @@ connect() — never edit the CREATE statements for deployed columns.
 """
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 SCHEMA = """
@@ -59,3 +60,79 @@ def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+def iso_z(dt) -> str:
+    """UTC datetime → the device's timestamp format, so strings sort together."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def metric_history(conn, metric: str, since) -> list:
+    """[(datetime, value)] ascending for one metric, nulls excluded."""
+    if metric not in READING_COLUMNS:
+        raise ValueError(f"unknown metric {metric!r}")
+    rows = conn.execute(
+        f"SELECT ts, {metric} FROM readings"
+        f" WHERE ts >= ? AND {metric} IS NOT NULL ORDER BY ts",
+        (iso_z(since),),
+    )
+    return [(datetime.fromisoformat(ts), float(v)) for ts, v in rows]
+
+
+def get_open_events(conn) -> dict:
+    """Open alert events keyed by metric (at most one open per metric)."""
+    rows = conn.execute(
+        "SELECT id, metric, tier, opened_at, renotified_at, peak_value,"
+        " baseline, threshold FROM alert_events WHERE closed_at IS NULL"
+    )
+    return {
+        metric: {
+            "id": event_id,
+            "metric": metric,
+            "tier": tier,
+            "opened_at": datetime.fromisoformat(opened_at),
+            "renotified_at": (
+                datetime.fromisoformat(renotified_at) if renotified_at else None
+            ),
+            "peak_value": peak,
+            "baseline": baseline,
+            "threshold": threshold,
+        }
+        for event_id, metric, tier, opened_at, renotified_at, peak, baseline, threshold in rows
+    }
+
+
+def open_event(conn, metric, tier, opened_at, value, baseline, threshold, notified) -> int:
+    cursor = conn.execute(
+        "INSERT INTO alert_events"
+        " (metric, tier, opened_at, peak_value, baseline, threshold, open_notified)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (metric, tier, opened_at.isoformat(), value, baseline, threshold, int(notified)),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def close_event(conn, event_id, closed_at, notified) -> None:
+    conn.execute(
+        "UPDATE alert_events SET closed_at = ?, close_notified = ? WHERE id = ?",
+        (closed_at.isoformat(), int(notified), event_id),
+    )
+    conn.commit()
+
+
+def update_peak(conn, event_id, value) -> None:
+    conn.execute(
+        "UPDATE alert_events SET peak_value = MAX(COALESCE(peak_value, ?), ?)"
+        " WHERE id = ?",
+        (value, value, event_id),
+    )
+    conn.commit()
+
+
+def mark_renotified(conn, event_id, at) -> None:
+    conn.execute(
+        "UPDATE alert_events SET renotified_at = ? WHERE id = ?",
+        (at.isoformat(), event_id),
+    )
+    conn.commit()

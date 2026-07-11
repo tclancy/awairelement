@@ -12,6 +12,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 from awair import db
+from awair.alerts import Notifier
+from awair.monitor import DeviceHealth, check_metrics
 
 log = logging.getLogger("awair.poller")
 
@@ -61,11 +63,36 @@ def make_fetch(url: str):
     return fetch
 
 
+def handle_device_health(conn, notifier, health, status, now) -> None:
+    """Map a DeviceHealth verdict onto an alert event + notification."""
+    verdict = health.observe(status)
+    if verdict in ("unreachable", "stale"):
+        notified = notifier.send(
+            f"Awair Element {verdict} (~5 min of polls)",
+            title=f"Awair device {verdict}", priority="high",
+        )
+        db.open_event(
+            conn, metric="device", tier=verdict, opened_at=now,
+            value=None, baseline=None, threshold=None, notified=notified,
+        )
+    elif verdict == "recovered":
+        event = db.get_open_events(conn).get("device")
+        notified = notifier.send("Awair Element recovered", title="Awair device recovered")
+        if event:
+            db.close_event(conn, event["id"], closed_at=now, notified=notified)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     url = os.environ.get("AWAIR_URL", "http://192.168.68.51/air-data/latest")
     db_path = os.environ.get("AWAIR_DB", os.path.expanduser("~/data/awairelement/awair.db"))
     interval = int(os.environ.get("AWAIR_POLL_SECONDS", "30"))
+    notifier = Notifier(
+        base_url=os.environ.get("AWAIR_NTFY_URL", "https://notifications.tomclancy.info"),
+        topic=os.environ.get("AWAIR_NTFY_TOPIC", "awair"),
+        token=os.environ.get("AWAIR_NTFY_TOKEN", ""),
+    )
+    health = DeviceHealth()
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
@@ -76,6 +103,10 @@ def main() -> None:
         status = poll_once(conn, fetch)
         log.log(logging.INFO if status == "inserted" else logging.WARNING,
                 "poll: %s", status)
+        now = datetime.now(timezone.utc)
+        if status == "inserted":
+            check_metrics(conn, notifier, now)
+        handle_device_health(conn, notifier, health, status, now)
         time.sleep(interval)
 
 
