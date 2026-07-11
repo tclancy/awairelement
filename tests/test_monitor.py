@@ -84,6 +84,59 @@ def test_recovery_closes_event_and_sends_cleared(conn):
     )
 
 
+# --- escalation: mid-event tier promotion and reference laddering ---
+
+
+def test_ceiling_crossing_escalates_open_event(conn):
+    db.open_event(
+        conn,
+        metric="co2",
+        tier="relative",
+        opened_at=NOW - timedelta(hours=1),
+        value=900.0,
+        baseline=500.0,
+        threshold=800.0,
+        notified=True,
+    )
+    seed(conn, [1300, 1350])
+    notifier = FakeNotifier()
+    check_metrics(conn, notifier, now=NOW)
+
+    event = db.get_open_events(conn)["co2"]
+    assert event["tier"] == "ceiling"
+    assert event["notified_value"] == 1350.0
+    assert len(notifier.sent) == 1
+    title, message, priority = notifier.sent[0]
+    assert priority == "high"
+    assert "escalat" in (title + message).lower()
+
+
+def test_open_records_notified_value(conn):
+    seed(conn, [500, 500, 500, 1300, 1350])
+    check_metrics(conn, FakeNotifier(), now=NOW)
+    assert db.get_open_events(conn)["co2"]["notified_value"] == 1350.0
+
+
+def test_renotify_resets_escalation_reference(conn):
+    db.open_event(
+        conn,
+        metric="co2",
+        tier="ceiling",
+        opened_at=NOW - timedelta(hours=13),
+        value=900.0,
+        baseline=500.0,
+        threshold=1200.0,
+        notified=True,
+    )
+    seed(conn, [1300] * 40)
+    notifier = FakeNotifier()
+    check_metrics(conn, notifier, now=NOW)
+
+    event = db.get_open_events(conn)["co2"]
+    assert event["notified_value"] == 1300.0  # future doubling measured from here
+    assert len(notifier.sent) == 1  # the 12h still-elevated reminder
+
+
 # --- device health: unreachable and stale ---
 
 

@@ -86,5 +86,7 @@ def test_mark_renotified(conn):
         threshold=35.0,
         notified=True,
     )
-    db.mark_renotified(conn, event_id, NOW)
-    assert db.get_open_events(conn)["pm25"]["renotified_at"] == NOW
+    db.mark_renotified(conn, event_id, NOW, value=80.0)
+    event = db.get_open_events(conn)["pm25"]
+    assert event["renotified_at"] == NOW
+    assert event["notified_value"] == 80.0

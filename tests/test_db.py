@@ -45,6 +45,29 @@ def test_connect_enables_wal_and_busy_timeout(conn):
     assert conn.execute("PRAGMA busy_timeout").fetchone()[0] >= 5000
 
 
+def test_connect_adds_notified_value_column_to_legacy_db(tmp_path):
+    # DBs created before the escalation feature lack notified_value;
+    # connect() must add it in place (CREATE IF NOT EXISTS won't).
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE alert_events ("
+        " id INTEGER PRIMARY KEY, metric TEXT NOT NULL, tier TEXT NOT NULL,"
+        " opened_at TEXT NOT NULL, closed_at TEXT,"
+        " peak_value REAL, baseline REAL, threshold REAL,"
+        " open_notified INTEGER NOT NULL DEFAULT 0,"
+        " close_notified INTEGER NOT NULL DEFAULT 0, renotified_at TEXT)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
+    assert "notified_value" in columns
+
+
 def test_insert_reading_stores_all_fields(conn):
     assert db.insert_reading(conn, reading_from_fixture()) is True
     row = conn.execute(

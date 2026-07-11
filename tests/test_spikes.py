@@ -27,13 +27,25 @@ def hours_of(value, hours, end=NOW):
     return history([value] * int(hours * 3600 / 30), end=end)
 
 
-def open_event(tier="relative", opened_at=NOW - timedelta(hours=1), renotified_at=None):
+def open_event(
+    tier="relative",
+    opened_at=NOW - timedelta(hours=1),
+    renotified_at=None,
+    baseline=None,
+    threshold=None,
+    peak_value=None,
+    notified_value=None,
+):
     return {
         "id": 1,
         "metric": "co2",
         "tier": tier,
         "opened_at": opened_at,
         "renotified_at": renotified_at,
+        "baseline": baseline,
+        "threshold": threshold,
+        "peak_value": peak_value,
+        "notified_value": notified_value,
     }
 
 
@@ -131,6 +143,74 @@ def test_does_not_close_until_recovery_spans_close_window():
     # Recovered for only ~2 minutes: too soon.
     h = hours_of(500, 8)[:-60] + history([1300] * 56 + [500] * 4, end=NOW)
     assert evaluate(CO2, h, open_event(), NOW) is None
+
+
+# --- close: reference frozen at open, immune to baseline contamination ---
+
+
+def test_close_uses_frozen_open_stats_not_contaminated_history():
+    # A day-long event drags the trailing median up to the plateau itself;
+    # the recomputed close threshold would sit above current values and
+    # close while air is still 2x the pre-event level. Frozen stats say no.
+    h = hours_of(1000, 8)
+    event = open_event(baseline=500.0, threshold=800.0)
+    assert evaluate(CO2, h, event, NOW) is None
+
+
+def test_closes_below_frozen_close_threshold():
+    calm = 500.0  # below (500 + 800) / 2 = 650
+    h = hours_of(calm, 8)
+    decision = evaluate(CO2, h, open_event(baseline=500.0, threshold=800.0), NOW)
+    assert decision.action == "close"
+
+
+# --- escalate: tier promotion and magnitude doubling page mid-event ---
+
+
+def test_relative_event_escalates_when_ceiling_crossed():
+    h = hours_of(500, 8)[:-40] + history([1300] * 40, end=NOW)
+    event = open_event(tier="relative", baseline=500.0, threshold=800.0)
+    decision = evaluate(CO2, h, event, NOW)
+    assert decision.action == "escalate"
+    assert decision.tier == "ceiling"
+    assert decision.threshold == CO2.ceiling
+
+
+def test_escalates_when_recent_median_doubles_last_notified():
+    h = hours_of(500, 8)[:-4] + history([2700] * 4, end=NOW)
+    event = open_event(
+        tier="ceiling", baseline=500.0, threshold=1200.0, notified_value=1300.0
+    )
+    decision = evaluate(CO2, h, event, NOW)
+    assert decision.action == "escalate"
+    assert decision.tier == "ceiling"  # unchanged; magnitude, not promotion
+
+
+def test_single_blip_does_not_escalate():
+    # Median over the escalation window resists one wild sample.
+    h = hours_of(500, 8)[:-4] + history([1300, 1300, 1300, 2900], end=NOW)
+    event = open_event(
+        tier="ceiling", baseline=500.0, threshold=1200.0, notified_value=1300.0
+    )
+    assert evaluate(CO2, h, event, NOW) is None
+
+
+def test_escalation_reference_falls_back_to_peak_for_legacy_rows():
+    # Rows created before notified_value existed still escalate off peak.
+    h = hours_of(500, 8)[:-4] + history([2700] * 4, end=NOW)
+    event = open_event(
+        tier="ceiling", baseline=500.0, threshold=1200.0, peak_value=1300.0
+    )
+    decision = evaluate(CO2, h, event, NOW)
+    assert decision.action == "escalate"
+
+
+def test_ceiling_tier_event_does_not_repromote():
+    h = hours_of(500, 8)[:-40] + history([1300] * 40, end=NOW)
+    event = open_event(
+        tier="ceiling", baseline=500.0, threshold=1200.0, notified_value=1300.0
+    )
+    assert evaluate(CO2, h, event, NOW) is None
 
 
 # --- re-arm: long-lived events send one reminder per 12h ---
