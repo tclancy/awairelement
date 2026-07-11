@@ -76,3 +76,13 @@ def test_poll_once_reports_fetch_error_without_inserting(conn):
 def test_poll_once_reports_bad_json_as_error(conn):
     assert poll_once(conn, fetch=lambda: "<html>not json</html>") == "error"
     assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_main_with_test_flag_runs_fan_test_and_exits(monkeypatch, tmp_path):
+    from awair import poller
+
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "test.db"))
+    ran = []
+    monkeypatch.setattr(poller, "run_fan_test", lambda *a, **k: ran.append(a))
+    poller.main(["--test"])  # must return instead of entering the poll loop
+    assert len(ran) == 1

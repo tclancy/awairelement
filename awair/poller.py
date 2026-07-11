@@ -1,9 +1,11 @@
 """Poll the Awair Element Local API and store readings.
 
 Run as: python -m awair.poller
+       python -m awair.poller --test   (fan/ntfy smoke test, then exit)
 Config via environment: AWAIR_URL, AWAIR_DB, AWAIR_POLL_SECONDS.
 """
 
+import argparse
 import json
 import logging
 import os
@@ -13,7 +15,11 @@ from datetime import datetime, timezone
 
 from awair import db
 from awair.alerts import Notifier
-from awair.fans import check_fans, config_from_env as fans_config_from_env
+from awair.fans import (
+    check_fans,
+    config_from_env as fans_config_from_env,
+    run_fan_test,
+)
 from awair.monitor import DeviceHealth, check_metrics
 
 log = logging.getLogger("awair.poller")
@@ -102,7 +108,18 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
 
 
-def main() -> None:
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(prog="python -m awair.poller")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="turn the fans on, send a 'Fan test' ntfy notification, and exit",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = _parse_args(argv)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
@@ -123,6 +140,11 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
+
+    if args.test:
+        run_fan_test(conn, notifier, fans_config, datetime.now(timezone.utc))
+        return
+
     fetch = make_fetch(url)
     log.info(
         "polling %s every %ss into %s (fan mitigation: %s)",

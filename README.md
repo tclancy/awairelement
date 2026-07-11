@@ -134,6 +134,15 @@ verifying the poller is stable:
   poller drive the ceiling fans.
 - `AWAIR_FAN_HOST` (default `192.168.68.68`) — NodeMCU host on the LAN.
 
+Smoke-test the fan + ntfy plumbing (works even with mitigation disabled):
+
+```bash
+python -m awair.poller --test   # fans to speed1, sends "Fan test", exits
+```
+
+A running poller takes over afterward — with no event open it turns the
+fans back off within a couple of polls (after the 60s rate limit).
+
 ## Deploy (homelab)
 `restart.sh` in the repo root runs `uv sync --frozen` and restarts both units
 — use it as a one-shot after a `git pull`.
