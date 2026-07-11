@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Awair — 22 Parsons</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='uplot.min.css') }}">
+<style>
+:root {
+  --surface-1: #fcfcfb; --page: #f9f9f7;
+  --ink-1: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
+  --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
+  --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-1: #1a1a19; --page: #0d0d0d;
+    --ink-1: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --series-co2: #3987e5; --series-voc: #008300; --series-pm25: #9085e9;
+    --series-temp: #d95926; --series-humid: #e66767; --series-score: #c3c2b7;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--page); color: var(--ink-1);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  padding: 16px 20px 4px;
+}
+h1 { font-size: 17px; margin: 0; font-weight: 650; }
+#updated { color: var(--ink-muted); font-size: 12px; margin-left: auto; }
+.ranges { display: flex; gap: 2px; }
+.ranges button {
+  font: inherit; font-size: 12.5px; padding: 3px 12px; cursor: pointer;
+  border: 1px solid var(--ring); background: var(--surface-1); color: var(--ink-2);
+  border-radius: 6px;
+}
+.ranges button[aria-pressed="true"] {
+  color: var(--ink-1); font-weight: 650; border-color: var(--axis);
+}
+main {
+  display: grid; gap: 14px; padding: 14px 20px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+}
+.card {
+  background: var(--surface-1); border: 1px solid var(--ring);
+  border-radius: 10px; padding: 10px 12px 4px; min-width: 0;
+}
+.card h2 {
+  font-size: 13px; font-weight: 650; margin: 0 0 2px; color: var(--ink-1);
+  display: flex; align-items: baseline; gap: 6px;
+}
+.card h2 .dot { width: 8px; height: 8px; border-radius: 50%; align-self: center; }
+.card h2 .unit { color: var(--ink-muted); font-weight: 400; font-size: 12px; }
+.card h2 .now {
+  margin-left: auto; font-weight: 650; font-variant-numeric: tabular-nums;
+  color: var(--ink-2); font-size: 13px;
+}
+.plot { min-height: 150px; }
+/* recessive uPlot legend: small, muted, tabular values */
+.u-legend { font-size: 11px !important; color: var(--ink-muted) !important; }
+.u-legend .u-value { font-variant-numeric: tabular-nums; }
+.u-legend .u-series > * { padding: 0 4px !important; }
+#events { padding: 0 20px 24px; }
+#events h2 { font-size: 13px; font-weight: 650; margin: 4px 0 8px; }
+#events table {
+  width: 100%; border-collapse: collapse; background: var(--surface-1);
+  border: 1px solid var(--ring); border-radius: 10px; overflow: hidden;
+  font-size: 12.5px;
+}
+#events th, #events td {
+  text-align: left; padding: 6px 12px; border-top: 1px solid var(--grid);
+  font-variant-numeric: tabular-nums;
+}
+#events th { color: var(--ink-muted); font-weight: 500; border-top: none; }
+#events .badge {
+  display: inline-flex; align-items: center; gap: 5px; font-weight: 600;
+}
+#events .badge::before { content: ""; width: 8px; height: 8px; border-radius: 2px; }
+#events .badge.ceiling::before { background: var(--event-ceiling); }
+#events .badge.relative::before { background: var(--event-relative); }
+#events .badge.unreachable::before, #events .badge.stale::before { background: var(--event-device); }
+#events .empty { color: var(--ink-muted); padding: 10px 12px; }
+footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Awair — 22 Parsons</h1>
+  <nav class="ranges" aria-label="Time range">
+    <button data-range="7d" aria-pressed="true">7 days</button>
+    <button data-range="30d" aria-pressed="false">30 days</button>
+  </nav>
+  <span id="updated"></span>
+</header>
+<main id="charts">
+  {% for metric in metrics %}
+  <section class="card" data-metric="{{ metric }}">
+    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    <div class="plot"></div>
+  </section>
+  {% endfor %}
+</main>
+<section id="events">
+  <h2>Alert events</h2>
+  <div id="events-body"></div>
+</section>
+<footer>
+  Times shown in your local timezone. Shaded spans are alert events (band shows
+  each bucket's low–high range; line is the average). Data: 30-second polls from
+  the Awair Element local API.
+</footer>
+<script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

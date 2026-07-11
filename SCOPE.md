@@ -80,7 +80,9 @@ Two long-running processes on homelab, both systemd **user** units
   cron's floor is 1 minute (can't do 30s), consecutive-failure tracking stays
   trivial, and we avoid 2,880 process spawns/day. All detection state is
   DB-backed (see Spike Detection), so restarts are safe by construction.
-- `awair-web.service` — gunicorn serving the Flask dashboard on a LAN port.
+- `awairelement-web.service` — gunicorn serving the Flask dashboard on LAN
+  port 8097. `restart.sh` restarts both units, so `itguy deploy awairelement`
+  covers poller and dashboard together.
 
 `Restart=always` on both units covers crashes. All timestamps stored in UTC.
 SQLite runs in **WAL mode with a busy_timeout** (set via connection PRAGMAs in

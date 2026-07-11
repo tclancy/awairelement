@@ -79,6 +79,44 @@ def metric_history(conn, metric: str, since) -> list:
     return [(datetime.fromisoformat(ts), float(v)) for ts, v in rows]
 
 
+def readings_since(conn, columns, since) -> list:
+    """[(epoch_seconds, col1, col2, ...)] ascending for the given columns."""
+    unknown = set(columns) - set(READING_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown columns {unknown}")
+    rows = conn.execute(
+        f"SELECT ts, {', '.join(columns)} FROM readings WHERE ts >= ? ORDER BY ts",
+        (iso_z(since),),
+    )
+    return [
+        (datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows
+    ]
+
+
+def events_since(conn, since) -> list:
+    """Events overlapping [since, now]: closed within it, or still open."""
+    rows = conn.execute(
+        "SELECT metric, tier, opened_at, closed_at, peak_value, baseline, threshold"
+        " FROM alert_events WHERE closed_at IS NULL OR closed_at >= ?"
+        " ORDER BY opened_at",
+        (since.isoformat(),),
+    )
+    return [
+        {
+            "metric": metric,
+            "tier": tier,
+            "opened_at": datetime.fromisoformat(opened_at).timestamp(),
+            "closed_at": (
+                datetime.fromisoformat(closed_at).timestamp() if closed_at else None
+            ),
+            "peak_value": peak,
+            "baseline": baseline,
+            "threshold": threshold,
+        }
+        for metric, tier, opened_at, closed_at, peak, baseline, threshold in rows
+    ]
+
+
 def get_open_events(conn) -> dict:
     """Open alert events keyed by metric (at most one open per metric)."""
     rows = conn.execute(
