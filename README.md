@@ -5,7 +5,8 @@ quality monitor. See [SCOPE.md](SCOPE.md) for the full design.
 
 ## Status
 
-Slice 1: poller → SQLite. (Spike detection/ntfy and the dashboard are slices 2–3.)
+Slices 1–2 shipped: poller → SQLite, spike detection + ntfy alerts.
+(Dashboard is slice 3.)
 
 ## Run locally
 
@@ -18,16 +19,20 @@ uv run pytest
 Config (environment): `AWAIR_URL` (default `http://192.168.68.51/air-data/latest`),
 `AWAIR_DB` (default `~/data/awairelement/awair.db`), `AWAIR_POLL_SECONDS` (default 30).
 
-## Deploy (homelab, interim manual — Ansible wiring lands in slice 4)
+## Deploy (homelab)
+
+Provisioned by the `native-apps` Ansible role in the homelab repo
+(`--tags awair`): clone to `~/sources/awairelement`, env file from vault to
+`~/.config/awairelement/environment`, systemd user unit `awairelement.service`.
+
+Day-to-day management is itguy (systemd shape — the unit name matches the
+app name by convention):
 
 ```bash
-ssh tom@192.168.68.67
-git clone git@github.com:tclancy/awairelement.git ~/sources/awairelement
-cd ~/sources/awairelement && uv sync --frozen
-mkdir -p ~/.config/systemd/user ~/data/awairelement
-ln -sf ~/sources/awairelement/systemd/awair-poller.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now awair-poller
+itguy deploy awairelement   # git pull + ./restart.sh
+itguy status awairelement
+itguy logs awairelement     # journalctl --user -u awairelement under the hood
 ```
 
-Update: `cd ~/sources/awairelement && git pull && ./restart.sh`
+Logs live in the systemd journal:
+`journalctl --user -u awairelement -f` on the box.
