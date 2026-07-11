@@ -128,6 +128,13 @@ stays Celsius).
 If your checkout isn't at `~/sources/awairelement`, edit `WorkingDirectory=`
 and `ExecStart=` in each unit before symlinking.
 
+Fan mitigation (issue #10 / #14) is **off by default**; enable per-deploy after
+verifying the poller is stable:
+- `AWAIR_FAN_MITIGATION_ENABLED` (default `false`) — flip to `true` to let the
+  poller drive the ceiling fans.
+- `AWAIR_FAN_HOST` (default `192.168.68.68`) — NodeMCU host on the LAN.
+
+## Deploy (homelab)
 `restart.sh` in the repo root runs `uv sync --frozen` and restarts both units
 — use it as a one-shot after a `git pull`.
 

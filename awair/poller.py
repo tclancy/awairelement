@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from awair import db
 from awair.alerts import Notifier
+from awair.fans import check_fans, config_from_env as fans_config_from_env
 from awair.monitor import DeviceHealth, check_metrics
 
 log = logging.getLogger("awair.poller")
@@ -118,11 +119,18 @@ def main() -> None:
         token=os.environ.get("AWAIR_NTFY_TOKEN", ""),
     )
     health = DeviceHealth()
+    fans_config = fans_config_from_env()
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
     fetch = make_fetch(url)
-    log.info("polling %s every %ss into %s", url, interval, db_path)
+    log.info(
+        "polling %s every %ss into %s (fan mitigation: %s)",
+        url,
+        interval,
+        db_path,
+        "on" if fans_config.enabled else "off",
+    )
 
     while True:
         status = poll_once(conn, fetch)
@@ -134,6 +142,7 @@ def main() -> None:
         now = datetime.now(timezone.utc)
         if status == "inserted":
             check_metrics(conn, notifier, now)
+            check_fans(conn, notifier, fans_config, now)
         handle_device_health(conn, notifier, health, status, now)
         time.sleep(interval)
 
