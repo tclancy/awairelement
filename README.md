@@ -17,7 +17,9 @@ uv run pytest
 ```
 
 Config (environment): `AWAIR_URL` (default `http://192.168.68.51/air-data/latest`),
-`AWAIR_DB` (default `~/data/awairelement/awair.db`), `AWAIR_POLL_SECONDS` (default 30).
+`AWAIR_DB` (default `~/data/awairelement/awair.db`), `AWAIR_POLL_SECONDS` (default 30),
+`TEMPERATURE_UNIT` (default `C`, also accepts `F` and `K`; display-only — storage
+stays Celsius).
 
 ## Deploy (homelab)
 

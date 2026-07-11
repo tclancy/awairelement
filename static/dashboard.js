@@ -3,13 +3,17 @@
 (function () {
   "use strict";
 
+  // Temp unit symbol is stamped on <body data-temp-unit-symbol="..."> by
+  // the server so a single TEMPERATURE_UNIT env var flips both API values
+  // and the display label together.
+  const TEMP_UNIT = document.body.dataset.tempUnitSymbol || "°C";
   const METRICS = {
-    co2:   { name: "CO₂",      unit: "ppm",   digits: 0 },
-    voc:   { name: "TVOC",     unit: "ppb",   digits: 0 },
-    pm25:  { name: "PM2.5",    unit: "µg/m³", digits: 1 },
-    temp:  { name: "Temp",     unit: "°C",    digits: 1 },
-    humid: { name: "Humidity", unit: "%",     digits: 1 },
-    score: { name: "Score",    unit: "",      digits: 0 },
+    co2:   { name: "CO₂",      unit: "ppm",     digits: 0 },
+    voc:   { name: "TVOC",     unit: "ppb",     digits: 0 },
+    pm25:  { name: "PM2.5",    unit: "µg/m³",   digits: 1 },
+    temp:  { name: "Temp",     unit: TEMP_UNIT, digits: 1 },
+    humid: { name: "Humidity", unit: "%",       digits: 1 },
+    score: { name: "Score",    unit: "",        digits: 0 },
   };
 
   const state = { range: "7d", plots: [], events: [] };
