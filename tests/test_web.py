@@ -27,11 +27,26 @@ def client(tmp_path):
         rows,
     )
     conn.commit()
-    db.open_event(conn, metric="co2", tier="ceiling", opened_at=now - timedelta(minutes=30),
-                  value=1400.0, baseline=500.0, threshold=1200.0, notified=True)
-    ancient = db.open_event(conn, metric="voc", tier="relative",
-                            opened_at=now - timedelta(days=60),
-                            value=900.0, baseline=200.0, threshold=500.0, notified=True)
+    db.open_event(
+        conn,
+        metric="co2",
+        tier="ceiling",
+        opened_at=now - timedelta(minutes=30),
+        value=1400.0,
+        baseline=500.0,
+        threshold=1200.0,
+        notified=True,
+    )
+    ancient = db.open_event(
+        conn,
+        metric="voc",
+        tier="relative",
+        opened_at=now - timedelta(days=60),
+        value=900.0,
+        baseline=200.0,
+        threshold=500.0,
+        notified=True,
+    )
     db.close_event(conn, ancient, closed_at=now - timedelta(days=59), notified=True)
     conn.close()
     app = create_app(db_path=str(db_path))

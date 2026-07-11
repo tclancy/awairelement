@@ -68,8 +68,11 @@ def test_sustained_relative_spike_opens_after_m_consecutive():
     h = hours_of(500, 8)[: -CO2.m] + history([900] * CO2.m, end=NOW)
     decision = evaluate(CO2, h, None, NOW)
     assert decision == Decision(
-        action="open", tier="relative", value=900.0,
-        baseline=500.0, threshold=500.0 + CO2.k * CO2.floor,
+        action="open",
+        tier="relative",
+        value=900.0,
+        baseline=500.0,
+        threshold=500.0 + CO2.k * CO2.floor,
     )
 
 
@@ -93,7 +96,7 @@ def test_cold_start_disables_tier1():
 # --- tier 2: absolute ceilings ---
 
 
-def test_ceiling_opens_after_two_consecutive_even_cold( ):
+def test_ceiling_opens_after_two_consecutive_even_cold():
     # Ceilings are live from the first readings, even without 6h history.
     h = history([400, 1300, 1350], end=NOW)
     decision = evaluate(CO2, h, None, NOW)

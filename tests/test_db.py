@@ -1,7 +1,6 @@
 """Schema bootstrap and reading insertion."""
 
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -29,9 +28,7 @@ def reading_from_fixture(**overrides):
 def test_connect_creates_schema(conn):
     tables = {
         row[0]
-        for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert {"readings", "alert_events"} <= tables
 
@@ -50,8 +47,7 @@ def test_connect_enables_wal_and_busy_timeout(conn):
 def test_insert_reading_stores_all_fields(conn):
     assert db.insert_reading(conn, reading_from_fixture()) is True
     row = conn.execute(
-        "SELECT ts, received_at, score, co2, voc, voc_ethanol_raw, pm25"
-        " FROM readings"
+        "SELECT ts, received_at, score, co2, voc, voc_ethanol_raw, pm25 FROM readings"
     ).fetchone()
     assert row == (
         "2026-07-11T01:24:22.662Z",
@@ -71,9 +67,7 @@ def test_insert_reading_dedupes_on_device_ts(conn):
 
 
 def test_alert_events_schema_ready_for_slice_2(conn):
-    cols = {
-        row[1] for row in conn.execute("PRAGMA table_info(alert_events)")
-    }
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
     assert {
         "metric",
         "tier",

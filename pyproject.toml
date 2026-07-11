@@ -9,5 +9,19 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.0.0",
     "pytest>=9.1.1",
+    "pytest-cov>=6.0.0",
+    "radon>=6.0.1",
+    "ruff>=0.15.6",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=awair --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["awair"]
+
+[tool.radon]
+cc_min = "B"

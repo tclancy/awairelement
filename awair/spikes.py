@@ -13,10 +13,10 @@ from statistics import median
 @dataclass(frozen=True)
 class MetricConfig:
     name: str
-    floor: float    # minimum spread — MAD collapses to ~0 during stable periods
+    floor: float  # minimum spread — MAD collapses to ~0 during stable periods
     ceiling: float  # tier-2 absolute threshold
     k: float = 6.0  # tier-1 opens at baseline + k * spread
-    m: int = 4      # consecutive polls required to open tier-1
+    m: int = 4  # consecutive polls required to open tier-1
 
 
 METRICS = {
@@ -25,16 +25,16 @@ METRICS = {
     "pm25": MetricConfig("pm25", floor=4.0, ceiling=35.0),
 }
 
-CEILING_CONSECUTIVE = 2          # never page on a single sample
-CLOSE_CONSECUTIVE = 20           # ~10 min at 30s cadence, below BOTH thresholds
-MIN_HISTORY = timedelta(hours=6) # cold start: tier-1 off until this much data
+CEILING_CONSECUTIVE = 2  # never page on a single sample
+CLOSE_CONSECUTIVE = 20  # ~10 min at 30s cadence, below BOTH thresholds
+MIN_HISTORY = timedelta(hours=6)  # cold start: tier-1 off until this much data
 RENOTIFY_EVERY = timedelta(hours=12)
 
 
 @dataclass(frozen=True)
 class Decision:
-    action: str      # open | close | renotify
-    tier: str = ""   # relative | ceiling (open); event's tier otherwise
+    action: str  # open | close | renotify
+    tier: str = ""  # relative | ceiling (open); event's tier otherwise
     value: float = 0.0
     baseline: float = 0.0
     threshold: float = 0.0
@@ -73,7 +73,7 @@ def _maybe_open(cfg, history, values):
         return None
     baseline, spread = baseline_spread(values, cfg.floor)
     threshold = baseline + cfg.k * spread
-    if all(v > threshold for v in values[-cfg.m:]):
+    if all(v > threshold for v in values[-cfg.m :]):
         return Decision("open", "relative", values[-1], baseline, threshold)
     return None
 
@@ -85,9 +85,13 @@ def _maybe_close_or_renotify(cfg, values, open_event, now):
     if len(recent) == CLOSE_CONSECUTIVE and all(
         v < close_threshold and v < cfg.ceiling for v in recent
     ):
-        return Decision("close", open_event["tier"], values[-1], baseline, close_threshold)
+        return Decision(
+            "close", open_event["tier"], values[-1], baseline, close_threshold
+        )
 
     last_notice = open_event["renotified_at"] or open_event["opened_at"]
     if now - last_notice >= RENOTIFY_EVERY:
-        return Decision("renotify", open_event["tier"], values[-1], baseline, close_threshold)
+        return Decision(
+            "renotify", open_event["tier"], values[-1], baseline, close_threshold
+        )
     return None

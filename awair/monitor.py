@@ -33,9 +33,14 @@ def check_metrics(conn, notifier, now):
                 priority=PRIORITY[decision.tier],
             )
             db.open_event(
-                conn, metric=name, tier=decision.tier, opened_at=now,
-                value=decision.value, baseline=decision.baseline,
-                threshold=decision.threshold, notified=notified,
+                conn,
+                metric=name,
+                tier=decision.tier,
+                opened_at=now,
+                value=decision.value,
+                baseline=decision.baseline,
+                threshold=decision.threshold,
+                notified=notified,
             )
         elif decision.action == "close":
             notified = notifier.send(
