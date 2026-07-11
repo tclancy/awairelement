@@ -78,7 +78,10 @@
         scales: { x: { time: true } },
         bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
         series: [
-          {},
+          // Year-free hover timestamp: the full default ("2026-07-11 10:50am")
+          // wraps the legend row in a card this narrow, and the row growing to
+          // two lines shifts every chart below it.
+          { value: "{M}/{D} {h}:{mm}{aa}" },
           { label: "low", stroke: null, points: { show: false } },
           { label: "high", stroke: null, points: { show: false } },
           {
