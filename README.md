@@ -19,6 +19,12 @@ uv run pytest
 Config (environment): `AWAIR_URL` (default `http://192.168.68.51/air-data/latest`),
 `AWAIR_DB` (default `~/data/awairelement/awair.db`), `AWAIR_POLL_SECONDS` (default 30).
 
+Fan mitigation (issue #10 / #14) is **off by default**; enable per-deploy after
+verifying the poller is stable:
+- `AWAIR_FAN_MITIGATION_ENABLED` (default `false`) — flip to `true` to let the
+  poller drive the ceiling fans.
+- `AWAIR_FAN_HOST` (default `192.168.68.68`) — NodeMCU host on the LAN.
+
 ## Deploy (homelab)
 
 Provisioned by the `native-apps` Ansible role in the homelab repo

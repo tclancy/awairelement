@@ -5,8 +5,13 @@ connect() — never edit the CREATE statements for deployed columns.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+# UTC-aware sentinel for fan_state rows we've never written — must be tz-aware
+# so callers can subtract it from `datetime.now(timezone.utc)` without a
+# naive/aware TypeError.
+_NEVER = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
@@ -30,6 +35,13 @@ CREATE TABLE IF NOT EXISTS alert_events (
     open_notified INTEGER NOT NULL DEFAULT 0,
     close_notified INTEGER NOT NULL DEFAULT 0,
     renotified_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS fan_state (
+    fan_id INTEGER PRIMARY KEY,
+    last_action TEXT NOT NULL,
+    last_changed_at TEXT NOT NULL,
+    last_command_at TEXT NOT NULL
 );
 """
 
@@ -191,5 +203,54 @@ def mark_renotified(conn, event_id, at) -> None:
     conn.execute(
         "UPDATE alert_events SET renotified_at = ? WHERE id = ?",
         (at.isoformat(), event_id),
+    )
+    conn.commit()
+
+
+def latest_pm25(conn) -> float | None:
+    """Most recent pm25 reading, or None if the table is empty / null."""
+    row = conn.execute(
+        "SELECT pm25 FROM readings WHERE pm25 IS NOT NULL ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return float(row[0]) if row else None
+
+
+def get_fan_state(conn, fan_id: int) -> dict:
+    """Last-known state for one fan, defaulted to 'off' if never set.
+
+    Never-set defaults use a distant-past command timestamp so the rate limit
+    is not blocking on first use.
+    """
+    row = conn.execute(
+        "SELECT last_action, last_changed_at, last_command_at"
+        " FROM fan_state WHERE fan_id = ?",
+        (fan_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "fan_id": fan_id,
+            "last_action": "off",
+            "last_changed_at": _NEVER,
+            "last_command_at": _NEVER,
+        }
+    last_action, last_changed_at, last_command_at = row
+    return {
+        "fan_id": fan_id,
+        "last_action": last_action,
+        "last_changed_at": datetime.fromisoformat(last_changed_at),
+        "last_command_at": datetime.fromisoformat(last_command_at),
+    }
+
+
+def upsert_fan_state(conn, fan_id: int, action: str, changed_at, command_at) -> None:
+    """Persist a fan transition. changed_at and command_at may be the same."""
+    conn.execute(
+        "INSERT INTO fan_state (fan_id, last_action, last_changed_at, last_command_at)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(fan_id) DO UPDATE SET"
+        " last_action = excluded.last_action,"
+        " last_changed_at = excluded.last_changed_at,"
+        " last_command_at = excluded.last_command_at",
+        (fan_id, action, changed_at.isoformat(), command_at.isoformat()),
     )
     conn.commit()
