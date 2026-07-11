@@ -33,7 +33,9 @@ def check_metrics(conn, notifier, now):
         history = db.metric_history(conn, name, since)
         event = open_events.get(name)
         if event and history:
-            db.update_peak(conn, event["id"], history[-1][1])
+            latest = history[-1][1]
+            db.update_peak(conn, event["id"], latest)
+            event["peak_value"] = max(event["peak_value"] or latest, latest)
         decision = evaluate(cfg, history, event, now)
         if decision is None:
             continue
@@ -62,6 +64,25 @@ def check_metrics(conn, notifier, now):
                 title=f"{name.upper()} cleared",
             )
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
+        elif decision.action == "escalate":
+            promoted = decision.tier != event["tier"]
+            if promoted:
+                detail = (
+                    f"crossed the {_fmt(name, decision.threshold, temp_unit)} ceiling"
+                )
+            else:
+                detail = (
+                    f"doubled since last notice"
+                    f" (peak {_fmt(name, event['peak_value'], temp_unit)})"
+                )
+            notifier.send(
+                f"{name.upper()} at {_fmt(name, decision.value, temp_unit)} — {detail}",
+                title=f"{name.upper()} escalating",
+                priority="high",
+            )
+            db.escalate_event(
+                conn, event["id"], now, value=decision.value, tier=decision.tier
+            )
         elif decision.action == "renotify":
             notifier.send(
                 f"{name.upper()} still elevated at"
@@ -69,7 +90,7 @@ def check_metrics(conn, notifier, now):
                 f" (peak {_fmt(name, event['peak_value'], temp_unit)})",
                 title=f"{name.upper()} still elevated",
             )
-            db.mark_renotified(conn, event["id"], now)
+            db.mark_renotified(conn, event["id"], now, value=decision.value)
 
 
 class DeviceHealth:

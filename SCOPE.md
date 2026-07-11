@@ -155,6 +155,18 @@ Per metric (CO2, TVOC, PM2.5):
 - **Close condition (hysteresis):** an open event closes only when the value is
   **both** below baseline + (K/2) × spread **and** below the ceiling, sustained
   for 10 minutes. One "spike" notification at open, one "cleared" at close.
+  The baseline and spread here are the ones **stored on the event at open** —
+  recomputing from trailing history lets a long event drag the median up to its
+  own plateau and close while air is still far above pre-event levels
+  (observed 2026-07-11: a day-long VOC event pushed the moving close threshold
+  from 396 to 2535).
+- **Escalation (mid-event paging):** an open event pages again immediately when
+  (a) a relative-tier event crosses its absolute ceiling for 2 consecutive polls
+  — the event is promoted to ceiling tier — or (b) the median of the last 4
+  polls reaches **2× the value at the last notification**. Each notification
+  (open, renotify, escalate) records `notified_value`, so magnitude escalations
+  ladder: 2×, 4×, 8× each page exactly once. Without this, a doubling mid-event
+  would sit silent until the 12h reminder.
 - **Re-arm for long events:** if an event is still open after 12h (e.g., VOC
   baseline drift parking readings high for days), send one "still elevated"
   reminder, update `renotified_at` and `peak_value`, and repeat at most every 12h.

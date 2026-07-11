@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS alert_events (
     peak_value REAL, baseline REAL, threshold REAL,
     open_notified INTEGER NOT NULL DEFAULT 0,
     close_notified INTEGER NOT NULL DEFAULT 0,
-    renotified_at TEXT
+    renotified_at TEXT,
+    notified_value REAL
 );
 
 CREATE TABLE IF NOT EXISTS fan_state (
@@ -69,7 +70,32 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn) -> None:
+    """In-place additions for DBs created under an older SCHEMA.
+
+    CREATE TABLE IF NOT EXISTS leaves existing tables untouched, so columns
+    added to SCHEMA after first deploy need an explicit ALTER here.
+    """
+    _add_column(conn, "alert_events", "notified_value REAL")
+
+
+def _add_column(conn, table: str, column_def: str) -> None:
+    """ALTER ADD COLUMN that tolerates the column already existing.
+
+    Poller and web both run connect() after restart.sh; a check-then-ALTER
+    would let the loser of that race crash on "duplicate column name", so
+    the ALTER is attempted unconditionally and duplicates read as success.
+    """
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        if "duplicate column" not in str(exc).lower():
+            raise
 
 
 def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
@@ -141,22 +167,22 @@ def get_open_events(conn) -> dict:
     """Open alert events keyed by metric (at most one open per metric)."""
     rows = conn.execute(
         "SELECT id, metric, tier, opened_at, renotified_at, peak_value,"
-        " baseline, threshold FROM alert_events WHERE closed_at IS NULL"
+        " baseline, threshold, notified_value"
+        " FROM alert_events WHERE closed_at IS NULL"
     )
     return {
-        metric: {
-            "id": event_id,
-            "metric": metric,
-            "tier": tier,
-            "opened_at": datetime.fromisoformat(opened_at),
-            "renotified_at": (
-                datetime.fromisoformat(renotified_at) if renotified_at else None
-            ),
-            "peak_value": peak,
-            "baseline": baseline,
-            "threshold": threshold,
+        row[1]: {
+            "id": row[0],
+            "metric": row[1],
+            "tier": row[2],
+            "opened_at": datetime.fromisoformat(row[3]),
+            "renotified_at": (datetime.fromisoformat(row[4]) if row[4] else None),
+            "peak_value": row[5],
+            "baseline": row[6],
+            "threshold": row[7],
+            "notified_value": row[8],
         }
-        for event_id, metric, tier, opened_at, renotified_at, peak, baseline, threshold in rows
+        for row in rows
     }
 
 
@@ -165,8 +191,9 @@ def open_event(
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO alert_events"
-        " (metric, tier, opened_at, peak_value, baseline, threshold, open_notified)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " (metric, tier, opened_at, peak_value, baseline, threshold,"
+        "  open_notified, notified_value)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             metric,
             tier,
@@ -175,6 +202,7 @@ def open_event(
             baseline,
             threshold,
             int(notified),
+            value,
         ),
     )
     conn.commit()
@@ -198,10 +226,21 @@ def update_peak(conn, event_id, value) -> None:
     conn.commit()
 
 
-def mark_renotified(conn, event_id, at) -> None:
+def mark_renotified(conn, event_id, at, value) -> None:
+    """Record a mid-event notification; `value` re-arms escalation laddering."""
     conn.execute(
-        "UPDATE alert_events SET renotified_at = ? WHERE id = ?",
-        (at.isoformat(), event_id),
+        "UPDATE alert_events SET renotified_at = ?, notified_value = ? WHERE id = ?",
+        (at.isoformat(), value, event_id),
+    )
+    conn.commit()
+
+
+def escalate_event(conn, event_id, at, value, tier) -> None:
+    """Tier promotion and/or magnitude escalation: one notification, re-arm."""
+    conn.execute(
+        "UPDATE alert_events SET tier = ?, renotified_at = ?, notified_value = ?"
+        " WHERE id = ?",
+        (tier, at.isoformat(), value, event_id),
     )
     conn.commit()
 
