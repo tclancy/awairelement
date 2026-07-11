@@ -120,6 +120,25 @@ def actuate(decision: MitigationDecision, config: FansConfig, opener=None) -> bo
         return False
 
 
+def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
+    """Manual smoke test (`--test`): every fan to speed1, then a "Fan test" page.
+
+    Deliberately ignores config.enabled — proving the NodeMCU and ntfy plumbing
+    works is what you do before flipping mitigation on. Successful commands are
+    recorded so a running poller resumes from physical truth (and turns the
+    fans back off once no event calls for them).
+    """
+    for fan_id in config.fan_ids:
+        decision = MitigationDecision(
+            fan_id=fan_id, action="speed1", reason="manual fan test"
+        )
+        ok = actuate(decision, config, opener)
+        log.info("fan test: fan %d -> speed1 actuate=%s", fan_id, ok)
+        if ok:
+            db.upsert_fan_state(conn, fan_id=fan_id, action="speed1", command_at=now)
+    notifier.send("Fan test")
+
+
 def check_fans(conn, notifier, config: FansConfig, now) -> None:
     """One poll's worth of fan control. No-op when config.enabled is False."""
     if not config.enabled:

@@ -332,3 +332,42 @@ def test_config_from_env_enabled_is_strict(monkeypatch):
     # partial rename (e.g. "on") must never accidentally activate fans.
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "on")
     assert fans.config_from_env().enabled is False
+
+
+# --- run_fan_test: the poller's manual --test smoke switch ---
+
+
+def test_run_fan_test_actuates_all_fans_and_notifies(conn):
+    calls = []
+    notifier = FakeNotifier()
+    config = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
+    fans.run_fan_test(conn, notifier, config, NOW, opener=fake_url_opener(calls))
+
+    assert [url for url, _ in calls] == [
+        "http://host.local/fan/1/speed1",
+        "http://host.local/fan/2/speed1",
+    ]
+    assert notifier.sent == [("", "Fan test", "default")]
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+    assert db.get_fan_state(conn, 2)["last_action"] == "speed1"
+
+
+def test_run_fan_test_ignores_enabled_flag(conn):
+    # Proving the plumbing works is exactly what you do BEFORE flipping
+    # mitigation on, so --test must not be gated on enabled.
+    calls = []
+    config = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    fans.run_fan_test(conn, FakeNotifier(), config, NOW, opener=fake_url_opener(calls))
+    assert calls
+
+
+def test_run_fan_test_does_not_record_state_on_actuate_failure(conn):
+    def broken(url, timeout):
+        raise OSError("connection refused")
+
+    notifier = FakeNotifier()
+    config = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    fans.run_fan_test(conn, notifier, config, NOW, opener=broken)
+
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"  # DB truth preserved
+    assert notifier.sent  # the ntfy half still runs
