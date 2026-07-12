@@ -49,7 +49,9 @@ def conn(tmp_path):
 
 def test_parse_reading_merges_weather_and_air_quality():
     reading = parse_reading(WEATHER, AIR_QUALITY, received_at=RECEIVED)
-    assert reading["ts"] == "2026-07-12T04:30"
+    # Open-Meteo's minute-precision naive `current.time` is normalized to a
+    # full ISO UTC string so lexicographic `ts >= ?` filters work correctly.
+    assert reading["ts"] == "2026-07-12T04:30:00+00:00"
     assert reading["received_at"] == RECEIVED
     assert reading["temp"] == 22.4
     assert reading["humid"] == 68
@@ -85,6 +87,14 @@ def test_parse_reading_requires_weather_time():
     del payload["current"]["time"]
     with pytest.raises(KeyError):
         parse_reading(payload, AIR_QUALITY, received_at=RECEIVED)
+
+
+def test_parse_reading_normalizes_naive_open_meteo_time():
+    """Prod payloads carry a naive `HH:MM` string; storage needs full ISO+tz."""
+    reading = parse_reading(WEATHER, AIR_QUALITY, received_at=RECEIVED)
+    # Full ISO with UTC offset — sorts lexicographically alongside
+    # `since.isoformat()` values from callers.
+    assert reading["ts"] == "2026-07-12T04:30:00+00:00"
 
 
 def test_parse_reading_null_air_quality_gives_null_aq_columns():

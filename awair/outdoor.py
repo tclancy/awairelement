@@ -64,6 +64,22 @@ AIR_QUALITY_TO_COLUMN = {
 }
 
 
+def _normalize_source_time(source_time: str) -> str:
+    """Canonicalize Open-Meteo's `current.time` to a full ISO UTC string.
+
+    Open-Meteo returns `"YYYY-MM-DDTHH:MM"` when polled with `timezone=UTC` —
+    minute precision, naive. Storing that verbatim breaks lexicographic
+    `WHERE ts >= ?` filters because the short form sorts *before* the full
+    ISO strings that callers pass in via `since.isoformat()`. Normalize
+    both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
+    time comparison.
+    """
+    parsed = datetime.fromisoformat(source_time)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
     params = urllib.parse.urlencode(
         {
@@ -97,7 +113,7 @@ def parse_reading(
     """
     weather_current = weather_payload["current"]
     reading = {col: None for col in db.OUTDOOR_COLUMNS}
-    reading["ts"] = weather_current["time"]
+    reading["ts"] = _normalize_source_time(weather_current["time"])
     reading["received_at"] = received_at
     for source_field, column in WEATHER_TO_COLUMN.items():
         reading[column] = weather_current.get(source_field)
