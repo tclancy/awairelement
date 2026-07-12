@@ -16,14 +16,25 @@ from awair.fans import (
     check_fans,
     decide,
     desired_action,
+    events_to_engage,
 )
 from tests._helpers import FakeNotifier, fake_url_opener
 
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
 
+# Below FAN_SCORE_GATE — the score at which an event is worth spending fans on.
+BAD_SCORE = 70
+GOOD_SCORE = 84
 
-def _event(metric, tier="relative"):
-    return {"metric": metric, "tier": tier, "id": 1}
+
+def _event(metric, tier="relative", fans_engaged=1, event_id=1):
+    """An open event. Latched by default — most fan rules predate the gate."""
+    return {
+        "metric": metric,
+        "tier": tier,
+        "id": event_id,
+        "fans_engaged": fans_engaged,
+    }
 
 
 # --- desired_action: spike-event tiers → fan speed ---
@@ -91,6 +102,90 @@ def test_pm25_metric_event_does_not_trigger_fans():
     # PM25 spikes must not turn fans on (still a suppressor at raw threshold).
     action, _ = desired_action({"pm25": _event("pm25", tier="ceiling")}, 5.0)
     assert action == "off"
+
+
+# --- desired_action: the score gate (only latched events drive fans) ---
+
+
+def test_unlatched_event_does_not_drive_fans():
+    # A voc spike the score never agreed with: TVOC is elevated but the air is
+    # fine overall. This is the "closed the windows, fans came on" complaint.
+    action, reason = desired_action(
+        {"voc": _event("voc", tier="ceiling", fans_engaged=0)}, latest_pm25=5.0
+    )
+    assert action == "off"
+    assert "no co2/voc spike" in reason
+
+
+def test_only_latched_events_count_toward_speed():
+    # co2 latched, voc not: one effective trigger, so speed1 — not speed2.
+    action, reason = desired_action(
+        {
+            "co2": _event("co2", fans_engaged=1),
+            "voc": _event("voc", fans_engaged=0),
+        },
+        latest_pm25=5.0,
+    )
+    assert action == "speed1"
+    assert "co2" in reason
+    assert "voc" not in reason
+
+
+def test_pm25_suppression_still_beats_a_latched_event():
+    # The latch is a relevance gate, not an override of the safety suppressor.
+    action, reason = desired_action(
+        {"voc": _event("voc", tier="ceiling", fans_engaged=1)}, latest_pm25=30.0
+    )
+    assert action == "off"
+    assert "pm25" in reason
+
+
+# --- events_to_engage: which open events latch on this poll ---
+
+
+def test_score_below_gate_engages_an_open_trigger():
+    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
+    assert events_to_engage(open_events, latest_score=BAD_SCORE) == [7]
+
+
+def test_score_above_gate_engages_nothing():
+    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
+    assert events_to_engage(open_events, latest_score=GOOD_SCORE) == []
+
+
+def test_score_exactly_at_gate_does_not_engage():
+    # Gate is a strict "drops below 75" — 75 itself is still acceptable air.
+    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
+    assert events_to_engage(open_events, latest_score=fans.FAN_SCORE_GATE) == []
+
+
+def test_missing_score_engages_nothing():
+    # Absent/stale data means don't act. Never hallucinate a bad score.
+    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
+    assert events_to_engage(open_events, latest_score=None) == []
+
+
+def test_already_latched_event_is_not_re_engaged():
+    # Idempotence: the latch is written once, not re-stamped every poll.
+    open_events = {"voc": _event("voc", fans_engaged=1, event_id=7)}
+    assert events_to_engage(open_events, latest_score=BAD_SCORE) == []
+
+
+def test_non_fan_trigger_events_never_engage():
+    # A pm25 or device event must not latch — they aren't fan triggers.
+    open_events = {
+        "pm25": _event("pm25", fans_engaged=0, event_id=7),
+        "device": _event("device", fans_engaged=0, event_id=8),
+    }
+    assert events_to_engage(open_events, latest_score=BAD_SCORE) == []
+
+
+def test_multiple_open_triggers_engage_together():
+    open_events = {
+        "co2": _event("co2", fans_engaged=0, event_id=3),
+        "voc": _event("voc", fans_engaged=0, event_id=4),
+    }
+    assert sorted(events_to_engage(open_events, latest_score=BAD_SCORE)) == [3, 4]
 
 
 # --- decide: no-op filter + 1-cmd/min per-fan rate limit ---
@@ -192,17 +287,20 @@ def conn(tmp_path):
     return db.connect(tmp_path / "test.db")
 
 
-def _seed_reading(conn, pm25, ts=NOW):
+def _seed_reading(conn, pm25, ts=NOW, score=BAD_SCORE):
+    """One reading. Score defaults BELOW the gate so fans are free to engage —
+    tests that care about the gate pass GOOD_SCORE explicitly."""
     ts_iso = db.iso_z(ts)
     conn.execute(
-        "INSERT INTO readings (ts, received_at, co2, voc, pm25) VALUES (?, ?, ?, ?, ?)",
-        (ts_iso, ts_iso, 500, 100, pm25),
+        "INSERT INTO readings (ts, received_at, score, co2, voc, pm25)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (ts_iso, ts_iso, score, 500, 100, pm25),
     )
     conn.commit()
 
 
 def _seed_event(conn, metric, tier="relative"):
-    db.open_event(
+    return db.open_event(
         conn,
         metric=metric,
         tier=tier,
@@ -305,6 +403,100 @@ def test_check_fans_actuate_failure_does_not_advance_last_action(conn, monkeypat
     # But last_command_at IS stamped so the rate limit gates the retry to
     # 1 attempt / RATE_LIMIT — a broken NodeMCU is not spammed every poll.
     assert state["last_command_at"] == NOW
+
+
+# --- check_fans: the score gate + latch, end to end ---
+
+
+def test_check_fans_ignores_a_spike_the_score_disagrees_with(conn, monkeypatch):
+    """The bug report: TVOC ceiling breached, but overall air is fine (score 84).
+
+    Closing the windows nudges TVOC up without meaningfully degrading air
+    quality. No fan should move, and no latch should be written.
+    """
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    _seed_reading(conn, pm25=5.0, score=GOOD_SCORE)
+    _seed_event(conn, "voc", tier="ceiling")
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert calls == []
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
+
+
+def test_check_fans_engages_and_persists_the_latch(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    _seed_reading(conn, pm25=5.0, score=BAD_SCORE)
+    _seed_event(conn, "voc", tier="ceiling")
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/speed1"]
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
+
+
+def test_latched_event_keeps_fans_on_after_the_score_recovers(conn, monkeypatch):
+    """The whole point of the latch.
+
+    The score lives astride the gate (p1=73, p5=76 in real data). Once we've
+    committed to running the fans for an event, a score bobbing back over 75
+    must NOT turn them off — that oscillation is what would have Tom fighting
+    the fans.
+    """
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+
+    # Poll 1: score dips, event latches, fan spins up.
+    _seed_reading(conn, pm25=5.0, score=BAD_SCORE)
+    _seed_event(conn, "voc", tier="ceiling")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+
+    # Poll 2, two minutes later (past the rate limit): score has recovered to 84,
+    # but the event is still open and still latched.
+    calls.clear()
+    later = NOW + timedelta(minutes=2)
+    _seed_reading(conn, pm25=5.0, ts=later, score=GOOD_SCORE)
+    check_fans(conn, FakeNotifier(), cfg, later)
+
+    # No new command at all: desired is still speed1, so decide() no-ops.
+    assert calls == []
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+
+
+def test_score_gate_does_not_block_the_pm25_safety_off(conn, monkeypatch):
+    """A good score must never strand the fans ON during a particulate spike."""
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(minutes=5)
+    )
+    # Score is fine, pm25 is not. Suppressor must still force the fan off.
+    _seed_reading(conn, pm25=30.0, score=GOOD_SCORE)
+    _seed_event(conn, "voc", tier="ceiling")
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
+
+
+def test_stale_score_does_not_engage_fans(conn, monkeypatch):
+    """A score older than SCORE_FRESHNESS reads as no data — don't act on it."""
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    # Bad score, but from an hour ago — well outside the freshness window.
+    _seed_reading(conn, pm25=5.0, ts=NOW - timedelta(hours=1), score=BAD_SCORE)
+    _seed_event(conn, "voc", tier="ceiling")
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert calls == []
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
 
 
 # --- config: env parsing ---

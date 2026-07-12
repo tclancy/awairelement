@@ -1,12 +1,23 @@
 """Ceiling-fan mitigation: turn fans on when CO2/TVOC spike, off otherwise.
 
-The trigger surface reuses `awair.spikes` events (co2/voc open = fans should run;
-both closed = fans off). PM2.5 is a **suppressor** — an elevated pm25 reading
-blocks turn-on and forces any running fan off, because fans re-suspend particulate
-and would worsen the local reading. See issue #10 for the design memo.
+The trigger surface reuses `awair.spikes` events, but an open co2/voc event is not
+enough on its own: it must also have **latched** (`fans_engaged`), which happens the
+first time the Awair score drops below FAN_SCORE_GATE while that event is open. A
+spike the score never agreed with never moves a fan.
+
+The latch is write-once per event, and deliberately so. The score hovers right around
+the gate (p1=73, p5=76 in practice), so re-deciding every poll would oscillate the
+fans — and would re-engage them after a manual shutoff at the wall. Latching means we
+form an opinion exactly once per event; `decide()`'s no-op filter then guarantees we
+never re-command a fan the user has overridden.
+
+PM2.5 remains a **suppressor** outranking all of it — an elevated pm25 reading blocks
+turn-on and forces any running fan off, because fans re-suspend particulate and would
+worsen the local reading. See issue #10 for the design memo.
 
 Split cleanly for testability:
 
+- `events_to_engage(open_events, latest_score)` — pure; which events latch now.
 - `desired_action(open_events, latest_pm25)` — pure verdict from sensor state.
 - `decide(fan_id, action, reason, state, now)` — rate-limit + no-op filter.
 - `actuate(decision, config, opener)` — thin urllib GET at the NodeMCU endpoint.
@@ -30,6 +41,11 @@ RATE_LIMIT = timedelta(seconds=60)
 # Trust pm25 only within this window — the suppressor must not act on a hours-old
 # reading if the sensor drops pm25 for a while.
 PM25_FRESHNESS = timedelta(minutes=5)
+# An open co2/voc event only earns the fans once the Awair score agrees the air
+# has actually degraded. A spike that never moves the score isn't worth spinning
+# up for — that's the "closed the windows, fans came on" complaint.
+FAN_SCORE_GATE = 75.0
+SCORE_FRESHNESS = timedelta(minutes=5)
 FAN_CMD_TIMEOUT_SECONDS = 5
 DEFAULT_FAN_HOST = "192.168.68.68"
 DEFAULT_FAN_IDS = (1, 2)
@@ -58,19 +74,44 @@ def config_from_env() -> FansConfig:
     )
 
 
+def events_to_engage(open_events: dict, latest_score: float | None) -> list:
+    """Ids of open co2/voc events that should latch as fan-worthy on this poll.
+
+    An event latches the first time the score drops below the gate while it is
+    open. Already-latched events are not returned — the latch is written once,
+    and after that the score is never consulted again for that event.
+
+    A missing/stale score (None) engages nothing: absent data means don't act.
+    """
+    if latest_score is None or latest_score >= FAN_SCORE_GATE:
+        return []
+    return [
+        open_events[m]["id"]
+        for m in FAN_TRIGGERS
+        if m in open_events and not open_events[m].get("fans_engaged")
+    ]
+
+
 def desired_action(open_events: dict, latest_pm25: float | None) -> tuple[str, str]:
     """From spike events + latest pm25, compute the target fan action.
 
     Rules (see #10):
       - pm25 >= 25 always suppresses fans (particulate re-suspension risk).
-      - No co2/voc events open → off.
-      - One of co2/voc open → speed1.
-      - Both open, both relative tier → speed2.
-      - Both open, either at ceiling tier → speed3.
+      - No *engaged* co2/voc events open → off.
+      - One of co2/voc engaged → speed1.
+      - Both engaged, both relative tier → speed2.
+      - Both engaged, either at ceiling tier → speed3.
+
+    Only events whose `fans_engaged` latch is set count. An open spike the score
+    never agreed with is invisible here, so the fans stay put.
     """
     if latest_pm25 is not None and latest_pm25 >= PM25_SUPPRESS_THRESHOLD:
         return "off", f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans"
-    active = [open_events[m] for m in FAN_TRIGGERS if m in open_events]
+    active = [
+        open_events[m]
+        for m in FAN_TRIGGERS
+        if m in open_events and open_events[m].get("fans_engaged")
+    ]
     if not active:
         return "off", "no co2/voc spike"
     metrics = "+".join(sorted(e["metric"] for e in active))
@@ -139,11 +180,28 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
     notifier.send("Fan test")
 
 
+def _engage_qualifying_events(conn, open_events: dict, now) -> dict:
+    """Latch any open trigger whose air quality has now dropped below the gate.
+
+    Returns open_events refreshed from the DB when anything latched, so the
+    caller's verdict is computed against the state we just persisted.
+    """
+    score = db.latest_score(conn, since=now - SCORE_FRESHNESS)
+    newly_engaged = events_to_engage(open_events, score)
+    if not newly_engaged:
+        return open_events
+    for event_id in newly_engaged:
+        db.mark_fans_engaged(conn, event_id)
+        log.info("event %d engaged for fans (score %.0f)", event_id, score)
+    return db.get_open_events(conn)
+
+
 def check_fans(conn, notifier, config: FansConfig, now) -> None:
     """One poll's worth of fan control. No-op when config.enabled is False."""
     if not config.enabled:
         return
     open_events = db.get_open_events(conn)
+    open_events = _engage_qualifying_events(conn, open_events, now)
     latest_pm25 = db.latest_pm25(conn, since=now - PM25_FRESHNESS)
     action, reason = desired_action(open_events, latest_pm25)
     for fan_id in config.fan_ids:

@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS alert_events (
     open_notified INTEGER NOT NULL DEFAULT 0,
     close_notified INTEGER NOT NULL DEFAULT 0,
     renotified_at TEXT,
-    notified_value REAL
+    notified_value REAL,
+    fans_engaged INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS fan_state (
@@ -103,6 +104,10 @@ def _migrate(conn) -> None:
     added to SCHEMA after first deploy need an explicit ALTER here.
     """
     _add_column(conn, "alert_events", "notified_value REAL")
+    # The fan score gate's latch. DEFAULT 0 is load-bearing: a live DB has open
+    # events at migration time, and they must land unlatched rather than
+    # spuriously driving the fans on the first poll after deploy.
+    _add_column(conn, "alert_events", "fans_engaged INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -220,7 +225,7 @@ def get_open_events(conn) -> dict:
     """Open alert events keyed by metric (at most one open per metric)."""
     rows = conn.execute(
         "SELECT id, metric, tier, opened_at, renotified_at, peak_value,"
-        " baseline, threshold, notified_value"
+        " baseline, threshold, notified_value, fans_engaged"
         " FROM alert_events WHERE closed_at IS NULL"
     )
     return {
@@ -234,9 +239,20 @@ def get_open_events(conn) -> dict:
             "baseline": row[6],
             "threshold": row[7],
             "notified_value": row[8],
+            "fans_engaged": row[9],
         }
         for row in rows
     }
+
+
+def mark_fans_engaged(conn, event_id) -> None:
+    """Latch this event as fan-worthy: the score dipped below the gate while it
+    was open. Write-once — the score is never consulted again for this event."""
+    conn.execute(
+        "UPDATE alert_events SET fans_engaged = 1 WHERE id = ?",
+        (event_id,),
+    )
+    conn.commit()
 
 
 def open_event(
@@ -309,6 +325,22 @@ def latest_pm25(conn, since) -> float | None:
     row = conn.execute(
         "SELECT pm25 FROM readings"
         " WHERE ts >= ? AND pm25 IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (iso_z(since),),
+    ).fetchone()
+    return float(row[0]) if row else None
+
+
+def latest_score(conn, since) -> float | None:
+    """Most recent Awair score at or after `since`, or None.
+
+    Bounded by `since` for the same reason as `latest_pm25`: the score is a
+    gate on spending fans, and a stale value must not authorize (or veto) a
+    turn-on. Returns None when the last read is older than the window; the
+    caller treats that as 'no data' and declines to engage.
+    """
+    row = conn.execute(
+        "SELECT score FROM readings"
+        " WHERE ts >= ? AND score IS NOT NULL ORDER BY ts DESC LIMIT 1",
         (iso_z(since),),
     ).fetchone()
     return float(row[0]) if row else None

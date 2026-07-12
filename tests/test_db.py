@@ -74,6 +74,111 @@ def test_migration_tolerates_losing_the_startup_race(conn):
     db._add_column(conn, "alert_events", "notified_value REAL")
 
 
+def test_connect_adds_fans_engaged_column_to_legacy_db(tmp_path):
+    # The fan score-gate latch. A live DB already has open alert_events rows,
+    # so the ALTER must supply a default rather than a NOT NULL with no value.
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE alert_events ("
+        " id INTEGER PRIMARY KEY, metric TEXT NOT NULL, tier TEXT NOT NULL,"
+        " opened_at TEXT NOT NULL, closed_at TEXT,"
+        " peak_value REAL, baseline REAL, threshold REAL,"
+        " open_notified INTEGER NOT NULL DEFAULT 0,"
+        " close_notified INTEGER NOT NULL DEFAULT 0, renotified_at TEXT)"
+    )
+    # An event that is already open when the migration lands — exactly the
+    # in-flight voc event on homelab today.
+    legacy.execute(
+        "INSERT INTO alert_events (metric, tier, opened_at) VALUES ('voc', 'ceiling', ?)",
+        (NOW.isoformat(),),
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
+    assert "fans_engaged" in columns
+    # The pre-existing open event defaults to unlatched — it must not
+    # spuriously drive the fans the moment we deploy.
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
+
+
+# --- fans_engaged latch ---
+
+
+def test_open_event_starts_unlatched(conn):
+    _open_voc_event(conn)
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
+
+
+def test_mark_fans_engaged_sets_the_latch(conn):
+    event_id = _open_voc_event(conn)
+    db.mark_fans_engaged(conn, event_id)
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
+
+
+def test_mark_fans_engaged_is_idempotent(conn):
+    event_id = _open_voc_event(conn)
+    db.mark_fans_engaged(conn, event_id)
+    db.mark_fans_engaged(conn, event_id)
+    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
+
+
+def _open_voc_event(conn):
+    return db.open_event(
+        conn,
+        metric="voc",
+        tier="ceiling",
+        opened_at=NOW,
+        value=2500.0,
+        baseline=800.0,
+        threshold=2200.0,
+        notified=True,
+    )
+
+
+# --- latest_score: freshness-bounded, mirrors latest_pm25 ---
+
+
+def test_latest_score_empty_is_none(conn):
+    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
+
+
+def test_latest_score_returns_most_recent_within_window(conn):
+    for minutes_ago, score in ((4, 84), (1, 70)):
+        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
+            (ts, ts, score),
+        )
+    conn.commit()
+    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 70
+
+
+def test_latest_score_returns_none_when_only_stale_readings(conn):
+    # A score from an hour ago must not gate today's fans.
+    ts = db.iso_z(NOW - timedelta(hours=1))
+    conn.execute(
+        "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)", (ts, ts, 70)
+    )
+    conn.commit()
+    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
+
+
+def test_latest_score_skips_nulls(conn):
+    for minutes_ago, score in ((4, 72), (1, None)):
+        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
+            (ts, ts, score),
+        )
+    conn.commit()
+    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 72
+
+
 def test_insert_reading_stores_all_fields(conn):
     assert db.insert_reading(conn, reading_from_fixture()) is True
     row = conn.execute(
