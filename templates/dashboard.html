@@ -12,6 +12,7 @@
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
   --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
+  --series-outdoor-temp: #0b7a86;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
 @media (prefers-color-scheme: dark) {
@@ -21,6 +22,7 @@
     --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
     --series-co2: #3987e5; --series-voc: #008300; --series-pm25: #9085e9;
     --series-temp: #d95926; --series-humid: #e66767; --series-score: #c3c2b7;
+    --series-outdoor-temp: #4bb9c3;
   }
 }
 * { box-sizing: border-box; }
@@ -110,6 +112,10 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
     <div class="plot"></div>
   </section>
   {% endfor %}
+  <section class="card" data-outdoor="temp">
+    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    <div class="plot"></div>
+  </section>
 </main>
 <section id="events">
   <h2>Alert events</h2>

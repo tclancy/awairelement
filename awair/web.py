@@ -22,12 +22,29 @@ RANGES = {
     "30d": {"days": 30, "bucket_seconds": 900},
 }
 
+# Outdoor readings publish every 15 min at the source, so bucket sizes are
+# scaled up — indoor's 5-min bucket over 7d would leave most outdoor buckets
+# empty and paint a jittery gap-riddled line.
+OUTDOOR_RANGES = {
+    "7d": {"days": 7, "bucket_seconds": 900},
+    "30d": {"days": 30, "bucket_seconds": 3600},
+}
+
 
 def _range_params():
     name = request.args.get("range", "7d")
     if name not in RANGES:
         abort(400, f"range must be one of {sorted(RANGES)}")
     spec = RANGES[name]
+    since = datetime.now(timezone.utc) - timedelta(days=spec["days"])
+    return since, spec["bucket_seconds"]
+
+
+def _outdoor_range_params():
+    name = request.args.get("range", "7d")
+    if name not in OUTDOOR_RANGES:
+        abort(400, f"range must be one of {sorted(OUTDOOR_RANGES)}")
+    spec = OUTDOOR_RANGES[name]
     since = datetime.now(timezone.utc) - timedelta(days=spec["days"])
     return since, spec["bucket_seconds"]
 
@@ -100,5 +117,30 @@ def create_app(db_path=None):
                         if field in event:
                             event[field] = units.from_celsius(event[field], unit)
         return jsonify({"events": rows, "temp_unit_symbol": units.symbol(unit)})
+
+    @app.get("/api/outdoor-series")
+    def outdoor_series():
+        since, bucket_seconds = _outdoor_range_params()
+        conn = connect()
+        try:
+            rows = db.outdoor_readings_since(conn, ("temp",), since)
+        finally:
+            conn.close()
+        unit = temp_unit()
+        points = [(row[0], row[1]) for row in rows if row[1] is not None]
+        temp_series = bucket(points, bucket_seconds)
+        if unit != "C":
+            for key in ("avg", "min", "max"):
+                temp_series[key] = [
+                    units.from_celsius(v, unit) if v is not None else None
+                    for v in temp_series[key]
+                ]
+        return jsonify(
+            {
+                "bucket_seconds": bucket_seconds,
+                "metrics": {"temp": temp_series},
+                "temp_unit_symbol": units.symbol(unit),
+            }
+        )
 
     return app
