@@ -2,7 +2,7 @@
 
 from urllib.error import URLError
 
-from awair.alerts import Notifier
+from awair.alerts import USER_AGENT, Notifier
 
 
 class FakeOpener:
@@ -62,3 +62,22 @@ def test_send_without_token_omits_auth_header():
     opener = FakeOpener([None])
     Notifier("https://n", "awair", "", opener=opener).send("msg")
     assert opener.requests[0][0].get_header("Authorization") is None
+
+
+def test_send_identifies_itself_with_a_real_user_agent():
+    """Regression: urllib's default UA is `Python-urllib/<ver>`, which Cloudflare's
+    bot protection 403s. Every notification sent through the tunnel was silently
+    dropped from 2026-07-11 to 07-12. The poller now talks to ntfy on the loopback,
+    but alerts.py must not carry a footgun for any caller that does route it through
+    a WAF — so it identifies itself explicitly.
+    """
+    opener = FakeOpener([None])
+    assert notifier(opener).send("hi")
+    request, _ = opener.requests[0]
+    user_agent = request.get_header("User-agent")
+    assert user_agent == USER_AGENT
+    assert "urllib" not in user_agent.lower()
+    # Estate-wide convention: a shared `homelab/` prefix Cloudflare can
+    # allow-list in one rule, plus the app name so logs stay attributable.
+    assert user_agent.startswith("homelab/")
+    assert "awairelement" in user_agent
