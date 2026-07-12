@@ -21,7 +21,11 @@ class MetricConfig:
 
 METRICS = {
     "co2": MetricConfig("co2", floor=50.0, ceiling=1200.0),
-    "voc": MetricConfig("voc", floor=50.0, ceiling=1000.0),
+    # 2200 ppb is the conventional TVOC "unhealthy" boundary. The old 1000 sat
+    # at roughly this house's 65th percentile — VOC exceeded it 38% of the time,
+    # so it paged on ordinary living (closing a window would do it). See
+    # docs/superpowers/specs/2026-07-12-voc-threshold-score-gate-design.md.
+    "voc": MetricConfig("voc", floor=50.0, ceiling=2200.0),
     "pm25": MetricConfig("pm25", floor=4.0, ceiling=35.0),
 }
 

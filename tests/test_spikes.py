@@ -248,3 +248,31 @@ def test_no_second_renotify_within_12h():
 def test_no_renotify_before_12h():
     h = hours_of(500, 8)[:-40] + history([1100] * 40, end=NOW)
     assert evaluate(CO2, h, open_event(opened_at=NOW - timedelta(hours=3)), NOW) is None
+
+
+# --- voc ceiling: raised 1000 -> 2200 (see 2026-07-12 spec) ---
+
+VOC = METRICS["voc"]
+
+
+def test_voc_ceiling_is_above_this_houses_ordinary_range():
+    # The old 1000 ceiling sat at ~p65 of real readings — it fired on ordinary
+    # living. 2200 is the conventional TVOC "unhealthy" line and this house's
+    # ~p93. Pinned so a well-meaning tweak can't quietly re-introduce the noise.
+    assert VOC.ceiling == 2200.0
+
+
+def test_voc_at_old_ceiling_no_longer_opens_a_ceiling_event():
+    # 1500 ppb is routine here (p75 = 1418) and used to page. It must not now.
+    assert evaluate(VOC, hours_of(1500, 8), None, NOW) is None
+
+
+def test_voc_above_new_ceiling_still_opens():
+    # Two consecutive samples over 2200 — a genuine spike still pages.
+    past = hours_of(400, 8, end=NOW - timedelta(minutes=1))
+    spike = history([2500, 2600], end=NOW)
+    decision = evaluate(VOC, past + spike, None, NOW)
+    assert decision is not None
+    assert decision.action == "open"
+    assert decision.tier == "ceiling"
+    assert decision.threshold == 2200.0
