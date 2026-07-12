@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 export PATH="$HOME/.local/bin:$PATH"
 
 uv sync --frozen
-for unit in awairelement awairelement-web; do
+for unit in awairelement awairelement-web awairelement-outdoor; do
   if systemctl --user cat "$unit" >/dev/null 2>&1; then
     systemctl --user restart "$unit"
     echo "$unit: $(systemctl --user is-active "$unit")"
