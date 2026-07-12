@@ -131,7 +131,64 @@ def test_dashboard_page_renders(client):
     html = response.get_data(as_text=True)
     for name in METRIC_NAMES:
         assert f'data-metric="{name}"' in html
+    assert 'data-outdoor="temp"' in html
     assert "uplot" in html
+
+
+# --- /api/outdoor-series ---
+
+
+def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1)):
+    """Three 15-min-cadence outdoor readings ~30 minutes apart."""
+    conn = db.connect(db_path)
+    now = datetime.now(timezone.utc)
+    for offset, temp in enumerate(temps):
+        ts = (now - timedelta(minutes=15 * (len(temps) - 1 - offset))).isoformat()
+        conn.execute(
+            "INSERT INTO outdoor_readings (ts, received_at, temp) VALUES (?, ?, ?)",
+            (ts, ts, temp),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_outdoor_series_returns_temp_buckets(client, tmp_path):
+    db_path = tmp_path / "web.db"
+    _seed_outdoor(db_path)
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    assert payload["bucket_seconds"] == 900
+    temp = payload["metrics"]["temp"]
+    assert temp["t"]
+    for value in temp["avg"]:
+        # 20.0 <= v <= 22.4 across the seeded samples
+        if value is not None:
+            assert 20.0 <= value <= 22.4
+
+
+def test_outdoor_series_30d_uses_hourly_buckets(client):
+    payload = client.get("/api/outdoor-series?range=30d").get_json()
+    assert payload["bucket_seconds"] == 3600
+
+
+def test_outdoor_series_rejects_unknown_range(client):
+    assert client.get("/api/outdoor-series?range=1y").status_code == 400
+
+
+def test_outdoor_series_empty_returns_empty_series(client):
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    temp = payload["metrics"]["temp"]
+    assert temp == {"t": [], "avg": [], "min": [], "max": []}
+
+
+def test_outdoor_series_honors_fahrenheit(make_client, tmp_path):
+    client = make_client("F")
+    db_path = tmp_path / "web-F.db"
+    _seed_outdoor(db_path, temps=(0.0,))
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    assert payload["temp_unit_symbol"] == "°F"
+    temp = payload["metrics"]["temp"]
+    avg = [v for v in temp["avg"] if v is not None]
+    assert avg == [32.0]  # 0 C → 32 F
 
 
 # --- TEMPERATURE_UNIT env-var driven display conversion ---

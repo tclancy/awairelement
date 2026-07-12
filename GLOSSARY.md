@@ -24,6 +24,8 @@ same PR that lands the code.
 - **MetricConfig** — Per-metric threshold + hysteresis config used by `spikes.evaluate` to decide whether to open, close, or renotify an event.
 - **MitigationDecision** — Immutable dataclass emitted by `awair.fans.decide`: `fan_id`, target `action`, and human-readable `reason`. Consumed by `actuate`.
 - **notifier** — The `awair.alerts.Notifier` object that fans an event out to ntfy; injected into `poller.handle_device_health` and `monitor.check_metrics`.
+- **outdoor reading** — One row in the `outdoor_readings` table produced by `awair.outdoor.parse_reading(weather, air_quality, received_at)`. Sibling of **reading** (indoor). Different cadence (15 min at source vs. 30 s indoor) and different upstream (Open-Meteo vs. Awair Element local API), so kept in its own table rather than widening `readings`.
+- **outdoor poll** — One iteration of `awair.outdoor.poll_once`: `fetch_weather` + `fetch_air_quality` → `parse_reading` → `insert_outdoor_reading`. An AQ-endpoint outage does not wedge the weather write — the row lands with AQ columns NULL and the poll returns `"partial"`.
 - **poll** — One iteration of the poller loop: `fetch` → `parse_reading` → `insert_reading` → `check_metrics` → `check_fans`. Distinct from **fetch** — a poll wraps a fetch with DB + monitor side effects.
 - **reading** — One row in the `readings` table; produced by `poller.parse_reading(payload, received_at)`.
 - **series** — A bucketed time-window of readings for the dashboard, produced by `awair.series.bucket(points, bucket_seconds)`. **Not** a synonym for `metric_history` (which returns raw points).

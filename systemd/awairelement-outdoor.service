@@ -1,0 +1,20 @@
+# Dev reference copy — canonical unit is templated by the native-apps Ansible
+# role in the homelab repo (awairelement-outdoor.service.j2). Sibling of the
+# main awairelement.service so an Open-Meteo outage doesn't wedge the indoor
+# poller, and vice versa.
+# Manual install (non-Ansible boxes):
+#   ln -sf ~/sources/awairelement/systemd/awairelement-outdoor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now awairelement-outdoor
+[Unit]
+Description=Awair Element outdoor (Open-Meteo) poller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/sources/awairelement
+ExecStart=%h/sources/awairelement/.venv/bin/python -m awair.outdoor
+EnvironmentFile=-%h/.config/awairelement/environment
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

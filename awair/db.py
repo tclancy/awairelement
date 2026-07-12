@@ -43,7 +43,29 @@ CREATE TABLE IF NOT EXISTS fan_state (
     last_action TEXT NOT NULL CHECK (last_action IN ('off', 'speed1', 'speed2', 'speed3')),
     last_command_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS outdoor_readings (
+    ts TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
+    pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL
+);
 """
+
+OUTDOOR_COLUMNS = (
+    "ts",
+    "received_at",
+    "temp",
+    "humid",
+    "wind_speed",
+    "pressure",
+    "precipitation",
+    "pm25",
+    "pm10",
+    "us_aqi",
+    "co",
+    "o3",
+)
 
 READING_COLUMNS = (
     "ts",
@@ -108,6 +130,37 @@ def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     )
     conn.commit()
     return cursor.rowcount == 1
+
+
+def insert_outdoor_reading(conn: sqlite3.Connection, reading: dict) -> bool:
+    """Insert one outdoor reading. False if this source-time is already stored.
+
+    `ts` is Open-Meteo's `current.time` — the source publish time, not our
+    poll wall-clock. INSERT OR IGNORE makes the poll loop idempotent: if
+    the upstream hasn't refreshed since the previous poll (the weather
+    endpoint publishes every 15 min), the second write is a no-op.
+    """
+    placeholders = ", ".join(f":{col}" for col in OUTDOOR_COLUMNS)
+    cursor = conn.execute(
+        f"INSERT OR IGNORE INTO outdoor_readings ({', '.join(OUTDOOR_COLUMNS)})"
+        f" VALUES ({placeholders})",
+        reading,
+    )
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def outdoor_readings_since(conn, columns, since) -> list:
+    """[(epoch_seconds, col1, col2, ...)] ascending for outdoor columns."""
+    unknown = set(columns) - set(OUTDOOR_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown outdoor columns {unknown}")
+    rows = conn.execute(
+        f"SELECT ts, {', '.join(columns)} FROM outdoor_readings"
+        f" WHERE ts >= ? ORDER BY ts",
+        (since.isoformat(),),
+    )
+    return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
 
 def iso_z(dt) -> str:

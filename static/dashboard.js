@@ -15,6 +15,14 @@
     humid: { name: "Humidity", unit: "%",       digits: 1 },
     score: { name: "Score",    unit: "",        digits: 0 },
   };
+  const OUTDOOR_METRICS = {
+    temp: {
+      name: "Outdoor Temp",
+      unit: TEMP_UNIT,
+      digits: 1,
+      colorVar: "--series-outdoor-temp",
+    },
+  };
 
   const state = { range: "7d", plots: [], events: [] };
   const sync = uPlot.sync("awair");
@@ -144,19 +152,72 @@
       <tbody>${rows}</tbody></table>`;
   }
 
+  function makeOutdoorPlot(card, metric, series) {
+    const meta = OUTDOOR_METRICS[metric];
+    const color = cssVar(meta.colorVar);
+    const plotEl = card.querySelector(".plot");
+    plotEl.innerHTML = "";
+    const data = [series.t, series.min, series.max, series.avg];
+    const axisStyle = {
+      stroke: cssVar("--ink-muted"),
+      grid: { stroke: cssVar("--grid"), width: 1 },
+      ticks: { stroke: cssVar("--axis"), width: 1 },
+      font: "11px system-ui, sans-serif",
+    };
+    const plot = new uPlot(
+      {
+        width: plotEl.clientWidth || 320,
+        height: 150,
+        cursor: { sync: { key: sync.key }, points: { size: 7 } },
+        legend: { live: true },
+        scales: { x: { time: true } },
+        bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
+        series: [
+          { value: "{M}/{D} {h}:{mm}{aa}" },
+          { label: "low", stroke: null, points: { show: false } },
+          { label: "high", stroke: null, points: { show: false } },
+          {
+            label: "avg",
+            stroke: color,
+            width: 2,
+            points: { show: false },
+            spanGaps: false,
+          },
+        ],
+        axes: [{ ...axisStyle }, { ...axisStyle, size: 52 }],
+      },
+      data,
+      plotEl
+    );
+    sync.sub(plot);
+    state.plots.push(plot);
+    card.querySelector(".name").textContent = meta.name;
+    card.querySelector(".unit").textContent = meta.unit;
+    card.querySelector(".dot").style.background = color;
+    const latest = [...series.avg].reverse().find((v) => v != null);
+    card.querySelector(".now").textContent =
+      fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+  }
+
   async function load() {
-    const [seriesRes, eventsRes] = await Promise.all([
+    const [seriesRes, eventsRes, outdoorRes] = await Promise.all([
       fetch(`/api/series?range=${state.range}`),
       fetch(`/api/events?range=${state.range}`),
+      fetch(`/api/outdoor-series?range=${state.range}`),
     ]);
     const seriesPayload = await seriesRes.json();
     state.events = (await eventsRes.json()).events;
+    const outdoorPayload = await outdoorRes.json();
 
     state.plots.forEach((p) => p.destroy());
     state.plots = [];
     for (const card of document.querySelectorAll(".card[data-metric]")) {
       const metric = card.dataset.metric;
       makePlot(card, metric, seriesPayload.metrics[metric]);
+    }
+    for (const card of document.querySelectorAll(".card[data-outdoor]")) {
+      const metric = card.dataset.outdoor;
+      makeOutdoorPlot(card, metric, outdoorPayload.metrics[metric]);
     }
     renderEvents();
     document.getElementById("updated").textContent =
