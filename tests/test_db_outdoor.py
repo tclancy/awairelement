@@ -7,11 +7,6 @@ import pytest
 from awair import db
 
 
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
-
-
 def _row(**overrides):
     row = {col: None for col in db.OUTDOOR_COLUMNS}
     row["ts"] = "2026-07-12T04:30"
@@ -57,15 +52,17 @@ def test_outdoor_readings_schema_survives_re_connect(tmp_path):
     conn1.close()
     conn2 = db.connect(path)
     row = conn2.execute("SELECT temp FROM outdoor_readings").fetchone()
+    conn2.close()
     assert row == (22.4,)
 
 
 def test_indoor_pipeline_still_works(conn):
     """Sanity: adding outdoor_readings doesn't disturb the indoor pipeline."""
+    now = datetime.now(timezone.utc)
     reading = {col: None for col in db.READING_COLUMNS}
-    reading["ts"] = "2026-07-12T04:00:00.000Z"
-    reading["received_at"] = "2026-07-12T04:00:01+00:00"
+    reading["ts"] = db.iso_z(now - timedelta(hours=1))
+    reading["received_at"] = (now - timedelta(hours=1)).isoformat()
     reading["temp"] = 21.0
     assert db.insert_reading(conn, reading) is True
-    since = datetime.now(timezone.utc) - timedelta(days=1)
+    since = now - timedelta(days=1)
     assert db.metric_history(conn, "temp", since) != []

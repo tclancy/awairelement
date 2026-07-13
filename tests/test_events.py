@@ -2,16 +2,9 @@
 
 from datetime import datetime, timezone
 
-import pytest
-
 from awair import db
 
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
-
-
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
 
 
 def test_no_open_events_initially(conn):

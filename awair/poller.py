@@ -142,7 +142,10 @@ def main(argv=None) -> None:
     conn = db.connect(db_path)
 
     if args.test:
-        run_fan_test(conn, notifier, fans_config, datetime.now(timezone.utc))
+        try:
+            run_fan_test(conn, notifier, fans_config, datetime.now(timezone.utc))
+        finally:
+            conn.close()
         return
 
     fetch = make_fetch(url)
