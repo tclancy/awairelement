@@ -22,11 +22,6 @@ def default_celsius(monkeypatch):
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
 
 
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
-
-
 def iso_z(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 

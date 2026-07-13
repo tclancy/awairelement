@@ -6,8 +6,6 @@ Each scenario maps to a rule in issue #10 / #14. Trigger surface is
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from awair import db, fans
 from awair.fans import (
     FansConfig,
@@ -280,11 +278,6 @@ def test_actuate_failure_returns_false():
 
 
 # --- check_fans: end-to-end glue over the DB ---
-
-
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
 
 
 def _seed_reading(conn, pm25, ts=NOW, score=BAD_SCORE):

@@ -7,11 +7,6 @@ import pytest
 from awair import db
 
 
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
-
-
 def _row(**overrides):
     row = {col: None for col in db.OUTDOOR_COLUMNS}
     row["ts"] = "2026-07-12T04:30"
@@ -57,6 +52,7 @@ def test_outdoor_readings_schema_survives_re_connect(tmp_path):
     conn1.close()
     conn2 = db.connect(path)
     row = conn2.execute("SELECT temp FROM outdoor_readings").fetchone()
+    conn2.close()
     assert row == (22.4,)
 
 

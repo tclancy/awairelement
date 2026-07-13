@@ -13,11 +13,6 @@ FIXTURE = json.loads(
 )
 
 
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
-
-
 def reading_from_fixture(**overrides):
     from awair.poller import parse_reading
 
@@ -38,6 +33,7 @@ def test_connect_is_idempotent(tmp_path):
     db.connect(tmp_path / "test.db").close()
     conn = db.connect(tmp_path / "test.db")  # second bootstrap must not raise
     assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+    conn.close()
 
 
 def test_connect_enables_wal_and_busy_timeout(conn):
@@ -65,6 +61,7 @@ def test_connect_adds_notified_value_column_to_legacy_db(tmp_path):
 
     conn = db.connect(path)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
+    conn.close()
     assert "notified_value" in columns
 
 
@@ -104,6 +101,7 @@ def test_connect_adds_fans_engaged_column_to_legacy_db(tmp_path):
     # The pre-existing open event defaults to unlatched — it must not
     # spuriously drive the fans the moment we deploy.
     assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
+    conn.close()
 
 
 # --- fans_engaged latch ---

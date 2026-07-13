@@ -5,7 +5,6 @@ from urllib.error import URLError
 
 import pytest
 
-from awair import db
 from awair.outdoor import (
     AIR_QUALITY_FIELDS,
     WEATHER_FIELDS,
@@ -40,11 +39,6 @@ AIR_QUALITY = {
     }
 }
 AIR_QUALITY_TEXT = json.dumps(AIR_QUALITY)
-
-
-@pytest.fixture
-def conn(tmp_path):
-    return db.connect(tmp_path / "test.db")
 
 
 def test_parse_reading_merges_weather_and_air_quality():
