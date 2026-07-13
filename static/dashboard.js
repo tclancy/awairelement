@@ -63,11 +63,51 @@
     };
   }
 
+  // Dashed horizontal reference line at the alert ceiling for this metric.
+  // Anchors the eye when uPlot autoscales Y to a peak so 1500 ppb VOC doesn't
+  // read as "cleared" when it's still 15× baseline and above the ceiling (#25).
+  // Drawn in the `draw` hook so it lands over the series and event wash but
+  // below the crosshair overlay.
+  function ceilingLinePlugin(ceiling) {
+    return {
+      hooks: {
+        draw: (u) => {
+          if (u.scales.y.min == null || u.scales.y.max == null) return;
+          if (ceiling < u.scales.y.min || ceiling > u.scales.y.max) return;
+          const ctx = u.ctx;
+          const y = Math.round(u.valToPos(ceiling, "y", true)) + 0.5;
+          const color = cssVar("--event-ceiling") || "#d03b3b";
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+          ctx.clip();
+          ctx.strokeStyle = hexToRgba(color, 0.55);
+          ctx.lineWidth = 1;
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(u.bbox.left, y);
+          ctx.lineTo(u.bbox.left + u.bbox.width, y);
+          ctx.stroke();
+          ctx.restore();
+        },
+      },
+    };
+  }
+
   function makePlot(card, metric, series) {
     const meta = METRICS[metric];
     const color = cssVar(`--series-${metric}`);
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
+
+    // Server stamps the alert ceiling on the card when the metric has one in
+    // spikes.METRICS. Missing → no reference line for this chart.
+    const ceilingRaw = card.dataset.ceiling;
+    const ceiling = ceilingRaw ? Number(ceilingRaw) : null;
+    const plugins = [eventWashPlugin(metric)];
+    if (ceiling != null && Number.isFinite(ceiling)) {
+      plugins.push(ceilingLinePlugin(ceiling));
+    }
 
     const data = [series.t, series.min, series.max, series.avg];
     const axisStyle = {
@@ -104,7 +144,7 @@
           { ...axisStyle },
           { ...axisStyle, size: 52 },
         ],
-        plugins: [eventWashPlugin(metric)],
+        plugins,
       },
       data,
       plotEl

@@ -12,6 +12,7 @@ same PR that lands the code.
 <!-- Alphabetical by canonical name. One line per term. -->
 
 - **actuate** — Fire the intended fan state at the NodeMCU endpoint (`awair.fans.actuate`). Distinct from **decide**: `decide` produces the intent, `actuate` sends it.
+- **ceiling** — Per-metric absolute alert threshold on `MetricConfig` (`spikes.MetricConfig.ceiling`). A `ceiling`-tier event opens when the last 2 samples exceed it (bypasses the relative-baseline path). Dashboard renders it as a dashed reference line so autoscaled Y-axes don't visually collapse "still elevated" into "cleared" (#25). Values: co2=1200, voc=2200, pm25=35. Unrelated to the ceiling **fan** hardware; naming collision is intentional-and-fine.
 - **decide** — In `awair.fans`, the rate-limit + no-op filter around a **desired action**. Returns a `MitigationDecision` or `None`.
 - **desired action** — The verdict `awair.fans.desired_action` derives from open **event**s + latest pm25: `"off" | "speed1" | "speed2" | "speed3"`.
 - **DeviceHealth** — Snapshot of last-successful-fetch state used to detect the transition between healthy and stale/unreachable readings; owns the `ok`, `since`, and `last_status` fields on `awair.monitor.DeviceHealth`.
