@@ -35,6 +35,12 @@ OUTDOOR_RANGES = {
     "30d": {"days": 30, "bucket_seconds": 3600},
 }
 
+# Open-Meteo returns precipitation in mm. The dashboard displays inches — Tom's
+# expected scale on #31 was "tenths of an inch". Conversion happens at the API
+# boundary so storage stays raw (same shape as temperature: DB in Celsius,
+# display convert via TEMPERATURE_UNIT).
+_MM_PER_INCH = 25.4
+
 
 def _range_params():
     name = request.args.get("range", "7d")
@@ -129,22 +135,29 @@ def create_app(db_path=None):
         since, bucket_seconds = _outdoor_range_params()
         conn = connect()
         try:
-            rows = db.outdoor_readings_since(conn, ("temp",), since)
+            rows = db.outdoor_readings_since(conn, ("temp", "precipitation"), since)
         finally:
             conn.close()
         unit = temp_unit()
-        points = [(row[0], row[1]) for row in rows if row[1] is not None]
-        temp_series = bucket(points, bucket_seconds)
+        temp_points = [(row[0], row[1]) for row in rows if row[1] is not None]
+        precip_points = [(row[0], row[2]) for row in rows if row[2] is not None]
+        temp_series = bucket(temp_points, bucket_seconds)
+        precip_series = bucket(precip_points, bucket_seconds)
         if unit != "C":
             for key in ("avg", "min", "max"):
                 temp_series[key] = [
                     units.from_celsius(v, unit) if v is not None else None
                     for v in temp_series[key]
                 ]
+        for key in ("avg", "min", "max"):
+            precip_series[key] = [
+                round(v / _MM_PER_INCH, 3) if v is not None else None
+                for v in precip_series[key]
+            ]
         return jsonify(
             {
                 "bucket_seconds": bucket_seconds,
-                "metrics": {"temp": temp_series},
+                "metrics": {"temp": temp_series, "precipitation": precip_series},
                 "temp_unit_symbol": units.symbol(unit),
             }
         )
