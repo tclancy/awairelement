@@ -135,6 +135,18 @@ def test_dashboard_page_renders(client):
     assert "uplot" in html
 
 
+def test_dashboard_stamps_ceilings_for_alerting_metrics(client):
+    # data-ceiling on the card feeds the JS reference-line plugin (#25).
+    # Metrics without an alert ceiling (temp, humid, score) get no attribute.
+    from awair import spikes
+
+    html = client.get("/").get_data(as_text=True)
+    for metric, cfg in spikes.METRICS.items():
+        assert f'data-metric="{metric}" data-ceiling="{cfg.ceiling}"' in html
+    for silent in ("temp", "humid", "score"):
+        assert f'data-metric="{silent}" data-ceiling' not in html
+
+
 # --- /api/outdoor-series ---
 
 

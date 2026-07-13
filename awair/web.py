@@ -8,10 +8,15 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, units
+from awair import db, spikes, units
 from awair.series import bucket
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
+
+# Alert ceilings surfaced to the dashboard as horizontal reference lines so a
+# Y-axis autoscaled to a peak doesn't visually collapse "still elevated" into
+# "cleared" (#25). Metrics without an entry in spikes.METRICS get no line.
+CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.
@@ -71,6 +76,7 @@ def create_app(db_path=None):
         return render_template(
             "dashboard.html",
             metrics=METRIC_NAMES,
+            ceilings=CEILINGS,
             temp_unit_symbol=units.symbol(temp_unit()),
         )
 
