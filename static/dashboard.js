@@ -22,6 +22,12 @@
       digits: 1,
       colorVar: "--series-outdoor-temp",
     },
+    precipitation: {
+      name: "Precipitation",
+      unit: "in",
+      digits: 2,
+      colorVar: "--series-outdoor-precip",
+    },
   };
 
   const state = { range: "7d", plots: [], events: [] };

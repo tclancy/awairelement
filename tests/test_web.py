@@ -132,6 +132,7 @@ def test_dashboard_page_renders(client):
     for name in METRIC_NAMES:
         assert f'data-metric="{name}"' in html
     assert 'data-outdoor="temp"' in html
+    assert 'data-outdoor="precipitation"' in html
     assert "uplot" in html
 
 
@@ -150,15 +151,22 @@ def test_dashboard_stamps_ceilings_for_alerting_metrics(client):
 # --- /api/outdoor-series ---
 
 
-def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1)):
-    """Three 15-min-cadence outdoor readings ~30 minutes apart."""
+def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1), precips=None):
+    """Three 15-min-cadence outdoor readings ~30 minutes apart.
+
+    precips: optional matching iterable of mm rainfall per sample; None cells
+    are stored as SQL NULL to exercise the "some intervals had no precip" case.
+    """
     conn = db.connect(db_path)
     now = datetime.now(timezone.utc)
-    for offset, temp in enumerate(temps):
+    precips = precips if precips is not None else [None] * len(temps)
+    assert len(precips) == len(temps)
+    for offset, (temp, precip) in enumerate(zip(temps, precips)):
         ts = (now - timedelta(minutes=15 * (len(temps) - 1 - offset))).isoformat()
         conn.execute(
-            "INSERT INTO outdoor_readings (ts, received_at, temp) VALUES (?, ?, ?)",
-            (ts, ts, temp),
+            "INSERT INTO outdoor_readings (ts, received_at, temp, precipitation)"
+            " VALUES (?, ?, ?, ?)",
+            (ts, ts, temp, precip),
         )
     conn.commit()
     conn.close()
@@ -189,7 +197,33 @@ def test_outdoor_series_rejects_unknown_range(client):
 def test_outdoor_series_empty_returns_empty_series(client):
     payload = client.get("/api/outdoor-series?range=7d").get_json()
     temp = payload["metrics"]["temp"]
+    precip = payload["metrics"]["precipitation"]
     assert temp == {"t": [], "avg": [], "min": [], "max": []}
+    assert precip == {"t": [], "avg": [], "min": [], "max": []}
+
+
+def test_outdoor_series_returns_precipitation_in_inches(client, tmp_path):
+    # #31: precipitation graph. Open-Meteo stores mm; API converts to inches
+    # at the boundary so the dashboard's display unit stays consistent with
+    # Tom's expected scale ("tenths of an inch").
+    db_path = tmp_path / "web.db"  # match the `client` fixture's path
+    _seed_outdoor(db_path, temps=(20.0, 20.0), precips=(25.4, 12.7))
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    precip = payload["metrics"]["precipitation"]
+    values = [v for v in precip["avg"] if v is not None]
+    assert 1.0 in values  # 25.4 mm → 1.0 in
+    assert 0.5 in values  # 12.7 mm → 0.5 in
+
+
+def test_outdoor_series_precipitation_none_stays_none(client, tmp_path):
+    # Older rows have NULL precipitation (column added mid-flight). Absent
+    # samples must not crash the bucketer or the mm→in map.
+    db_path = tmp_path / "web.db"
+    _seed_outdoor(db_path, temps=(20.0, 20.0, 20.0), precips=(None, 5.08, None))
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    precip = payload["metrics"]["precipitation"]
+    non_null = [v for v in precip["avg"] if v is not None]
+    assert non_null == [0.2]  # 5.08 mm → 0.2 in
 
 
 def test_outdoor_series_honors_fahrenheit(make_client, tmp_path):
