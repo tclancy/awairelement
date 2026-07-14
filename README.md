@@ -70,6 +70,7 @@ omitted entirely to run without alerts.
 | `AWAIR_NTFY_URL` | `https://notifications.tomclancy.info` | ntfy server root. Use `https://ntfy.sh` for the public server. |
 | `AWAIR_NTFY_TOPIC` | `awair` | ntfy topic name. Pick your own. |
 | `AWAIR_NTFY_TOKEN` | *(unset)* | Access token if your topic is protected. Empty string = no auth header sent. |
+| `AWAIR_TZ` | `UTC` | IANA zone (e.g. `America/New_York`) for the dashboard's sunrise/sunset markers. Ignored if `AWAIR_LAT` / `AWAIR_LON` are unset. |
 
 To disable ntfy entirely, leave `AWAIR_NTFY_TOKEN` unset and pick a topic
 nobody's listening on — the poller will still POST but no one will see the

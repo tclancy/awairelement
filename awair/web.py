@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, spikes, units
+from awair import db, solar, spikes, units
 from awair.series import bucket
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -159,6 +159,7 @@ def create_app(db_path=None):
                 "bucket_seconds": bucket_seconds,
                 "metrics": {"temp": temp_series, "precipitation": precip_series},
                 "temp_unit_symbol": units.symbol(unit),
+                "daily_events": solar.daily_events(since, datetime.now(timezone.utc)),
             }
         )
 

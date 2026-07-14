@@ -226,6 +226,29 @@ def test_outdoor_series_precipitation_none_stays_none(client, tmp_path):
     assert non_null == [0.2]  # 5.08 mm → 0.2 in
 
 
+def test_outdoor_series_includes_daily_events_when_coords_set(client, monkeypatch):
+    # #32: sunrise/sunset markers computed from AWAIR_LAT/AWAIR_LON + AWAIR_TZ,
+    # threaded into /api/outdoor-series so the dashboard renders them without a
+    # second fetch.
+    monkeypatch.setenv("AWAIR_LAT", "43.0")
+    monkeypatch.setenv("AWAIR_LON", "-70.8")
+    monkeypatch.setenv("AWAIR_TZ", "America/New_York")
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    assert "daily_events" in payload
+    events = payload["daily_events"]
+    assert len(events) > 0
+    for ev in events:
+        assert set(ev.keys()) == {"ts", "kind"}
+        assert ev["kind"] in ("sunrise", "sunset")
+
+
+def test_outdoor_series_daily_events_empty_when_coords_unset(client, monkeypatch):
+    for var in ("AWAIR_LAT", "AWAIR_LON"):
+        monkeypatch.delenv(var, raising=False)
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    assert payload["daily_events"] == []
+
+
 def test_outdoor_series_honors_fahrenheit(make_client, tmp_path):
     client = make_client("F")
     db_path = tmp_path / "web-F.db"
