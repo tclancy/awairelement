@@ -49,6 +49,15 @@ main {
   display: grid; gap: 14px; padding: 14px 20px 20px;
   grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
 }
+/* Tablet portrait and small laptops: force one column so each card gets
+   the full browser width. At 2-across on ~768–1024 px the "now" value
+   in the card header and the uPlot legend get clipped, and the plot is
+   narrow enough that touch-panning it feels stuck. Full-width cards fix
+   both. Debounced resize handler in dashboard.js re-runs setSize when
+   the column count flips, so the plot canvas follows. #36 */
+@media (max-width: 1024px) {
+  main { grid-template-columns: 1fr; }
+}
 .card {
   background: var(--surface-1); border: 1px solid var(--ring);
   border-radius: 10px; padding: 10px 12px 4px; min-width: 0;
@@ -63,7 +72,11 @@ main {
   margin-left: auto; font-weight: 650; font-variant-numeric: tabular-nums;
   color: var(--ink-2); font-size: 13px;
 }
-.plot { min-height: 150px; }
+/* Let vertical panning pass through the plot to the page. uPlot's cursor
+   otherwise captures every touch and "wants to select the graph" instead
+   of scrolling — the exact failure #36 reports. Horizontal gestures still
+   reach the crosshair. */
+.plot { min-height: 150px; touch-action: pan-y; }
 /* recessive uPlot legend: small, muted, tabular values. Locked to one
    line — a populated legend wrapping taller than the idle "--" state
    shifts every card below it on hover. */
