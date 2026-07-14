@@ -31,6 +31,7 @@ same PR that lands the code.
 - **reading** — One row in the `readings` table; produced by `poller.parse_reading(payload, received_at)`.
 - **series** — A bucketed time-window of readings for the dashboard, produced by `awair.series.bucket(points, bucket_seconds)`. **Not** a synonym for `metric_history` (which returns raw points).
 - **spike** — An event triggered by threshold + hysteresis logic in `awair.spikes`; distinct from a **stale device**, which is the health-check equivalent handled by `monitor` + `DeviceHealth`.
+- **near-miss** — A pm25 reading at or above `PM25_NEAR_MISS_THRESHOLD` (15 µg/m³) but below the **suppressor** threshold (25). Logged at INFO from `check_fans` so we can watch the suppressor's headroom shrink before it ever fires (#15). Behavior-neutral — it does not change the fan verdict.
 - **suppressor** — A metric that *blocks* fan mitigation rather than triggering it. PM2.5 is the current sole suppressor (fans re-suspend particulate); an elevated pm25 forces fans off regardless of co2/voc.
 - **TEMPERATURE_UNIT** — Environment variable that flips the display unit for temperature. Accepts `C` (default), `F`, or `K`. Read by `awair.units.get_temperature_unit`; storage in the `readings` table is always Celsius.
 

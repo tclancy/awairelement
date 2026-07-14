@@ -556,3 +556,77 @@ def test_run_fan_test_does_not_record_state_on_actuate_failure(conn):
 
     assert db.get_fan_state(conn, 1)["last_action"] == "off"  # DB truth preserved
     assert notifier.sent  # the ntfy half still runs
+
+
+# --- pm25 observability logs (#15) ---
+
+
+def test_check_fans_logs_pm25_near_miss(conn, monkeypatch, caplog):
+    """A pm25 reading at/above 15 is INFO-logged even when no fan candidacy exists."""
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=17.0)  # no open events -> no candidacy, just a near-miss
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    hits = [r for r in caplog.records if "pm25 near-miss" in r.message]
+    assert len(hits) == 1
+    assert "17" in hits[0].message
+    # Suppressor threshold echoed so the log line is self-describing.
+    assert "25" in hits[0].message
+
+
+def test_check_fans_does_not_log_near_miss_below_threshold(conn, monkeypatch, caplog):
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=10.0)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert not any("near-miss" in r.message for r in caplog.records)
+
+
+def test_check_fans_logs_candidacy_when_engaged_and_suppressor_passes(
+    conn, monkeypatch, caplog
+):
+    """An engaged event + clean pm25 records the value + a 'passed' verdict."""
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=8.0)
+    _seed_event(conn, "co2")  # opens with fans_engaged=1 via _seed_event default? no
+    # _seed_event doesn't set the latch; the score-gate path does. Emulate by
+    # writing the latch directly.
+    conn.execute("UPDATE alert_events SET fans_engaged=1")
+    conn.commit()
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    candidacy = [r for r in caplog.records if "fan-on candidacy" in r.message]
+    assert len(candidacy) == 1
+    assert "pm25=8" in candidacy[0].message
+    assert "suppressor=passed" in candidacy[0].message
+
+
+def test_check_fans_logs_candidacy_when_suppressor_fires(conn, monkeypatch, caplog):
+    """Engaged event + pm25>=25 records the value + 'fired' verdict + action=off."""
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=30.0)
+    _seed_event(conn, "co2")
+    conn.execute("UPDATE alert_events SET fans_engaged=1")
+    conn.commit()
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    candidacy = [r for r in caplog.records if "fan-on candidacy" in r.message]
+    assert len(candidacy) == 1
+    assert "pm25=30" in candidacy[0].message
+    assert "suppressor=fired" in candidacy[0].message
+    assert "action=off" in candidacy[0].message
+
+
+def test_check_fans_no_candidacy_log_when_no_engaged_event(conn, monkeypatch, caplog):
+    """A near-miss without an engaged event logs the near-miss but not a candidacy."""
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=18.0)  # near-miss zone but no open event
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert not any("fan-on candidacy" in r.message for r in caplog.records)
+    assert any("pm25 near-miss" in r.message for r in caplog.records)
