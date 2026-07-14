@@ -5,10 +5,13 @@ from urllib.error import URLError
 
 import pytest
 
+from awair import outdoor
 from awair.outdoor import (
     AIR_QUALITY_FIELDS,
     WEATHER_FIELDS,
     _build_url,
+    _require_env,
+    make_fetch,
     parse_reading,
     poll_once,
 )
@@ -156,3 +159,91 @@ def test_build_url_carries_all_air_quality_fields():
     url = _build_url("https://example.test/aq", 43.1, -70.9, AIR_QUALITY_FIELDS)
     for field in AIR_QUALITY_FIELDS:
         assert field in url
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body.encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_make_fetch_returns_decoded_body(monkeypatch):
+    """make_fetch's closure hits urlopen with the configured timeout and decodes."""
+    calls = {}
+
+    def fake_urlopen(url, timeout):
+        calls["url"] = url
+        calls["timeout"] = timeout
+        return _FakeResponse('{"ok": true}')
+
+    monkeypatch.setattr(outdoor.urllib.request, "urlopen", fake_urlopen)
+    fetch = make_fetch("https://example.test/x?foo=1")
+    assert fetch() == '{"ok": true}'
+    assert calls["url"] == "https://example.test/x?foo=1"
+    assert calls["timeout"] == outdoor.FETCH_TIMEOUT_SECONDS
+
+
+def test_poll_once_weather_missing_current_returns_error(conn):
+    """parse_reading raises KeyError on `payload['current']`; poll_once swallows it."""
+    status = poll_once(
+        conn,
+        fetch_weather=lambda: json.dumps({}),  # no 'current' key
+        fetch_air_quality=lambda: AIR_QUALITY_TEXT,
+    )
+    assert status == "error"
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+
+
+def test_require_env_raises_when_missing(monkeypatch):
+    monkeypatch.delenv("AWAIR_LAT", raising=False)
+    with pytest.raises(SystemExit) as exc:
+        _require_env("AWAIR_LAT")
+    assert "AWAIR_LAT" in str(exc.value)
+
+
+def test_require_env_returns_value(monkeypatch):
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    assert _require_env("AWAIR_LAT") == "43.1"
+
+
+def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
+    """Drive main() through one loop iteration by making time.sleep bail out."""
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "1")
+
+    # Both fetchers succeed so poll_once returns 'inserted' (INFO branch).
+    monkeypatch.setattr(
+        outdoor,
+        "make_fetch",
+        lambda url: (
+            (lambda: WEATHER_TEXT)
+            if "air-quality" not in url
+            else (lambda: AIR_QUALITY_TEXT)
+        ),
+    )
+
+    class Stop(Exception):
+        pass
+
+    def stop(_seconds):
+        raise Stop
+
+    monkeypatch.setattr(outdoor.time, "sleep", stop)
+    with pytest.raises(Stop):
+        outdoor.main()
+    # One row landed — proves poll_once was invoked with a real connection.
+    conn = outdoor.db.connect(str(tmp_path / "out.db"))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
+    finally:
+        conn.close()
