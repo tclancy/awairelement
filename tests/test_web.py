@@ -151,22 +151,27 @@ def test_dashboard_stamps_ceilings_for_alerting_metrics(client):
 # --- /api/outdoor-series ---
 
 
-def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1), precips=None):
+def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1), precips=None, pressures=None):
     """Three 15-min-cadence outdoor readings ~30 minutes apart.
 
     precips: optional matching iterable of mm rainfall per sample; None cells
     are stored as SQL NULL to exercise the "some intervals had no precip" case.
+    pressures: optional matching iterable of hPa MSL pressure per sample; None
+    cells are stored as SQL NULL (mirrors the precipitation-mid-flight case).
     """
     conn = db.connect(db_path)
     now = datetime.now(timezone.utc)
     precips = precips if precips is not None else [None] * len(temps)
+    pressures = pressures if pressures is not None else [None] * len(temps)
     assert len(precips) == len(temps)
-    for offset, (temp, precip) in enumerate(zip(temps, precips)):
+    assert len(pressures) == len(temps)
+    for offset, (temp, precip, pressure) in enumerate(zip(temps, precips, pressures)):
         ts = (now - timedelta(minutes=15 * (len(temps) - 1 - offset))).isoformat()
         conn.execute(
-            "INSERT INTO outdoor_readings (ts, received_at, temp, precipitation)"
-            " VALUES (?, ?, ?, ?)",
-            (ts, ts, temp, precip),
+            "INSERT INTO outdoor_readings"
+            " (ts, received_at, temp, precipitation, pressure)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (ts, ts, temp, precip, pressure),
         )
     conn.commit()
     conn.close()
@@ -198,8 +203,43 @@ def test_outdoor_series_empty_returns_empty_series(client):
     payload = client.get("/api/outdoor-series?range=7d").get_json()
     temp = payload["metrics"]["temp"]
     precip = payload["metrics"]["precipitation"]
+    pressure = payload["metrics"]["pressure"]
     assert temp == {"t": [], "avg": [], "min": [], "max": []}
     assert precip == {"t": [], "avg": [], "min": [], "max": []}
+    assert pressure == {"t": [], "avg": [], "min": [], "max": []}
+
+
+def test_outdoor_series_returns_pressure_in_inhg(client, tmp_path):
+    # #42: pressure layered on the precipitation chart. Open-Meteo stores hPa;
+    # API converts to inHg (33.8639 hPa/inHg) at the boundary to match the
+    # imperial unit convention on the rest of the dashboard.
+    db_path = tmp_path / "web.db"
+    _seed_outdoor(
+        db_path,
+        temps=(20.0, 20.0),
+        pressures=(1013.25, 1000.0),  # standard atm, storm-approaching
+    )
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    pressure = payload["metrics"]["pressure"]
+    values = [v for v in pressure["avg"] if v is not None]
+    assert 29.92 in values  # 1013.25 hPa → 29.92 inHg
+    assert 29.53 in values  # 1000.0 hPa → 29.53 inHg
+
+
+def test_outdoor_series_pressure_none_stays_none(client, tmp_path):
+    # Older rows have NULL pressure (column added mid-flight, same shape as
+    # precipitation). Absent samples must not crash the bucketer or the
+    # hPa→inHg map.
+    db_path = tmp_path / "web.db"
+    _seed_outdoor(
+        db_path,
+        temps=(20.0, 20.0, 20.0),
+        pressures=(None, 1013.25, None),
+    )
+    payload = client.get("/api/outdoor-series?range=7d").get_json()
+    pressure = payload["metrics"]["pressure"]
+    non_null = [v for v in pressure["avg"] if v is not None]
+    assert non_null == [29.92]
 
 
 def test_outdoor_series_returns_precipitation_in_inches(client, tmp_path):

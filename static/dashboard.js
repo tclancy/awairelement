@@ -28,7 +28,23 @@
       digits: 2,
       colorVar: "--series-outdoor-precip",
     },
+    pressure: {
+      name: "Pressure",
+      unit: "inHg",
+      digits: 2,
+      colorVar: "--series-outdoor-pressure",
+    },
   };
+
+  // Storm-warning threshold: a 3-hour pressure drop of ~2 hPa (~0.06 inHg) is
+  // the classic "front moving in" signal (#42). Arrow shows current direction
+  // of change over the last 3 hours of the visible range.
+  const PRESSURE_TREND_THRESHOLD_INHG = 0.06;
+  const PRESSURE_TREND_WINDOW_SECONDS = 3 * 3600;
+  // uPlot right-side y-axis (side: 1 = right). Fixed range keeps the eye on
+  // rate-of-change; auto-fit would visually flatten normal variance.
+  const PRESSURE_SCALE_MIN_INHG = 28.5;
+  const PRESSURE_SCALE_MAX_INHG = 31.0;
 
   const state = { range: "7d", plots: [], events: [], dailyEvents: [] };
   const sync = uPlot.sync("awair");
@@ -229,39 +245,109 @@
       <tbody>${rows}</tbody></table>`;
   }
 
-  function makeOutdoorPlot(card, metric, series) {
+  // Latest non-null pressure (uses the min series) and the direction of change
+  // over the last 3 hours. Returns {value, arrow} or null if no signal.
+  function pressureSummary(series) {
+    if (!series || !series.t || !series.min) return null;
+    let latestIdx = -1;
+    for (let i = series.min.length - 1; i >= 0; i--) {
+      if (series.min[i] != null) {
+        latestIdx = i;
+        break;
+      }
+    }
+    if (latestIdx < 0) return null;
+    const latestT = series.t[latestIdx];
+    const latestV = series.min[latestIdx];
+    const windowStart = latestT - PRESSURE_TREND_WINDOW_SECONDS;
+    let earlyV = null;
+    for (let i = 0; i <= latestIdx; i++) {
+      if (series.min[i] != null && series.t[i] >= windowStart) {
+        earlyV = series.min[i];
+        break;
+      }
+    }
+    let arrow = "";
+    if (earlyV != null) {
+      const delta = latestV - earlyV;
+      if (delta < -PRESSURE_TREND_THRESHOLD_INHG) arrow = "↓";
+      else if (delta > PRESSURE_TREND_THRESHOLD_INHG) arrow = "↑";
+      else arrow = "→";
+    }
+    return { value: latestV, arrow };
+  }
+
+  function makeOutdoorPlot(card, metric, series, allMetrics) {
     const meta = OUTDOOR_METRICS[metric];
     const color = cssVar(meta.colorVar);
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
-    const data = [series.t, series.min, series.max, series.avg];
+
+    // Pressure overlays onto the precipitation chart (#42) — one card carries
+    // the storm-signal glance: rain accumulation + pressure trace + trend
+    // arrow. The pressure series is min-per-bucket (the trough matters more
+    // than the average for a front-moving-in signal).
+    const overlayPressure =
+      metric === "precipitation" && allMetrics && allMetrics.pressure;
+    const pressureSeries = overlayPressure ? allMetrics.pressure : null;
+    const pressureColor = overlayPressure
+      ? cssVar(OUTDOOR_METRICS.pressure.colorVar)
+      : null;
+
+    const data = overlayPressure
+      ? [series.t, series.min, series.max, series.avg, pressureSeries.min]
+      : [series.t, series.min, series.max, series.avg];
     const axisStyle = {
       stroke: cssVar("--ink-muted"),
       grid: { stroke: cssVar("--grid"), width: 1 },
       ticks: { stroke: cssVar("--axis"), width: 1 },
       font: "11px system-ui, sans-serif",
     };
+    const seriesConfig = [
+      { value: "{M}/{D} {h}:{mm}{aa}" },
+      { label: "low", stroke: null, points: { show: false } },
+      { label: "high", stroke: null, points: { show: false } },
+      {
+        label: "avg",
+        stroke: color,
+        width: 2,
+        points: { show: false },
+        spanGaps: false,
+      },
+    ];
+    const scales = { x: { time: true } };
+    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
+    if (overlayPressure) {
+      seriesConfig.push({
+        label: "Pressure",
+        stroke: pressureColor,
+        width: 1.5,
+        scale: "pressure",
+        value: (u, v) => (v == null ? "–" : v.toFixed(2) + " inHg"),
+        points: { show: false },
+        spanGaps: false,
+      });
+      scales.pressure = {
+        range: [PRESSURE_SCALE_MIN_INHG, PRESSURE_SCALE_MAX_INHG],
+      };
+      axes.push({
+        ...axisStyle,
+        side: 1,
+        scale: "pressure",
+        size: 44,
+        values: (u, splits) => splits.map((v) => v.toFixed(1)),
+      });
+    }
     const plot = new uPlot(
       {
         width: plotEl.clientWidth || 320,
         height: 150,
         cursor: { sync: { key: sync.key }, points: { size: 7 } },
         legend: { live: true },
-        scales: { x: { time: true } },
+        scales,
         bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
-        series: [
-          { value: "{M}/{D} {h}:{mm}{aa}" },
-          { label: "low", stroke: null, points: { show: false } },
-          { label: "high", stroke: null, points: { show: false } },
-          {
-            label: "avg",
-            stroke: color,
-            width: 2,
-            points: { show: false },
-            spanGaps: false,
-          },
-        ],
-        axes: [{ ...axisStyle }, { ...axisStyle, size: 52 }],
+        series: seriesConfig,
+        axes,
         plugins: [sunMoonMarkersPlugin()],
       },
       data,
@@ -273,8 +359,15 @@
     card.querySelector(".unit").textContent = meta.unit;
     card.querySelector(".dot").style.background = color;
     const latest = [...series.avg].reverse().find((v) => v != null);
-    card.querySelector(".now").textContent =
-      fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    let nowText = fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    if (overlayPressure) {
+      const summary = pressureSummary(pressureSeries);
+      if (summary != null) {
+        nowText +=
+          " · " + fmt(summary.value, 2) + " inHg " + summary.arrow;
+      }
+    }
+    card.querySelector(".now").textContent = nowText;
   }
 
   async function load() {
@@ -296,7 +389,12 @@
     }
     for (const card of document.querySelectorAll(".card[data-outdoor]")) {
       const metric = card.dataset.outdoor;
-      makeOutdoorPlot(card, metric, outdoorPayload.metrics[metric]);
+      makeOutdoorPlot(
+        card,
+        metric,
+        outdoorPayload.metrics[metric],
+        outdoorPayload.metrics
+      );
     }
     renderEvents();
     document.getElementById("updated").textContent =

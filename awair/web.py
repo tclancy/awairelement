@@ -40,6 +40,10 @@ OUTDOOR_RANGES = {
 # boundary so storage stays raw (same shape as temperature: DB in Celsius,
 # display convert via TEMPERATURE_UNIT).
 _MM_PER_INCH = 25.4
+# Open-Meteo returns MSL pressure in hPa. The dashboard displays inHg — US
+# weather convention, matches the imperial units used for temperature and
+# precipitation. Conversion at the API boundary (same pattern as precip).
+_HPA_PER_INHG = 33.8639
 
 
 def _range_params():
@@ -135,14 +139,18 @@ def create_app(db_path=None):
         since, bucket_seconds = _outdoor_range_params()
         conn = connect()
         try:
-            rows = db.outdoor_readings_since(conn, ("temp", "precipitation"), since)
+            rows = db.outdoor_readings_since(
+                conn, ("temp", "precipitation", "pressure"), since
+            )
         finally:
             conn.close()
         unit = temp_unit()
         temp_points = [(row[0], row[1]) for row in rows if row[1] is not None]
         precip_points = [(row[0], row[2]) for row in rows if row[2] is not None]
+        pressure_points = [(row[0], row[3]) for row in rows if row[3] is not None]
         temp_series = bucket(temp_points, bucket_seconds)
         precip_series = bucket(precip_points, bucket_seconds)
+        pressure_series = bucket(pressure_points, bucket_seconds)
         if unit != "C":
             for key in ("avg", "min", "max"):
                 temp_series[key] = [
@@ -154,10 +162,19 @@ def create_app(db_path=None):
                 round(v / _MM_PER_INCH, 3) if v is not None else None
                 for v in precip_series[key]
             ]
+        for key in ("avg", "min", "max"):
+            pressure_series[key] = [
+                round(v / _HPA_PER_INHG, 2) if v is not None else None
+                for v in pressure_series[key]
+            ]
         return jsonify(
             {
                 "bucket_seconds": bucket_seconds,
-                "metrics": {"temp": temp_series, "precipitation": precip_series},
+                "metrics": {
+                    "temp": temp_series,
+                    "precipitation": precip_series,
+                    "pressure": pressure_series,
+                },
                 "temp_unit_symbol": units.symbol(unit),
                 "daily_events": solar.daily_events(since, datetime.now(timezone.utc)),
             }
