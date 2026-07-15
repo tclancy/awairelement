@@ -30,7 +30,7 @@
     },
   };
 
-  const state = { range: "7d", plots: [], events: [] };
+  const state = { range: "7d", plots: [], events: [], dailyEvents: [] };
   const sync = uPlot.sync("awair");
 
   const cssVar = (name) =>
@@ -62,6 +62,37 @@
             const x1 = u.valToPos(ev.closed_at ?? Date.now() / 1000, "x", true);
             ctx.fillStyle = hexToRgba(color, 0.12);
             ctx.fillRect(x0, u.bbox.top, Math.max(x1 - x0, 2), u.bbox.height);
+          }
+          ctx.restore();
+        },
+      },
+    };
+  }
+
+  // Sunrise/sunset glyphs painted along the top of the plot canvas (#32).
+  // Server ships `daily_events: [{ts, kind: "sunrise"|"sunset"}]` computed from
+  // AWAIR_LAT/AWAIR_LON in the AWAIR_TZ zone; the plugin just paints them.
+  // Drawn in `draw` so glyphs land above series and event wash but below the
+  // crosshair overlay, same slot as the ceiling line.
+  function sunMoonMarkersPlugin() {
+    return {
+      hooks: {
+        draw: (u) => {
+          if (!state.dailyEvents.length) return;
+          const ctx = u.ctx;
+          const y = u.bbox.top + 10;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+          ctx.clip();
+          ctx.fillStyle = cssVar("--ink-muted") || "#898781";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.font = "10px system-ui, -apple-system, sans-serif";
+          for (const ev of state.dailyEvents) {
+            const x = u.valToPos(ev.ts, "x", true);
+            if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
+            ctx.fillText(ev.kind === "sunrise" ? "☀" : "☾", x, y);
           }
           ctx.restore();
         },
@@ -110,7 +141,7 @@
     // spikes.METRICS. Missing → no reference line for this chart.
     const ceilingRaw = card.dataset.ceiling;
     const ceiling = ceilingRaw ? Number(ceilingRaw) : null;
-    const plugins = [eventWashPlugin(metric)];
+    const plugins = [eventWashPlugin(metric), sunMoonMarkersPlugin()];
     if (ceiling != null && Number.isFinite(ceiling)) {
       plugins.push(ceilingLinePlugin(ceiling));
     }
@@ -231,6 +262,7 @@
           },
         ],
         axes: [{ ...axisStyle }, { ...axisStyle, size: 52 }],
+        plugins: [sunMoonMarkersPlugin()],
       },
       data,
       plotEl
@@ -254,6 +286,7 @@
     const seriesPayload = await seriesRes.json();
     state.events = (await eventsRes.json()).events;
     const outdoorPayload = await outdoorRes.json();
+    state.dailyEvents = outdoorPayload.daily_events || [];
 
     state.plots.forEach((p) => p.destroy());
     state.plots = [];
