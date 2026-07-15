@@ -12,12 +12,15 @@ astral internals.
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from astral import LocationInfo
 from astral.sun import sun
+
+logger = logging.getLogger(__name__)
 
 
 def _tz() -> ZoneInfo | timezone:
@@ -32,7 +35,18 @@ def _coords() -> tuple[float, float] | None:
     lon = os.environ.get("AWAIR_LON", "").strip()
     if not (lat and lon):
         return None
-    return float(lat), float(lon)
+    try:
+        return float(lat), float(lon)
+    except ValueError:
+        # Malformed AWAIR_LAT/AWAIR_LON (typo, comma instead of dot, non-numeric).
+        # Blanking the whole dashboard on every refresh is worse than dropping
+        # the solar markers — same tolerance as the unset case.
+        logger.warning(
+            "AWAIR_LAT/AWAIR_LON malformed (lat=%r, lon=%r); skipping solar markers",
+            lat,
+            lon,
+        )
+        return None
 
 
 def daily_events(since: datetime, until: datetime) -> list[dict]:

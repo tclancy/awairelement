@@ -66,6 +66,35 @@ def test_daily_events_kind_alternates(monkeypatch):
         assert a != b
 
 
+def test_coords_malformed_env(monkeypatch, caplog):
+    """Malformed AWAIR_LAT/AWAIR_LON returns [] instead of a ValueError.
+
+    Bot review on PR #37 flagged the failure chain: `_coords()` propagates
+    ValueError → `/api/outdoor-series` 500 → dashboard `load()` aborts →
+    all 8 charts blank on every 5-min refresh. Same tolerance as the unset
+    case: no markers is fine, blank dashboard is not.
+    """
+    monkeypatch.setenv("AWAIR_TZ", "America/New_York")
+    since = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    until = since + timedelta(days=2)
+
+    for lat, lon in [
+        ("43,0", "-70,8"),  # comma-decimal (European locale typo)
+        ("not-a-number", "-70.8"),
+        ("43.0", "seventy west"),
+        ("43.0.0", "-70.8"),  # extra dot
+    ]:
+        monkeypatch.setenv("AWAIR_LAT", lat)
+        monkeypatch.setenv("AWAIR_LON", lon)
+        with caplog.at_level("WARNING", logger="awair.solar"):
+            events = solar.daily_events(since, until)
+        assert events == []
+        assert any("malformed" in rec.message for rec in caplog.records), (
+            f"expected a malformed-coords warning for ({lat!r}, {lon!r})"
+        )
+        caplog.clear()
+
+
 def test_daily_events_utc_default_when_tz_unset(monkeypatch):
     """Missing AWAIR_TZ falls back to UTC — no crash, still emits events."""
     monkeypatch.setenv("AWAIR_LAT", "43.0")
