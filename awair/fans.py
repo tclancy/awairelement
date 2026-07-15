@@ -37,6 +37,11 @@ log = logging.getLogger("awair.fans")
 FAN_TRIGGERS = ("co2", "voc")
 PM25_SUPPRESS_THRESHOLD = 25.0
 PM25_SUPPRESS_REASON_PREFIX = "pm25 "  # decide() uses this to detect safety-off
+# Near-miss watchpoint: pm25 readings at or above this value are logged so we
+# can see how close the suppressor is to firing without changing behavior.
+# Threshold-review context in #15 — max observed pm25 was 19 over 7 days, so
+# 15 is a floor above p99.9 noise (=17) and 10 below the suppressor.
+PM25_NEAR_MISS_THRESHOLD = 15.0
 RATE_LIMIT = timedelta(seconds=60)
 # Trust pm25 only within this window — the suppressor must not act on a hours-old
 # reading if the sensor drops pm25 for a while.
@@ -196,6 +201,40 @@ def _engage_qualifying_events(conn, open_events: dict, now) -> dict:
     return db.get_open_events(conn)
 
 
+def _log_pm25_observability(
+    open_events: dict, latest_pm25: float | None, action: str
+) -> None:
+    """Emit two INFO lines for the pm25 suppressor without changing behavior (#15).
+
+    1. **Near-miss**: any poll with pm25 >= PM25_NEAR_MISS_THRESHOLD is logged,
+       whether or not a fan-on candidacy exists. Builds the distribution we need
+       to see the suppressor's headroom shrink before it ever fires.
+    2. **Candidacy trace**: when at least one open trigger is engaged (fans
+       would run absent a suppressor), log the pm25 value the suppressor saw
+       and the verdict it produced. Retrospective query becomes trivial.
+    """
+    if latest_pm25 is not None and latest_pm25 >= PM25_NEAR_MISS_THRESHOLD:
+        log.info(
+            "pm25 near-miss %g (suppressor fires at %g)",
+            latest_pm25,
+            PM25_SUPPRESS_THRESHOLD,
+        )
+    engaged = any(
+        m in open_events and open_events[m].get("fans_engaged") for m in FAN_TRIGGERS
+    )
+    if engaged:
+        log.info(
+            "fan-on candidacy: pm25=%s suppressor=%s action=%s",
+            "unknown" if latest_pm25 is None else f"{latest_pm25:g}",
+            "fired"
+            if action == "off"
+            and latest_pm25 is not None
+            and latest_pm25 >= PM25_SUPPRESS_THRESHOLD
+            else "passed",
+            action,
+        )
+
+
 def check_fans(conn, notifier, config: FansConfig, now) -> None:
     """One poll's worth of fan control. No-op when config.enabled is False."""
     if not config.enabled:
@@ -204,6 +243,7 @@ def check_fans(conn, notifier, config: FansConfig, now) -> None:
     open_events = _engage_qualifying_events(conn, open_events, now)
     latest_pm25 = db.latest_pm25(conn, since=now - PM25_FRESHNESS)
     action, reason = desired_action(open_events, latest_pm25)
+    _log_pm25_observability(open_events, latest_pm25, action)
     for fan_id in config.fan_ids:
         state = db.get_fan_state(conn, fan_id)
         decision = decide(fan_id, action, reason, state, now)
