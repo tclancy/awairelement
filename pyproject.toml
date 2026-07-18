@@ -14,7 +14,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "radon>=6.0.1",
-    "ruff>=0.15.21",
+    "ruff>=0.15.22",
 ]
 
 [tool.pytest.ini_options]
