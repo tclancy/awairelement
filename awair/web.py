@@ -22,15 +22,21 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # metric itself — converted for temp events at the API boundary.
 _TEMP_EVENT_FIELDS = ("peak_value", "baseline", "threshold")
 
+# "today" == since local midnight, not the last 24h — it's the single-day
+# detail view (#46). Bucket is 60 s (indoor poll cadence is 30 s → 2 samples
+# per bucket) so the finer granularity actually shows up.
 RANGES = {
+    "today": {"days": "today", "bucket_seconds": 60},
     "7d": {"days": 7, "bucket_seconds": 300},
     "30d": {"days": 30, "bucket_seconds": 900},
 }
 
 # Outdoor readings publish every 15 min at the source, so bucket sizes are
 # scaled up — indoor's 5-min bucket over 7d would leave most outdoor buckets
-# empty and paint a jittery gap-riddled line.
+# empty and paint a jittery gap-riddled line. For "today", bucket == source
+# cadence (900 s); no point sub-bucketing below what the source produces.
 OUTDOOR_RANGES = {
+    "today": {"days": "today", "bucket_seconds": 900},
     "7d": {"days": 7, "bucket_seconds": 900},
     "30d": {"days": 30, "bucket_seconds": 3600},
 }
@@ -46,13 +52,29 @@ _MM_PER_INCH = 25.4
 _HPA_PER_INHG = 33.8639
 
 
+def _since_for(spec):
+    """Resolve a RANGES/OUTDOOR_RANGES spec to a UTC `since` datetime.
+
+    `days: "today"` == local midnight (system TZ), everything else == N days
+    back from now. Local midnight is the intuitive "today" — the app is a
+    home dashboard on Tom's homelab, and Tom reads it in local time.
+    """
+    if spec["days"] == "today":
+        local_midnight = (
+            datetime.now()
+            .astimezone()
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+        )
+        return local_midnight.astimezone(timezone.utc)
+    return datetime.now(timezone.utc) - timedelta(days=spec["days"])
+
+
 def _range_params():
     name = request.args.get("range", "7d")
     if name not in RANGES:
         abort(400, f"range must be one of {sorted(RANGES)}")
     spec = RANGES[name]
-    since = datetime.now(timezone.utc) - timedelta(days=spec["days"])
-    return since, spec["bucket_seconds"]
+    return _since_for(spec), spec["bucket_seconds"]
 
 
 def _outdoor_range_params():
@@ -60,8 +82,7 @@ def _outdoor_range_params():
     if name not in OUTDOOR_RANGES:
         abort(400, f"range must be one of {sorted(OUTDOOR_RANGES)}")
     spec = OUTDOOR_RANGES[name]
-    since = datetime.now(timezone.utc) - timedelta(days=spec["days"])
-    return since, spec["bucket_seconds"]
+    return _since_for(spec), spec["bucket_seconds"]
 
 
 def create_app(db_path=None):
