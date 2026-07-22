@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from awair import db
+from awair import db, web
 from awair.web import METRIC_NAMES, create_app
 
 
@@ -114,6 +114,27 @@ def test_series_rejects_unknown_range(client):
     assert client.get("/api/series?range=1y").status_code == 400
 
 
+def test_series_today_uses_60s_buckets(client):
+    # #46: single-day detail view — bucket down to 60 s (2 samples per bucket
+    # at the 30 s poll cadence) so the finer resolution actually shows up.
+    payload = client.get("/api/series?range=today").get_json()
+    assert payload["bucket_seconds"] == 60
+    assert set(payload["metrics"]) == set(METRIC_NAMES)
+
+
+def test_since_for_today_lands_on_local_midnight():
+    # `today` == since local midnight, not last 24 h — the value shown as
+    # "today" on the dashboard should match what Tom sees on the wall clock.
+    since = web._since_for({"days": "today", "bucket_seconds": 60})
+    assert since.tzinfo is timezone.utc
+    now = datetime.now(timezone.utc)
+    # Since is at most 24 h ago and no later than now.
+    assert now - timedelta(days=1) <= since <= now
+    # And its local-tz projection is exactly midnight.
+    local = since.astimezone()
+    assert (local.hour, local.minute, local.second, local.microsecond) == (0, 0, 0, 0)
+
+
 def test_events_returns_open_event_and_excludes_ancient(client):
     payload = client.get("/api/events?range=7d").get_json()
     events = payload["events"]
@@ -134,6 +155,15 @@ def test_dashboard_page_renders(client):
     assert 'data-outdoor="temp"' in html
     assert 'data-outdoor="precipitation"' in html
     assert "uplot" in html
+
+
+def test_dashboard_page_offers_all_three_range_buttons(client):
+    # #46: Today button sits before 7d/30d — narrowest-to-widest reads
+    # left-to-right.
+    html = client.get("/").get_data(as_text=True)
+    for value in ("today", "7d", "30d"):
+        assert f'data-range="{value}"' in html
+    assert html.index('data-range="today"') < html.index('data-range="7d"')
 
 
 def test_dashboard_stamps_ceilings_for_alerting_metrics(client):
@@ -197,6 +227,13 @@ def test_outdoor_series_30d_uses_hourly_buckets(client):
 
 def test_outdoor_series_rejects_unknown_range(client):
     assert client.get("/api/outdoor-series?range=1y").status_code == 400
+
+
+def test_outdoor_series_today_uses_15min_buckets(client):
+    # #46: outdoor source cadence is 15 min — no point sub-bucketing below
+    # what Open-Meteo produces, so `today` matches the source (900 s).
+    payload = client.get("/api/outdoor-series?range=today").get_json()
+    assert payload["bucket_seconds"] == 900
 
 
 def test_outdoor_series_empty_returns_empty_series(client):
