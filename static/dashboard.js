@@ -90,13 +90,19 @@
   // AWAIR_LAT/AWAIR_LON in the AWAIR_TZ zone; the plugin just paints them.
   // Drawn in `draw` so glyphs land above series and event wash but below the
   // crosshair overlay, same slot as the ceiling line.
+  //
+  // Glyph size scales with the active date range (#47) — 30d packs ~60 glyphs
+  // into the plot so they stay small; today shows just 1–2 and needs the
+  // headroom. Y-offset tracks font size so the glyph never clips off the top.
+  const SOLAR_GLYPH_PX = { today: 16, "7d": 13, "30d": 10 };
   function sunMoonMarkersPlugin() {
     return {
       hooks: {
         draw: (u) => {
           if (!state.dailyEvents.length) return;
           const ctx = u.ctx;
-          const y = u.bbox.top + 10;
+          const size = SOLAR_GLYPH_PX[state.range] || 10;
+          const y = u.bbox.top + size;
           ctx.save();
           ctx.beginPath();
           ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
@@ -104,7 +110,7 @@
           ctx.fillStyle = cssVar("--ink-muted") || "#898781";
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          ctx.font = "10px system-ui, -apple-system, sans-serif";
+          ctx.font = `${size}px system-ui, -apple-system, sans-serif`;
           for (const ev of state.dailyEvents) {
             const x = u.valToPos(ev.ts, "x", true);
             if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
