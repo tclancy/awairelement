@@ -17,6 +17,28 @@ dev = [
     "ruff>=0.15.22",
 ]
 
+[tool.ruff.lint]
+# Pinned deliberately, because leaving it unset means the vendor picks it.
+#
+# This project had no [tool.ruff] section at all, so it inherited ruff's default
+# rule set -- which changed underneath it. ruff 0.15.21 defaulted to
+# ["E4", "E7", "E9", "F"]; 0.16.0 replaced that with a substantially wider set,
+# and the first CI run to install 0.16 reported 33 errors across four Dependabot
+# PRs that had touched no Python at all (#54).
+#
+# We adopt the rules that change surfaced, rather than suppressing them -- they
+# are good ones and 31 of the 33 were mechanical autofixes. But we name them
+# here so the decision is ours and the next ruff release cannot widen it again
+# without someone choosing to. Matches the fleet convention (sandy pins
+# select = ["E", "F", "C90"]).
+#
+#   E4/E7/E9, F  pycodestyle + pyflakes  -- the historic default
+#   I            import sorting
+#   UP           pyupgrade (this repo is py3.13; datetime.UTC over timezone.utc)
+#   B            bugbear
+#   RUF          ruff-specific
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "RUF"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=awair --cov-report=term-missing"
