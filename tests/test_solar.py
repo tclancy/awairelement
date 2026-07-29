@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import itertools
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -16,7 +17,7 @@ def _clean_env(monkeypatch):
 
 
 def test_daily_events_empty_when_coords_missing():
-    since = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 1, tzinfo=UTC)
     until = since + timedelta(days=7)
     assert solar.daily_events(since, until) == []
 
@@ -26,7 +27,7 @@ def test_daily_events_seven_days_two_events_per_day(monkeypatch):
     monkeypatch.setenv("AWAIR_LAT", "43.0")
     monkeypatch.setenv("AWAIR_LON", "-70.8")
     monkeypatch.setenv("AWAIR_TZ", "America/New_York")
-    since = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 1, tzinfo=UTC)
     until = since + timedelta(days=7)
     events = solar.daily_events(since, until)
     # 7-day window, two events per day → 14; boundary trimming may drop one
@@ -40,7 +41,7 @@ def test_daily_events_sorted_and_within_window(monkeypatch):
     monkeypatch.setenv("AWAIR_LAT", "43.0")
     monkeypatch.setenv("AWAIR_LON", "-70.8")
     monkeypatch.setenv("AWAIR_TZ", "America/New_York")
-    since = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 15, tzinfo=UTC)
     until = since + timedelta(days=3)
     events = solar.daily_events(since, until)
     since_ts = int(since.timestamp())
@@ -57,12 +58,12 @@ def test_daily_events_kind_alternates(monkeypatch):
     monkeypatch.setenv("AWAIR_LAT", "43.0")
     monkeypatch.setenv("AWAIR_LON", "-70.8")
     monkeypatch.setenv("AWAIR_TZ", "America/New_York")
-    since = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 15, tzinfo=UTC)
     until = since + timedelta(days=2)
     events = solar.daily_events(since, until)
     kinds = [e["kind"] for e in events]
     # No two consecutive sunrises or sunsets — the pattern alternates.
-    for a, b in zip(kinds, kinds[1:]):
+    for a, b in itertools.pairwise(kinds):
         assert a != b
 
 
@@ -75,7 +76,7 @@ def test_coords_malformed_env(monkeypatch, caplog):
     case: no markers is fine, blank dashboard is not.
     """
     monkeypatch.setenv("AWAIR_TZ", "America/New_York")
-    since = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 1, tzinfo=UTC)
     until = since + timedelta(days=2)
 
     for lat, lon in [
@@ -99,7 +100,7 @@ def test_daily_events_utc_default_when_tz_unset(monkeypatch):
     """Missing AWAIR_TZ falls back to UTC — no crash, still emits events."""
     monkeypatch.setenv("AWAIR_LAT", "43.0")
     monkeypatch.setenv("AWAIR_LON", "-70.8")
-    since = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 6, 1, tzinfo=UTC)
     until = since + timedelta(days=2)
     events = solar.daily_events(since, until)
     assert len(events) >= 2

@@ -20,7 +20,7 @@ import os
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from awair import db
 
@@ -76,7 +76,7 @@ def _normalize_source_time(source_time: str) -> str:
     """
     parsed = datetime.fromisoformat(source_time)
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.isoformat()
 
 
@@ -148,7 +148,7 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
         reading = parse_reading(
             weather_payload,
             air_quality_payload,
-            received_at=datetime.now(timezone.utc).isoformat(),
+            received_at=datetime.now(UTC).isoformat(),
         )
     except KeyError as exc:
         log.warning("weather payload missing required field: %s", exc)

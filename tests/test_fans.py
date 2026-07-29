@@ -4,7 +4,7 @@ Each scenario maps to a rule in issue #10 / #14. Trigger surface is
 `spikes` open events; suppressor is a raw pm25 read.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from awair import db, fans
 from awair.fans import (
@@ -18,7 +18,7 @@ from awair.fans import (
 )
 from tests._helpers import FakeNotifier, fake_url_opener
 
-NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
 # Below FAN_SCORE_GATE — the score at which an event is worth spending fans on.
 BAD_SCORE = 70
@@ -226,7 +226,7 @@ def test_fresh_fan_state_never_blocks():
     state = {
         "fan_id": 1,
         "last_action": "off",
-        "last_command_at": datetime(1970, 1, 1, tzinfo=timezone.utc),
+        "last_command_at": datetime(1970, 1, 1, tzinfo=UTC),
     }
     d = decide(1, "speed1", "co2 spike", state, NOW)
     assert d is not None

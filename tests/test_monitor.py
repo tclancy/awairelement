@@ -4,7 +4,7 @@ Uses ceiling-tier shapes (active even in cold start) to keep seeded
 histories small; tier-1 shapes are covered in test_spikes.py.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,7 +19,7 @@ def default_celsius(monkeypatch):
     monkeypatch.delenv("TEMPERATURE_UNIT", raising=False)
 
 
-NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
 
 def iso_z(dt):

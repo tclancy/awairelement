@@ -4,7 +4,7 @@ Run via: uv run --frozen gunicorn -b 0.0.0.0:8097 'awair.web:create_app()'
 """
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
@@ -65,8 +65,8 @@ def _since_for(spec):
             .astimezone()
             .replace(hour=0, minute=0, second=0, microsecond=0)
         )
-        return local_midnight.astimezone(timezone.utc)
-    return datetime.now(timezone.utc) - timedelta(days=spec["days"])
+        return local_midnight.astimezone(UTC)
+    return datetime.now(UTC) - timedelta(days=spec["days"])
 
 
 def _range_params():
@@ -197,7 +197,7 @@ def create_app(db_path=None):
                     "pressure": pressure_series,
                 },
                 "temp_unit_symbol": units.symbol(unit),
-                "daily_events": solar.daily_events(since, datetime.now(timezone.utc)),
+                "daily_events": solar.daily_events(since, datetime.now(UTC)),
             }
         )
 

@@ -1,6 +1,7 @@
 """Parsing device JSON and single poll iterations."""
 
 import json
+from datetime import UTC
 from pathlib import Path
 from urllib.error import URLError
 
@@ -124,9 +125,9 @@ class _RecordingNotifier:
 
 
 def _now():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    return datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
 
 def test_handle_device_health_no_verdict_noops(conn):

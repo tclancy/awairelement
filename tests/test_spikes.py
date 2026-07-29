@@ -4,14 +4,14 @@ History shapes are synthetic 30s-cadence series; every scenario here maps to
 a rule in SCOPE.md's Spike Detection section.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from awair.spikes import METRICS, Decision, baseline_spread, evaluate
 
 CO2 = METRICS["co2"]
 PM25 = METRICS["pm25"]
 
-NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
 
 def history(values, end=NOW, step_seconds=30):

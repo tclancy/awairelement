@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from astral import LocationInfo
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 def _tz() -> ZoneInfo | timezone:
     name = os.environ.get("AWAIR_TZ", "").strip()
     if not name:
-        return timezone.utc
+        return UTC
     return ZoneInfo(name)
 
 
@@ -86,7 +86,7 @@ def daily_events(since: datetime, until: datetime) -> list[dict]:
             continue
         for kind in ("sunrise", "sunset"):
             moment = s[kind]
-            if since <= moment.astimezone(timezone.utc) <= until:
+            if since <= moment.astimezone(UTC) <= until:
                 events.append({"ts": int(moment.timestamp()), "kind": kind})
         day += timedelta(days=1)
 

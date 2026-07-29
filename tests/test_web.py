@@ -1,6 +1,6 @@
 """Dashboard Flask app: series/events endpoints and the page itself."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -25,7 +25,7 @@ def _seed_db(db_path):
     known value on either side of the API boundary.
     """
     conn = db.connect(db_path)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     rows = []
     for i in range(120):  # one hour of 30s readings, newest last
         ts = iso_z(now - timedelta(seconds=30 * (119 - i)))
@@ -126,8 +126,8 @@ def test_since_for_today_lands_on_local_midnight():
     # `today` == since local midnight, not last 24 h — the value shown as
     # "today" on the dashboard should match what Tom sees on the wall clock.
     since = web._since_for({"days": "today", "bucket_seconds": 60})
-    assert since.tzinfo is timezone.utc
-    now = datetime.now(timezone.utc)
+    assert since.tzinfo is UTC
+    now = datetime.now(UTC)
     # Since is at most 24 h ago and no later than now.
     assert now - timedelta(days=1) <= since <= now
     # And its local-tz projection is exactly midnight.
@@ -190,12 +190,17 @@ def _seed_outdoor(db_path, temps=(20.0, 22.4, 21.1), precips=None, pressures=Non
     cells are stored as SQL NULL (mirrors the precipitation-mid-flight case).
     """
     conn = db.connect(db_path)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     precips = precips if precips is not None else [None] * len(temps)
     pressures = pressures if pressures is not None else [None] * len(temps)
     assert len(precips) == len(temps)
     assert len(pressures) == len(temps)
-    for offset, (temp, precip, pressure) in enumerate(zip(temps, precips, pressures)):
+    # strict=True: the three lists are asserted equal-length just above, so a
+    # future caller that breaks that should get a loud error rather than have
+    # zip() silently truncate the fixture it is building.
+    for offset, (temp, precip, pressure) in enumerate(
+        zip(temps, precips, pressures, strict=True)
+    ):
         ts = (now - timedelta(minutes=15 * (len(temps) - 1 - offset))).isoformat()
         conn.execute(
             "INSERT INTO outdoor_readings"
