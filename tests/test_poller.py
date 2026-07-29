@@ -1,7 +1,7 @@
 """Parsing device JSON and single poll iterations."""
 
 import json
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import URLError
 
@@ -125,8 +125,6 @@ class _RecordingNotifier:
 
 
 def _now():
-    from datetime import datetime
-
     return datetime(2026, 7, 14, 12, 0, tzinfo=UTC)
 
 

@@ -17,10 +17,8 @@ from awair import db
 from awair.alerts import Notifier
 from awair.fans import (
     check_fans,
-    run_fan_test,
-)
-from awair.fans import (
     config_from_env as fans_config_from_env,
+    run_fan_test,
 )
 from awair.monitor import DeviceHealth, check_metrics
 

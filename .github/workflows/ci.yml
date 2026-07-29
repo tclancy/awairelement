@@ -33,10 +33,10 @@ jobs:
         run: uv sync --all-groups --frozen
 
       - name: Lint (ruff)
-        run: uv run ruff check awair/ tests/
+        run: uv run --frozen ruff check awair/ tests/
 
       - name: Format check (ruff)
-        run: uv run ruff format --check awair/ tests/
+        run: uv run --frozen ruff format --check awair/ tests/
 
       - name: Run tests
-        run: uv run pytest
+        run: uv run --frozen pytest

@@ -27,10 +27,15 @@ dev = [
 # PRs that had touched no Python at all (#54).
 #
 # We adopt the rules that change surfaced, rather than suppressing them -- they
-# are good ones and 31 of the 33 were mechanical autofixes. But we name them
-# here so the decision is ours and the next ruff release cannot widen it again
-# without someone choosing to. Matches the fleet convention (sandy pins
-# select = ["E", "F", "C90"]).
+# are good ones and 31 of the 33 were mechanical autofixes. Matches the fleet
+# convention (sandy pins select = ["E", "F", "C90"]).
+#
+# What this does and does not buy: `select` takes PREFIXES, so rules ruff adds
+# to B, RUF, UP, I or F in a future release still fire automatically. This
+# narrows the blast radius from 0.16's default of ~413 rules across 39 families
+# to ~193 across 6 -- it is not immunity. The thing that actually makes CI
+# reproducible is the version pinned in uv.lock, enforced by the `uv lock
+# --check` step and `--frozen`. Don't go looking here when the next one bites.
 #
 #   E4/E7/E9, F  pycodestyle + pyflakes  -- the historic default
 #   I            import sorting
@@ -44,7 +49,17 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B", "RUF"]
 # `µg/m³`, `°C`. RUF003 flagged the MULTIPLICATION SIGN in a CO2 arithmetic
 # comment as a suspected `x` typo, which it is not. Rewriting correct notation to
 # satisfy a homoglyph check is the wrong trade in this codebase.
-ignore = ["RUF001", "RUF002", "RUF003"]
+#
+# RUF001 (string literals) is deliberately NOT ignored. It is the member of the
+# trio that catches real bugs -- a Cyrillic `а` in a dict key or a non-breaking
+# hyphen in a SQL identifier fails at runtime, silently -- and it was firing on
+# nothing here. Only comments (RUF003) and docstrings (RUF002) get the pass.
+ignore = ["RUF002", "RUF003"]
+
+[tool.ruff.lint.isort]
+# Without this, an aliased member forces a SECOND `from awair.fans import (...)`
+# block directly under the first, which reads as a bad merge conflict resolution.
+combine-as-imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
