@@ -19,8 +19,18 @@ jobs:
         with:
           python-version: "3.13"
 
+      # Named explicitly so lock drift reports itself instead of arriving later
+      # as an inexplicable lint failure. #54 cost four blocked PRs and a full
+      # diagnosis because the only symptom was "33 ruff errors on a PR that
+      # touched no Python".
+      - name: Check uv.lock is in sync with pyproject.toml
+        run: uv lock --check
+
+      # --frozen: install exactly what the lockfile pins. Without it `uv sync`
+      # re-resolves whenever the lock cannot satisfy pyproject, silently giving
+      # CI a different toolchain than every local run.
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --frozen
 
       - name: Lint (ruff)
         run: uv run ruff check awair/ tests/

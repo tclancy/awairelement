@@ -1,6 +1,12 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # "uv", not "pip": the pip ecosystem edits pyproject.toml and leaves uv.lock
+  # untouched, so every bump left the lock unable to satisfy its own pyproject
+  # (verified on 7d1fc24, which moved the ruff floor and changed one file). CI's
+  # non-frozen `uv sync` then re-resolved to whatever was newest on PyPI at run
+  # time, so the linter CI ran was not the linter anyone tested with -- that is
+  # the whole of #54. The uv ecosystem updates pyproject and uv.lock together.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
