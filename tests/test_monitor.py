@@ -217,6 +217,51 @@ def test_notification_format_temp_converts_and_suffixes():
     assert _fmt("temp", 0.0, "K") == "273.15K"
 
 
+def test_notification_titles_upcase_the_metric():
+    """Nothing pinned this: every other label assertion normalises with .lower().
+
+    Found by mutating `_Notice.label` to drop `.upper()` — the whole suite stayed
+    green while every ntfy title changed from "CO2 spike" to "co2 spike".
+    """
+    from awair.monitor import _Notice
+
+    notice = _Notice(
+        conn=None,
+        notifier=None,
+        name="co2",
+        decision=None,
+        event=None,
+        now=NOW,
+        temp_unit="C",
+    )
+    assert notice.label == "CO2"
+
+
+def test_notice_formats_values_in_its_own_temp_unit():
+    """`temp` has no MetricConfig yet, so this plumbing has no end-to-end path.
+
+    `METRICS` is co2/voc/pm25, which means `_Notice.fmt` never reaches `_fmt`'s
+    temperature branch through `check_metrics` today — a mutation hardcoding the
+    unit to "C" survived the whole suite. The threading is still correct and is
+    what a future `temp` metric will ride on, so pin it at the unit level.
+    """
+    from awair.monitor import _Notice
+
+    def notice_for(temp_unit):
+        return _Notice(
+            conn=None,
+            notifier=None,
+            name="temp",
+            decision=None,
+            event=None,
+            now=NOW,
+            temp_unit=temp_unit,
+        )
+
+    assert notice_for("C").fmt(22.5) == "22.5°C"
+    assert notice_for("F").fmt(22.5) == "72.5°F"
+
+
 # --- decision dispatch (#57) ---
 
 
