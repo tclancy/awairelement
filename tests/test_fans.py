@@ -138,6 +138,37 @@ def test_pm25_suppression_still_beats_a_latched_event():
     assert "pm25" in reason
 
 
+# --- the two predicates desired_action composes (#57) ---
+
+
+def test_pm25_suppresses_needs_positive_evidence():
+    """No reading is not a suppression: the veto needs particulate to point at.
+
+    `check_fans` only ever passes a reading inside PM25_FRESHNESS, so None here
+    means "the sensor has told us nothing recent" — which must not silently
+    behave like a clean reading *or* like a dirty one. It means don't veto.
+    """
+    assert fans.pm25_suppresses(None) is False
+    assert fans.pm25_suppresses(fans.PM25_SUPPRESS_THRESHOLD - 0.1) is False
+    assert fans.pm25_suppresses(fans.PM25_SUPPRESS_THRESHOLD) is True  # inclusive
+    assert fans.pm25_suppresses(fans.PM25_SUPPRESS_THRESHOLD + 100) is True
+
+
+def test_engaged_triggers_returns_only_latched_co2_voc_events():
+    """Trigger metrics only, latch set only, and in FAN_TRIGGERS order."""
+    active = fans.engaged_triggers(
+        {
+            "voc": _event("voc", fans_engaged=1),
+            "co2": _event("co2", fans_engaged=1),
+            "pm25": _event("pm25", fans_engaged=1),  # suppressor, never a trigger
+            "temp": _event("temp", fans_engaged=1),  # not a fan metric at all
+        }
+    )
+    assert [e["metric"] for e in active] == ["co2", "voc"]
+    assert fans.engaged_triggers({"co2": _event("co2", fans_engaged=0)}) == []
+    assert fans.engaged_triggers({}) == []
+
+
 # --- events_to_engage: which open events latch on this poll ---
 
 

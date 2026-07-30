@@ -215,3 +215,57 @@ def test_notification_format_temp_converts_and_suffixes():
     assert _fmt("temp", 22.5, "C") == "22.5°C"
     assert _fmt("temp", 22.5, "F") == "72.5°F"
     assert _fmt("temp", 0.0, "K") == "273.15K"
+
+
+# --- decision dispatch (#57) ---
+
+
+def test_every_decision_action_spikes_can_emit_has_a_handler():
+    """The docstring on `Decision.action` is the contract; pin it to _ACTIONS.
+
+    `Decision.action` is a bare `str` whose permitted values live only in a
+    comment, so a new action can ship without a handler and reach production as
+    silence. This test makes the comment executable.
+    """
+    import inspect
+    import re
+
+    from awair.monitor import _ACTIONS
+    from awair.spikes import Decision
+
+    source = inspect.getsource(Decision)
+    declared = re.search(r"action: str\s*#\s*(.+)", source).group(1)
+    assert set(re.split(r"\s*\|\s*", declared.strip())) == set(_ACTIONS)
+
+
+def test_unhandled_decision_action_warns_instead_of_vanishing(
+    conn, monkeypatch, caplog
+):
+    """An action with no handler is still a no-op, but a loud one.
+
+    The elif chain this replaced dropped it in silence — the worst outcome on
+    an alerting path, because a decision was made and nobody hears it.
+    """
+    from awair import monitor
+    from awair.spikes import Decision
+
+    seed(conn, [500, 500, 500, 1300, 1350])
+    monkeypatch.setattr(
+        monitor,
+        "evaluate",
+        lambda cfg, history, event, now: (
+            Decision(action="teleport", tier="ceiling", value=1400.0)
+            if cfg.name == "co2"
+            else None
+        ),
+    )
+    notifier = FakeNotifier()
+    caplog.set_level("WARNING", logger="awair.monitor")
+
+    check_metrics(conn, notifier, now=NOW)
+
+    assert notifier.sent == []
+    assert db.get_open_events(conn) == {}
+    warnings = [r for r in caplog.records if "no handler" in r.message]
+    assert len(warnings) == 1
+    assert "teleport" in warnings[0].message
