@@ -11,7 +11,7 @@ import logging
 import os
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from awair import db
 from awair.alerts import Notifier
@@ -61,9 +61,7 @@ def poll_once(conn, fetch) -> str:
     """One poll iteration: 'inserted', 'duplicate', or 'error'."""
     try:
         payload = json.loads(fetch())
-        reading = parse_reading(
-            payload, received_at=datetime.now(timezone.utc).isoformat()
-        )
+        reading = parse_reading(payload, received_at=datetime.now(UTC).isoformat())
     except (OSError, ValueError, KeyError) as exc:
         log.warning("poll failed: %s", exc)
         return "error"
@@ -143,7 +141,7 @@ def main(argv=None) -> None:
 
     if args.test:
         try:
-            run_fan_test(conn, notifier, fans_config, datetime.now(timezone.utc))
+            run_fan_test(conn, notifier, fans_config, datetime.now(UTC))
         finally:
             conn.close()
         return
@@ -164,7 +162,7 @@ def main(argv=None) -> None:
             "poll: %s",
             status,
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         if status == "inserted":
             check_metrics(conn, notifier, now)
             check_fans(conn, notifier, fans_config, now)

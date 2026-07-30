@@ -1,6 +1,6 @@
 """outdoor_readings table: schema, insert idempotency, query."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -39,7 +39,7 @@ def test_outdoor_readings_since_returns_selected_columns_ascending(conn):
 
 
 def test_outdoor_readings_since_rejects_unknown_column(conn):
-    since = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    since = datetime(2026, 1, 1, tzinfo=UTC)
     with pytest.raises(ValueError):
         db.outdoor_readings_since(conn, ("no_such_column",), since)
 
@@ -58,7 +58,7 @@ def test_outdoor_readings_schema_survives_re_connect(tmp_path):
 
 def test_indoor_pipeline_still_works(conn):
     """Sanity: adding outdoor_readings doesn't disturb the indoor pipeline."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     reading = {col: None for col in db.READING_COLUMNS}
     reading["ts"] = db.iso_z(now - timedelta(hours=1))
     reading["received_at"] = (now - timedelta(hours=1)).isoformat()

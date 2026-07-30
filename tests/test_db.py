@@ -1,7 +1,8 @@
 """Schema bootstrap and reading insertion."""
 
 import json
-from datetime import datetime, timedelta, timezone
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -218,7 +219,7 @@ def test_alert_events_schema_ready_for_slice_2(conn):
 # --- fan_state helpers ---
 
 
-NOW = datetime(2026, 7, 12, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
 
 def test_fan_state_schema_present(conn):
@@ -229,7 +230,11 @@ def test_fan_state_schema_present(conn):
 def test_fan_state_rejects_out_of_domain_action(conn):
     # CHECK constraint prevents a typo (e.g. 'Speed1') from writing state that
     # decide() would never match, causing infinite retries.
-    with pytest.raises(Exception):
+    # Narrowed from a bare Exception: this must fail at the CHECK constraint,
+    # not at any error that happens to reach the caller. A blind assert passed
+    # equally on an AttributeError from a wrong-typed command_at, which proves
+    # nothing about the constraint the test is named for.
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
         db.upsert_fan_state(conn, fan_id=1, action="Speed1", command_at=NOW)
 
 

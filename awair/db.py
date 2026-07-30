@@ -5,13 +5,13 @@ connect() — never edit the CREATE statements for deployed columns.
 """
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # UTC-aware sentinel for fan_state rows we've never written — must be tz-aware
 # so callers can subtract it from `datetime.now(timezone.utc)` without a
 # naive/aware TypeError.
-_NEVER = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_NEVER = datetime(1970, 1, 1, tzinfo=UTC)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (

@@ -1,10 +1,10 @@
 """alert_events persistence helpers."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from awair import db
 
-NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
 
 def test_no_open_events_initially(conn):
