@@ -129,20 +129,38 @@ stays Celsius).
 If your checkout isn't at `~/sources/awairelement`, edit `WorkingDirectory=`
 and `ExecStart=` in each unit before symlinking.
 
-Fan mitigation (issue #10 / #14) is **off by default**; enable per-deploy after
-verifying the poller is stable:
-- `AWAIR_FAN_MITIGATION_ENABLED` (default `false`) — flip to `true` to let the
-  poller drive the ceiling fans.
-- `AWAIR_FAN_HOST` (default `192.168.68.68`) — NodeMCU host on the LAN.
+### Fan mitigation — retired
 
-Smoke-test the fan + ntfy plumbing (works even with mitigation disabled):
+Automatic fan mitigation (issues #10 / #14) is **retired** as of
+[#61](https://github.com/tclancy/awairelement/issues/61). The poller does not
+drive the ceiling fans, and `AWAIR_FAN_MITIGATION_ENABLED=true` no longer
+re-enables it — `awair.fans.MITIGATION_RETIRED` overrides the variable and logs
+a warning if a deploy still sets it.
+
+Why: measured over 303 hours, the fans ran 97 of them — a 32% duty cycle, 25
+hours of it overnight, with one unbroken 34-hour span. Spike events in this
+house last half a day, so "mitigate the spike" meant "run the fans a third of
+the time". Full reasoning and the condition under which we'd bring it back:
+[ADR-001](docs/decisions/001-retire-automatic-fan-mitigation.md).
+
+A poller running with mitigation off **releases** the fans: any fan it still
+believes it left running gets one `off` command, then it stops touching them.
+Turning a fan on at the wall afterwards is safe — the poller will not fight you.
+
+The machinery is intact and fully tested, so re-enabling is one constant
+(`MITIGATION_RETIRED = False`) plus whatever change made it worth having again.
+`AWAIR_FAN_HOST` (default `192.168.68.68`, the NodeMCU on the LAN) still
+configures where commands go.
+
+Smoke-test the fan + ntfy plumbing — `--test` deliberately ignores every gate
+above, including the retirement:
 
 ```bash
 python -m awair.poller --test   # fans to speed1, sends "Fan test", exits
 ```
 
-A running poller takes over afterward — with no event open it turns the
-fans back off within a couple of polls (after the 60s rate limit).
+A running poller releases them off again within a poll or two (after the 60s
+rate limit).
 
 ## Deploy (homelab)
 `restart.sh` in the repo root runs `uv sync --frozen` and restarts both units

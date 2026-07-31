@@ -18,7 +18,7 @@ same PR that lands the code.
 - **DeviceHealth** — Snapshot of last-successful-fetch state used to detect the transition between healthy and stale/unreachable readings; owns the `ok`, `since`, and `last_status` fields on `awair.monitor.DeviceHealth`.
 - **engaged** — An open co2/voc **event** whose `fans_engaged` latch is set, i.e. one the Awair score has agreed with (score below `FAN_SCORE_GATE` at least once while the event was open). The latch is write-once per event; `fans.engaged_triggers` returns the engaged ones and only those reach a **desired action**. An open spike that is not engaged never moves a fan.
 - **event** — A row in the `events` table representing an open or closed spike/threshold violation. Rows are opened by `spikes.evaluate` and closed by `db.close_event`.
-- **fan mitigation** — The whole loop: `desired_action` → `decide` → `actuate`. Turns ceiling fans on when co2/voc spike and off when air clears; gated by `AWAIR_FAN_MITIGATION_ENABLED` (default off).
+- **fan mitigation** — The whole loop: `desired_action` → `decide` → `actuate`. Turns ceiling fans on when co2/voc spike and off when air clears. **Retired** as of #61 — see **retired** below.
 - **fan_state** — SQLite row (one per fan) tracking `last_action` (last known / last confirmed physical state) and `last_command_at` (when the poller last tried to command the fan — used for the 1-cmd/min rate limit).
 - **FansConfig** — Immutable config for fan mitigation: `enabled`, `fan_host`, `fan_ids`. Built from env by `awair.fans.config_from_env`.
 - **fetch** — The single-shot HTTP GET against the Awair Element Local API that returns one reading payload; built by `poller.make_fetch(url)`.
@@ -31,6 +31,8 @@ same PR that lands the code.
 - **poll** — One iteration of the poller loop: `fetch` → `parse_reading` → `insert_reading` → `check_metrics` → `check_fans`. Distinct from **fetch** — a poll wraps a fetch with DB + monitor side effects.
 - **pressure** — Mean sea-level barometric pressure. Stored in the `outdoor_readings.pressure` column in hPa (Open-Meteo's native unit) and converted to inHg at the `/api/outdoor-series` boundary (`_HPA_PER_INHG = 33.8639`). Rendered on the precipitation card as a second Y-axis layer (fixed range 28.5–31.0 inHg) using each bucket's `min` — the trough is the storm-front signal, not the average (#42).
 - **reading** — One row in the `readings` table; produced by `poller.parse_reading(payload, received_at)`.
+- **release** — Commanding a fan `off` once because **fan mitigation** is not driving it, as opposed to because the air cleared (`awair.fans.release_fans`, reason string `RELEASE_REASON`). A disabled poller releases rather than freezing, and then goes quiet — it does not re-command a fan switched on at the wall afterwards.
+- **retired** — **Fan mitigation**'s current state (#61): the machinery is intact and tested but `awair.fans.MITIGATION_RETIRED` forces `config_from_env()` to report disabled whatever `AWAIR_FAN_MITIGATION_ENABLED` says. Distinct from **disabled**, which is the ordinary off position of that env var. Rationale and the reversal condition: [ADR-001](docs/decisions/001-retire-automatic-fan-mitigation.md).
 - **series** — A bucketed time-window of readings for the dashboard, produced by `awair.series.bucket(points, bucket_seconds)`. **Not** a synonym for `metric_history` (which returns raw points).
 - **spike** — An event triggered by threshold + hysteresis logic in `awair.spikes`; distinct from a **stale device**, which is the health-check equivalent handled by `monitor` + `DeviceHealth`.
 - **near-miss** — A pm25 reading at or above `PM25_NEAR_MISS_THRESHOLD` (15 µg/m³) but below the **suppressor** threshold (25). Logged at INFO from `check_fans` so we can watch the suppressor's headroom shrink before it ever fires (#15). Behavior-neutral — it does not change the fan verdict.
@@ -40,4 +42,7 @@ same PR that lands the code.
 ## Related decisions
 
 Load-bearing terminology choices go in `docs/decisions/` as ADRs. Link them
-here when a term is contested or has a non-obvious rationale. (None yet.)
+here when a term is contested or has a non-obvious rationale.
+
+- [ADR-001](docs/decisions/001-retire-automatic-fan-mitigation.md) — retire
+  automatic **fan mitigation** (#61). Defines **retired** and **release**.

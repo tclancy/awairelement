@@ -1,5 +1,12 @@
 """Ceiling-fan mitigation: turn fans on when CO2/TVOC spike, off otherwise.
 
+**Automatic mitigation is RETIRED (#61).** `MITIGATION_RETIRED` below forces
+`config_from_env()` to report disabled no matter what the environment asks for,
+and a disabled poller now *releases* the fans rather than freezing them. Every
+pure function below is still live and still tested, so un-retiring is a one-line
+revert — see `docs/decisions/001-retire-automatic-fan-mitigation.md`. The rest of
+this docstring describes the machinery as it behaves when un-retired.
+
 The trigger surface reuses `awair.spikes` events, but an open co2/voc event is not
 enough on its own: it must also have **latched** (`fans_engaged`), which happens the
 first time the Awair score drops below FAN_SCORE_GATE while that event is open. A
@@ -23,6 +30,7 @@ Split cleanly for testability:
 - `desired_action(open_events, latest_pm25)` — pure verdict from sensor state.
 - `decide(fan_id, action, reason, state, now)` — rate-limit + no-op filter.
 - `actuate(decision, config, opener)` — thin urllib GET at the NodeMCU endpoint.
+- `release_fans(conn, notifier, config, now)` — let go of any fan we left running.
 - `check_fans(conn, notifier, config, now)` — glue: reads state, drives fans, persists, alerts.
 """
 
@@ -56,6 +64,19 @@ SCORE_FRESHNESS = timedelta(minutes=5)
 FAN_CMD_TIMEOUT_SECONDS = 5
 DEFAULT_FAN_HOST = "192.168.68.68"
 DEFAULT_FAN_IDS = (1, 2)
+# Automatic fan mitigation is retired (#61): measured over 303 h it ran the
+# ceiling fans for 97 h — a 32% duty cycle, 25 h of it between 22:00 and 08:00,
+# with a single unbroken 34 h stretch. The design assumed spikes are transient;
+# this house's voc-ceiling events last half a day. `config_from_env()` therefore
+# reports disabled regardless of the environment, and `check_fans` releases the
+# fans instead of driving them. Flip this to False to bring the whole loop back —
+# every function below stays live and tested for exactly that reason.
+# See docs/decisions/001-retire-automatic-fan-mitigation.md.
+MITIGATION_RETIRED = True
+# Recorded when a *disabled* poller commands a fan off. Deliberately not a
+# verdict about the air like "no co2/voc spike" — it is the poller letting go of
+# a fan it has stopped managing.
+RELEASE_REASON = "fan mitigation disabled, releasing fan"
 
 
 @dataclass(frozen=True)
@@ -73,9 +94,23 @@ class MitigationDecision:
 
 
 def config_from_env() -> FansConfig:
+    """Read fan config from the environment, honouring the retirement (#61).
+
+    While `MITIGATION_RETIRED` is set the enable flag cannot turn mitigation on.
+    It is logged rather than silently dropped: a deploy whose env still asks for
+    fans should say so out loud, so nobody debugs "why aren't the fans running"
+    against a variable that no longer has any power.
+    """
+    requested = (
+        os.environ.get("AWAIR_FAN_MITIGATION_ENABLED", "false").lower() == "true"
+    )
+    if requested and MITIGATION_RETIRED:
+        log.warning(
+            "ignoring AWAIR_FAN_MITIGATION_ENABLED=true: automatic fan mitigation"
+            " is retired (#61). Fans will be released off, not driven."
+        )
     return FansConfig(
-        enabled=os.environ.get("AWAIR_FAN_MITIGATION_ENABLED", "false").lower()
-        == "true",
+        enabled=requested and not MITIGATION_RETIRED,
         fan_host=os.environ.get("AWAIR_FAN_HOST", DEFAULT_FAN_HOST),
         fan_ids=DEFAULT_FAN_IDS,
     )
@@ -256,9 +291,67 @@ def _log_pm25_observability(
         )
 
 
+def _command_fan(conn, notifier, config: FansConfig, fan_id, action, reason, now):
+    """Decide → actuate → persist → alert for one fan. Silent when nothing changes.
+
+    Shared by the drive path (`check_fans`) and the release path
+    (`release_fans`) so both inherit `decide`'s no-op filter and rate limit, and
+    both persist failures the same way.
+    """
+    state = db.get_fan_state(conn, fan_id)
+    decision = decide(fan_id, action, reason, state, now)
+    if decision is None:
+        return
+    ok = actuate(decision, config)
+    log.info(
+        "fan %d -> %s (%s) actuate=%s",
+        fan_id,
+        decision.action,
+        decision.reason,
+        ok,
+    )
+    # On failure, keep last_action == whatever the DB already believed —
+    # don't record the failed target as "current." Stamp last_command_at
+    # either way so the rate limit doubles as backoff (retry once per
+    # RATE_LIMIT, not every poll).
+    db.upsert_fan_state(
+        conn,
+        fan_id=fan_id,
+        action=decision.action if ok else state["last_action"],
+        command_at=now,
+    )
+    if ok:
+        notifier.send(
+            f"fan {fan_id} -> {decision.action} ({decision.reason})",
+            title="Awair fan mitigation",
+        )
+
+
+def release_fans(conn, notifier, config: FansConfig, now) -> None:
+    """Command off, once, any fan this poller still believes it left running.
+
+    Disabling mitigation has to mean "the fans are not running", not "the fans
+    are frozen wherever the last command left them" (#61). The old early return
+    meant flipping the kill switch mid-event stranded both fans at speed1 with
+    nothing left running that would ever turn them back off — the complaint the
+    switch exists to answer, made permanent.
+
+    `decide`'s no-op filter makes this exactly one command per fan per
+    transition: once `last_action` is "off" every later poll is silent, so a
+    disabled poller does not fight a fan switched on at the wall afterwards.
+    """
+    for fan_id in config.fan_ids:
+        _command_fan(conn, notifier, config, fan_id, "off", RELEASE_REASON, now)
+
+
 def check_fans(conn, notifier, config: FansConfig, now) -> None:
-    """One poll's worth of fan control. No-op when config.enabled is False."""
+    """One poll's worth of fan control.
+
+    When mitigation is disabled this releases the fans rather than returning —
+    see `release_fans`.
+    """
     if not config.enabled:
+        release_fans(conn, notifier, config, now)
         return
     open_events = db.get_open_events(conn)
     open_events = _engage_qualifying_events(conn, open_events, now)
@@ -266,30 +359,4 @@ def check_fans(conn, notifier, config: FansConfig, now) -> None:
     action, reason = desired_action(open_events, latest_pm25)
     _log_pm25_observability(open_events, latest_pm25, action)
     for fan_id in config.fan_ids:
-        state = db.get_fan_state(conn, fan_id)
-        decision = decide(fan_id, action, reason, state, now)
-        if decision is None:
-            continue
-        ok = actuate(decision, config)
-        log.info(
-            "fan %d -> %s (%s) actuate=%s",
-            fan_id,
-            decision.action,
-            decision.reason,
-            ok,
-        )
-        # On failure, keep last_action == whatever the DB already believed —
-        # don't record the failed target as "current." Stamp last_command_at
-        # either way so the rate limit doubles as backoff (retry once per
-        # RATE_LIMIT, not every poll).
-        db.upsert_fan_state(
-            conn,
-            fan_id=fan_id,
-            action=decision.action if ok else state["last_action"],
-            command_at=now,
-        )
-        if ok:
-            notifier.send(
-                f"fan {fan_id} -> {decision.action} ({decision.reason})",
-                title="Awair fan mitigation",
-            )
+        _command_fan(conn, notifier, config, fan_id, action, reason, now)

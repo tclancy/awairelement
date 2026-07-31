@@ -336,12 +336,84 @@ def _seed_event(conn, metric, tier="relative"):
     )
 
 
-def test_check_fans_no_op_when_disabled(conn):
+def test_disabled_poller_touches_nothing_when_no_fan_is_running(conn):
+    # Nothing recorded => nothing to release. A disabled poller on a clean DB
+    # must stay completely silent rather than spamming an off command.
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1, 2))
     check_fans(conn, notifier, cfg, NOW)
     assert notifier.sent == []
     assert conn.execute("SELECT COUNT(*) FROM fan_state").fetchone()[0] == 0
+
+
+def test_disabled_poller_releases_fans_it_left_running(conn, monkeypatch):
+    # The state on the homelab when #61 was filed: voc-ceiling event 42 open and
+    # latched, both fans at speed1 since 15:22 ET, ten hours and counting. Under
+    # the old early return, disabling mitigation here stranded them at speed1
+    # forever — the complaint the kill switch exists to answer, made permanent.
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    notifier = FakeNotifier()
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1, 2))
+    _seed_reading(conn, pm25=5.0)
+    _seed_event(conn, "voc", tier="ceiling")
+    for fan_id in (1, 2):
+        db.upsert_fan_state(
+            conn, fan_id=fan_id, action="speed1", command_at=NOW - timedelta(hours=10)
+        )
+
+    check_fans(conn, notifier, cfg, NOW)
+
+    assert [url for url, _ in calls] == [
+        "http://host.local/fan/1/off",
+        "http://host.local/fan/2/off",
+    ]
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
+    assert db.get_fan_state(conn, 2)["last_action"] == "off"
+    assert len(notifier.sent) == 2
+
+
+def test_release_is_one_shot_not_a_command_every_poll(conn, monkeypatch):
+    # After the release the poller must go quiet: a disabled poller that
+    # re-sent "off" every 30s would fight a fan switched on at the wall.
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed2", command_at=NOW - timedelta(hours=1)
+    )
+
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert len(calls) == 1
+    for extra_polls in range(1, 5):
+        check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(minutes=extra_polls * 5))
+    assert len(calls) == 1
+
+
+def test_release_keeps_db_truth_and_retries_when_the_nodemcu_is_down(conn, monkeypatch):
+    # Same contract as the drive path: a failed command must not be recorded as
+    # the fan's current state, and the rate limit doubles as the retry backoff.
+    def broken(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken)
+    notifier = FakeNotifier()
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(hours=1)
+    )
+
+    check_fans(conn, notifier, cfg, NOW)
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"  # DB truth preserved
+    assert notifier.sent == []
+
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    check_fans(conn, notifier, cfg, NOW + timedelta(seconds=30))  # inside RATE_LIMIT
+    assert calls == []
+    check_fans(conn, notifier, cfg, NOW + timedelta(seconds=61))  # backoff elapsed
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
 def test_check_fans_drives_both_fans_on_co2_ceiling(conn, monkeypatch):
@@ -527,6 +599,10 @@ def test_stale_score_does_not_engage_fans(conn, monkeypatch):
 
 
 def test_config_from_env_defaults_off(monkeypatch):
+    # Retirement is lifted for the two parse tests below. With it in force they
+    # would pass for free — every input maps to enabled=False — and would stop
+    # saying anything about the parse they exist to pin.
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     monkeypatch.delenv("AWAIR_FAN_MITIGATION_ENABLED", raising=False)
     monkeypatch.delenv("AWAIR_FAN_HOST", raising=False)
     cfg = fans.config_from_env()
@@ -535,17 +611,62 @@ def test_config_from_env_defaults_off(monkeypatch):
     assert cfg.fan_ids == (1, 2)
 
 
-def test_config_from_env_reads_toggles(monkeypatch):
-    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
+def test_config_from_env_reads_fan_host(monkeypatch):
     monkeypatch.setenv("AWAIR_FAN_HOST", "10.0.0.10")
-    cfg = fans.config_from_env()
-    assert cfg.enabled is True
-    assert cfg.fan_host == "10.0.0.10"
+    assert fans.config_from_env().fan_host == "10.0.0.10"
+
+
+def test_retirement_overrides_the_enable_flag(monkeypatch, caplog):
+    # The homelab deploy still ships AWAIR_FAN_MITIGATION_ENABLED=true; while
+    # mitigation is retired (#61) that variable must not be able to switch the
+    # fans back on, and it must say so rather than being silently dropped.
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
+    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
+    with caplog.at_level("WARNING", logger="awair.fans"):
+        assert fans.config_from_env().enabled is False
+    assert "retired (#61)" in caplog.text
+
+
+def test_no_warning_when_the_env_does_not_ask_for_fans(monkeypatch, caplog):
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
+    monkeypatch.delenv("AWAIR_FAN_MITIGATION_ENABLED", raising=False)
+    with caplog.at_level("WARNING", logger="awair.fans"):
+        assert fans.config_from_env().enabled is False
+    assert caplog.text == ""
+
+
+def test_lifting_the_retirement_restores_the_enable_flag(monkeypatch):
+    # The whole point of retiring in place rather than deleting the module:
+    # un-retiring is one constant. If this ever fails, "flip it back" is a lie
+    # and the ADR's "reverses if" clause has nothing behind it.
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
+    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
+    assert fans.config_from_env().enabled is True
+
+
+def test_lifting_the_retirement_restores_the_whole_drive_loop(conn, monkeypatch):
+    # End-to-end through config_from_env, not a hand-built FansConfig: proves
+    # the retired machinery is still wired to the env, not just still present.
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
+    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
+    monkeypatch.setenv("AWAIR_FAN_HOST", "host.local")
+    _seed_reading(conn, pm25=5.0)
+    _seed_event(conn, "co2", tier="ceiling")
+
+    check_fans(conn, FakeNotifier(), fans.config_from_env(), NOW)
+
+    assert [url for url, _ in calls] == [
+        "http://host.local/fan/1/speed1",
+        "http://host.local/fan/2/speed1",
+    ]
 
 
 def test_config_from_env_enabled_is_strict(monkeypatch):
     # Anything other than the literal "true" (case-insensitive) is off — a
     # partial rename (e.g. "on") must never accidentally activate fans.
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "on")
     assert fans.config_from_env().enabled is False
 
