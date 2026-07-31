@@ -13,6 +13,7 @@ dev = [
     "pre-commit>=4.6.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
+    "pyyaml>=6.0.3",
     "radon>=6.0.1",
     "ruff>=0.15.22",
 ]
@@ -63,7 +64,10 @@ combine-as-imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=awair --cov-report=term-missing"
+# -ra so skipped tests are visible in CI output: tests/test_radon_gate.py
+# skips its two meaningful cases when uvx is absent, and a silent skip there
+# restores exactly the "green because nothing ran" state #57 was about.
+addopts = "-ra --cov=awair --cov-report=term-missing"
 
 [tool.coverage.run]
 source = ["awair"]

@@ -246,7 +246,12 @@ def _log_pm25_observability(
         log.info(
             "fan-on candidacy: pm25=%s suppressor=%s action=%s",
             "unknown" if latest_pm25 is None else f"{latest_pm25:g}",
-            "fired" if action == "off" and pm25_suppresses(latest_pm25) else "passed",
+            # Ask the suppressor directly rather than inferring it from
+            # `action == "off"`: today those agree (an engaged trigger can only
+            # be turned off by the suppressor), but the moment a second off-path
+            # exists — night-quiet, manual override — inferring would report the
+            # suppressor as having fired when it did not.
+            "fired" if pm25_suppresses(latest_pm25) else "passed",
             action,
         )
 
