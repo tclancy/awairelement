@@ -1,7 +1,18 @@
-"""Glue between readings, spike detection, alert_events, and ntfy."""
+"""Glue between readings, spike detection, alert_events, and ntfy.
+
+`check_metrics` is the loop; the four things it can decide to do with a metric
+(open, close, escalate, renotify) each live in their own `_apply_*` function and
+are reached through `_ACTIONS`. They were an elif chain until #57 — the chain
+scored grade C on its own, and every branch re-threaded the same seven values
+(`conn`, `notifier`, the metric name, the decision, the open event, `now`, the
+display unit) through `_fmt` calls by hand. `_Notice` carries that set once so a
+handler reads as message-then-persist.
+"""
 
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from awair import db, units
 from awair.spikes import METRICS, evaluate
@@ -24,6 +35,118 @@ def _fmt(name, value, temp_unit):
     return f"{value:g}"
 
 
+@dataclass(frozen=True)
+class _Notice:
+    """One metric's decision plus everything needed to announce and persist it.
+
+    `event` is the currently-open event row for this metric, or None when the
+    decision is `open` (there is nothing open yet). The other three actions all
+    act on an existing event, so they may read it.
+    """
+
+    conn: Any
+    notifier: Any
+    name: str
+    decision: Any
+    event: dict | None
+    now: Any
+    temp_unit: str
+
+    @property
+    def label(self) -> str:
+        """The metric name as it appears in a notification title/body."""
+        return self.name.upper()
+
+    def fmt(self, value) -> str:
+        """Render a value of *this* metric in the configured display unit."""
+        return _fmt(self.name, value, self.temp_unit)
+
+
+def _apply_open(notice):
+    """Announce a newly-detected spike and record the event."""
+    notified = notice.notifier.send(
+        f"{notice.label} at {notice.fmt(notice.decision.value)}"
+        f" (baseline {notice.fmt(notice.decision.baseline)},"
+        f" threshold {notice.fmt(notice.decision.threshold)})",
+        title=f"{notice.label} spike",
+        priority=PRIORITY[notice.decision.tier],
+    )
+    db.open_event(
+        notice.conn,
+        metric=notice.name,
+        tier=notice.decision.tier,
+        opened_at=notice.now,
+        value=notice.decision.value,
+        baseline=notice.decision.baseline,
+        threshold=notice.decision.threshold,
+        notified=notified,
+    )
+
+
+def _apply_close(notice):
+    """Announce that a metric came back down and close its event."""
+    notified = notice.notifier.send(
+        f"{notice.label} back to {notice.fmt(notice.decision.value)}",
+        title=f"{notice.label} cleared",
+    )
+    db.close_event(
+        notice.conn, notice.event["id"], closed_at=notice.now, notified=notified
+    )
+
+
+def _escalation_detail(notice) -> str:
+    """Why this escalation fired — a new ceiling crossing, or a doubling."""
+    promoted = notice.decision.tier != notice.event["tier"]
+    if promoted:
+        return f"crossed the {notice.fmt(notice.decision.threshold)} ceiling"
+    return f"doubled since last notice (peak {notice.fmt(notice.event['peak_value'])})"
+
+
+def _apply_escalate(notice):
+    """Page on an open event that got materially worse."""
+    notice.notifier.send(
+        f"{notice.label} at {notice.fmt(notice.decision.value)}"
+        f" — {_escalation_detail(notice)}",
+        title=f"{notice.label} escalating",
+        priority="high",
+    )
+    db.escalate_event(
+        notice.conn,
+        notice.event["id"],
+        notice.now,
+        value=notice.decision.value,
+        tier=notice.decision.tier,
+    )
+
+
+def _apply_renotify(notice):
+    """Re-state a long-running event that has neither cleared nor worsened."""
+    notice.notifier.send(
+        f"{notice.label} still elevated at"
+        f" {notice.fmt(notice.decision.value)}"
+        f" (peak {notice.fmt(notice.event['peak_value'])})",
+        title=f"{notice.label} still elevated",
+    )
+    db.mark_renotified(
+        notice.conn, notice.event["id"], notice.now, value=notice.decision.value
+    )
+
+
+_ACTIONS = {
+    "open": _apply_open,
+    "close": _apply_close,
+    "escalate": _apply_escalate,
+    "renotify": _apply_renotify,
+}
+
+
+def _refresh_peak(conn, event, history):
+    """Fold the newest sample into an open event's running peak."""
+    latest = history[-1][1]
+    db.update_peak(conn, event["id"], latest)
+    event["peak_value"] = max(event["peak_value"] or latest, latest)
+
+
 def check_metrics(conn, notifier, now):
     """Run detection for every metric; persist and notify on decisions."""
     open_events = db.get_open_events(conn)
@@ -33,64 +156,20 @@ def check_metrics(conn, notifier, now):
         history = db.metric_history(conn, name, since)
         event = open_events.get(name)
         if event and history:
-            latest = history[-1][1]
-            db.update_peak(conn, event["id"], latest)
-            event["peak_value"] = max(event["peak_value"] or latest, latest)
+            _refresh_peak(conn, event, history)
         decision = evaluate(cfg, history, event, now)
         if decision is None:
             continue
         log.info("%s: %s (%s)", name, decision.action, decision.tier)
-        if decision.action == "open":
-            notified = notifier.send(
-                f"{name.upper()} at {_fmt(name, decision.value, temp_unit)}"
-                f" (baseline {_fmt(name, decision.baseline, temp_unit)},"
-                f" threshold {_fmt(name, decision.threshold, temp_unit)})",
-                title=f"{name.upper()} spike",
-                priority=PRIORITY[decision.tier],
-            )
-            db.open_event(
-                conn,
-                metric=name,
-                tier=decision.tier,
-                opened_at=now,
-                value=decision.value,
-                baseline=decision.baseline,
-                threshold=decision.threshold,
-                notified=notified,
-            )
-        elif decision.action == "close":
-            notified = notifier.send(
-                f"{name.upper()} back to {_fmt(name, decision.value, temp_unit)}",
-                title=f"{name.upper()} cleared",
-            )
-            db.close_event(conn, event["id"], closed_at=now, notified=notified)
-        elif decision.action == "escalate":
-            promoted = decision.tier != event["tier"]
-            if promoted:
-                detail = (
-                    f"crossed the {_fmt(name, decision.threshold, temp_unit)} ceiling"
-                )
-            else:
-                detail = (
-                    f"doubled since last notice"
-                    f" (peak {_fmt(name, event['peak_value'], temp_unit)})"
-                )
-            notifier.send(
-                f"{name.upper()} at {_fmt(name, decision.value, temp_unit)} — {detail}",
-                title=f"{name.upper()} escalating",
-                priority="high",
-            )
-            db.escalate_event(
-                conn, event["id"], now, value=decision.value, tier=decision.tier
-            )
-        elif decision.action == "renotify":
-            notifier.send(
-                f"{name.upper()} still elevated at"
-                f" {_fmt(name, decision.value, temp_unit)}"
-                f" (peak {_fmt(name, event['peak_value'], temp_unit)})",
-                title=f"{name.upper()} still elevated",
-            )
-            db.mark_renotified(conn, event["id"], now, value=decision.value)
+        apply = _ACTIONS.get(decision.action)
+        if apply is None:
+            # The elif chain this replaced dropped an unrecognised action in
+            # silence, which is the worst outcome for an alerting path: a
+            # decision was made and nobody hears about it. Still a no-op, but
+            # a loud one.
+            log.warning("%s: no handler for action %r", name, decision.action)
+            continue
+        apply(_Notice(conn, notifier, name, decision, event, now, temp_unit))
 
 
 class DeviceHealth:

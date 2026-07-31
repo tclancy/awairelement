@@ -16,6 +16,7 @@ same PR that lands the code.
 - **decide** — In `awair.fans`, the rate-limit + no-op filter around a **desired action**. Returns a `MitigationDecision` or `None`.
 - **desired action** — The verdict `awair.fans.desired_action` derives from open **event**s + latest pm25: `"off" | "speed1" | "speed2" | "speed3"`.
 - **DeviceHealth** — Snapshot of last-successful-fetch state used to detect the transition between healthy and stale/unreachable readings; owns the `ok`, `since`, and `last_status` fields on `awair.monitor.DeviceHealth`.
+- **engaged** — An open co2/voc **event** whose `fans_engaged` latch is set, i.e. one the Awair score has agreed with (score below `FAN_SCORE_GATE` at least once while the event was open). The latch is write-once per event; `fans.engaged_triggers` returns the engaged ones and only those reach a **desired action**. An open spike that is not engaged never moves a fan.
 - **event** — A row in the `events` table representing an open or closed spike/threshold violation. Rows are opened by `spikes.evaluate` and closed by `db.close_event`.
 - **fan mitigation** — The whole loop: `desired_action` → `decide` → `actuate`. Turns ceiling fans on when co2/voc spike and off when air clears; gated by `AWAIR_FAN_MITIGATION_ENABLED` (default off).
 - **fan_state** — SQLite row (one per fan) tracking `last_action` (last known / last confirmed physical state) and `last_command_at` (when the poller last tried to command the fan — used for the 1-cmd/min rate limit).

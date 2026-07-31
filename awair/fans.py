@@ -18,6 +18,8 @@ worsen the local reading. See issue #10 for the design memo.
 Split cleanly for testability:
 
 - `events_to_engage(open_events, latest_score)` — pure; which events latch now.
+- `engaged_triggers(open_events)` — pure; the already-latched co2/voc events.
+- `pm25_suppresses(latest_pm25)` — pure; does particulate veto the fans.
 - `desired_action(open_events, latest_pm25)` — pure verdict from sensor state.
 - `decide(fan_id, action, reason, state, now)` — rate-limit + no-op filter.
 - `actuate(decision, config, opener)` — thin urllib GET at the NodeMCU endpoint.
@@ -97,34 +99,55 @@ def events_to_engage(open_events: dict, latest_score: float | None) -> list:
     ]
 
 
-def desired_action(open_events: dict, latest_pm25: float | None) -> tuple[str, str]:
-    """From spike events + latest pm25, compute the target fan action.
+def pm25_suppresses(latest_pm25: float | None) -> bool:
+    """Whether this pm25 reading blocks fan mitigation outright.
 
-    Rules (see #10):
-      - pm25 >= 25 always suppresses fans (particulate re-suspension risk).
-      - No *engaged* co2/voc events open → off.
-      - One of co2/voc engaged → speed1.
-      - Both engaged, both relative tier → speed2.
-      - Both engaged, either at ceiling tier → speed3.
-
-    Only events whose `fans_engaged` latch is set count. An open spike the score
-    never agreed with is invisible here, so the fans stay put.
+    A missing reading does *not* suppress: the suppressor needs positive
+    evidence of particulate, and `check_fans` already only asks about readings
+    inside PM25_FRESHNESS.
     """
-    if latest_pm25 is not None and latest_pm25 >= PM25_SUPPRESS_THRESHOLD:
-        return "off", f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans"
-    active = [
+    return latest_pm25 is not None and latest_pm25 >= PM25_SUPPRESS_THRESHOLD
+
+
+def engaged_triggers(open_events: dict) -> list:
+    """The open co2/voc events whose `fans_engaged` latch is set.
+
+    An open spike the Awair score never agreed with has no latch and so is
+    invisible to the fan verdict — see the module docstring.
+    """
+    return [
         open_events[m]
         for m in FAN_TRIGGERS
         if m in open_events and open_events[m].get("fans_engaged")
     ]
-    if not active:
-        return "off", "no co2/voc spike"
+
+
+def _speed_for(active: list) -> tuple[str, str]:
+    """Pick a fan speed for a non-empty list of engaged trigger events."""
     metrics = "+".join(sorted(e["metric"] for e in active))
     if len(active) == 1:
         return "speed1", f"{metrics} elevated"
     if any(e["tier"] == "ceiling" for e in active):
         return "speed3", f"{metrics} at ceiling"
     return "speed2", f"{metrics} elevated"
+
+
+def desired_action(open_events: dict, latest_pm25: float | None) -> tuple[str, str]:
+    """From spike events + latest pm25, compute the target fan action.
+
+    Rules (see #10), in precedence order:
+      - pm25 >= 25 always suppresses fans (particulate re-suspension risk).
+      - No *engaged* co2/voc events open → off.
+      - One of co2/voc engaged → speed1.
+      - Both engaged, both relative tier → speed2.
+      - Both engaged, either at ceiling tier → speed3.
+    """
+    if pm25_suppresses(latest_pm25):
+        return "off", f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans"
+    active = engaged_triggers(open_events)
+    if not active:
+        return "off", "no co2/voc spike"
+    return _speed_for(active)
 
 
 def decide(
@@ -219,18 +242,16 @@ def _log_pm25_observability(
             latest_pm25,
             PM25_SUPPRESS_THRESHOLD,
         )
-    engaged = any(
-        m in open_events and open_events[m].get("fans_engaged") for m in FAN_TRIGGERS
-    )
-    if engaged:
+    if engaged_triggers(open_events):
         log.info(
             "fan-on candidacy: pm25=%s suppressor=%s action=%s",
             "unknown" if latest_pm25 is None else f"{latest_pm25:g}",
-            "fired"
-            if action == "off"
-            and latest_pm25 is not None
-            and latest_pm25 >= PM25_SUPPRESS_THRESHOLD
-            else "passed",
+            # Ask the suppressor directly rather than inferring it from
+            # `action == "off"`: today those agree (an engaged trigger can only
+            # be turned off by the suppressor), but the moment a second off-path
+            # exists — night-quiet, manual override — inferring would report the
+            # suppressor as having fired when it did not.
+            "fired" if pm25_suppresses(latest_pm25) else "passed",
             action,
         )
 
