@@ -18,3 +18,14 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # Watches the one remaining pinned hook repo, pre-commit/pre-commit-hooks.
+  # Deliberately NOT here to keep ruff current -- ruff is a `local` hook reading
+  # this project's uv.lock (#56), so the `uv` ecosystem above is already its
+  # only pin. Adding ruff back here would recreate the two-pin split, and pip
+  # and pre-commit being separate ecosystems means the two PRs can never land
+  # atomically (sandy#166 has the worked example: a weekly window of red CI).
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "weekly"
