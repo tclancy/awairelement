@@ -616,6 +616,21 @@ def test_config_from_env_reads_fan_host(monkeypatch):
     assert fans.config_from_env().fan_host == "10.0.0.10"
 
 
+def test_fan_mitigation_ships_retired(monkeypatch):
+    """The as-shipped default, asserted through behaviour and not monkeypatched.
+
+    Every other retirement test sets `MITIGATION_RETIRED` explicitly, which
+    leaves the value the repo actually ships completely unpinned — a mutation
+    round flipping it to False kept the whole suite green. That is the one
+    constant standing between #61 and the fans coming back on, so it gets a
+    test with nothing patched over it. Un-retiring should have to edit this
+    test on purpose, in the same diff, where a reviewer will see it.
+    """
+    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
+    assert fans.MITIGATION_RETIRED is True
+    assert fans.config_from_env().enabled is False
+
+
 def test_retirement_overrides_the_enable_flag(monkeypatch, caplog):
     # The homelab deploy still ships AWAIR_FAN_MITIGATION_ENABLED=true; while
     # mitigation is retired (#61) that variable must not be able to switch the
