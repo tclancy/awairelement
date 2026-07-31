@@ -29,16 +29,29 @@ We retire automatic fan mitigation **in place** rather than deleting it. A
 module constant `awair.fans.MITIGATION_RETIRED = True` forces `config_from_env()`
 to report `enabled=False` regardless of `AWAIR_FAN_MITIGATION_ENABLED`, logging a
 warning when the environment still asks for fans so the dead variable is loud
-rather than silent. Every pure function in `awair/fans.py` stays live and stays
-tested — the drive-path tests build a `FansConfig` directly, and
+rather than silent. The poller's startup banner reads
+`fan mitigation: retired (#61)` — a third state, not a synonym for `off`, since
+once the Ansible variable below is also `false` that warning never fires again
+and nothing else would tell this decision apart from someone having simply left
+fans off.
+
+Everything from `events_to_engage` to `_log_pm25_observability` therefore has
+**no production caller**. It stays intact and fully tested — the drive-path tests
+build a `FansConfig` directly, and
 `test_lifting_the_retirement_restores_the_whole_drive_loop` exercises the full
-loop through `config_from_env` with the constant lifted.
+loop through `config_from_env` with the constant lifted — but it is not *live*,
+and nothing outside the test suite will notice if it rots.
 
 We also change what *disabled* means. `check_fans` used to early-return, so
 flipping the kill switch mid-event stranded both fans at whatever speed the last
 command set — exactly the live state on the box. It now calls `release_fans`,
 which commands each fan off **once**, through the same `decide` no-op filter, and
-then goes quiet.
+then goes quiet. The release is unconditional rather than `desired_action`'s
+verdict: on the live box the open voc event is latched, so that verdict is still
+`speed1` and asking for it would no-op against `last_action` and strand the fans
+exactly as the early return did. If the NodeMCU cannot be reached it gives up
+after `RELEASE_MAX_ATTEMPTS` and sends one high-priority ntfy, so the retired
+path does not become the only thing in the poller still talking to the network.
 
 The homelab Ansible variable `awair_fan_mitigation_enabled` also flips to
 `false` (homelab PR) so config and code agree, but neither change depends on the
@@ -57,8 +70,16 @@ other: the code retirement alone is sufficient on the box.
 - **Reverses if:** we find a trigger whose *duration* matches a tolerable
   fan-on window — most likely a duration cap (fans off after N minutes
   regardless of the event) or a quiet-hours window, both of which #14 explicitly
-  decided against. Reversal is `MITIGATION_RETIRED = False` plus whichever of
-  those two it is.
+  decided against. Reversal is **three edits, not one**, deliberately:
+  1. `awair/fans.py` — `MITIGATION_RETIRED = False`.
+  2. `tests/test_fans.py` — `test_fan_mitigation_ships_retired`, which pins the
+     shipped value precisely so un-retiring cannot happen without a reviewer
+     seeing it in the diff.
+  3. homelab `ansible/group_vars/homelab/vars.yml` —
+     `awair_fan_mitigation_enabled: true`, plus a deploy.
+
+  Plus whichever of the duration cap or quiet-hours window made it worth having
+  again.
 
 ## Alternatives considered
 

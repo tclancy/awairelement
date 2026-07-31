@@ -13,7 +13,7 @@ import time
 import urllib.request
 from datetime import UTC, datetime
 
-from awair import db
+from awair import db, fans
 from awair.alerts import Notifier
 from awair.fans import (
     check_fans,
@@ -106,6 +106,13 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
 
 
+def _fan_mitigation_status(fans_config) -> str:
+    """One word for the startup banner: on, off, or retired (#61)."""
+    if fans.MITIGATION_RETIRED:
+        return "retired (#61)"
+    return "on" if fans_config.enabled else "off"
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser(prog="python -m awair.poller")
     parser.add_argument(
@@ -152,7 +159,11 @@ def main(argv=None) -> None:
         url,
         interval,
         db_path,
-        "on" if fans_config.enabled else "off",
+        # "retired" is a third state, not a synonym for "off": once the homelab
+        # env stops setting AWAIR_FAN_MITIGATION_ENABLED=true the warning in
+        # config_from_env never fires again, and this line would be the only
+        # thing distinguishing #61 from someone having simply left fans off.
+        _fan_mitigation_status(fans_config),
     )
 
     while True:

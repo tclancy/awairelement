@@ -2,10 +2,15 @@
 
 **Automatic mitigation is RETIRED (#61).** `MITIGATION_RETIRED` below forces
 `config_from_env()` to report disabled no matter what the environment asks for,
-and a disabled poller now *releases* the fans rather than freezing them. Every
-pure function below is still live and still tested, so un-retiring is a one-line
-revert — see `docs/decisions/001-retire-automatic-fan-mitigation.md`. The rest of
-this docstring describes the machinery as it behaves when un-retired.
+and a disabled poller now *releases* the fans rather than freezing them.
+
+Everything from `events_to_engage` down to `_log_pm25_observability` therefore
+has **no production caller** — it is intact and fully tested, not live. Tests
+are the only thing keeping it honest. Un-retiring means three edits, not one:
+this constant, `test_fan_mitigation_ships_retired` (which pins the shipped
+value on purpose), and homelab's `awair_fan_mitigation_enabled`. See
+`docs/decisions/001-retire-automatic-fan-mitigation.md`. The rest of this
+docstring describes the machinery as it behaves when un-retired.
 
 The trigger surface reuses `awair.spikes` events, but an open co2/voc event is not
 enough on its own: it must also have **latched** (`fans_engaged`), which happens the
@@ -69,14 +74,24 @@ DEFAULT_FAN_IDS = (1, 2)
 # with a single unbroken 34 h stretch. The design assumed spikes are transient;
 # this house's voc-ceiling events last half a day. `config_from_env()` therefore
 # reports disabled regardless of the environment, and `check_fans` releases the
-# fans instead of driving them. Flip this to False to bring the whole loop back —
-# every function below stays live and tested for exactly that reason.
+# fans instead of driving them. The machinery below stays intact and tested so
+# this stays reversible.
+# Flip this to False to bring the whole loop back — but see the module docstring:
+# it is one of three edits, not a one-liner.
 # See docs/decisions/001-retire-automatic-fan-mitigation.md.
 MITIGATION_RETIRED = True
 # Recorded when a *disabled* poller commands a fan off. Deliberately not a
 # verdict about the air like "no co2/voc spike" — it is the poller letting go of
 # a fan it has stopped managing.
 RELEASE_REASON = "fan mitigation disabled, releasing fan"
+# A release that cannot reach the NodeMCU gives up after this many failures and
+# says so once, on ntfy. The drive path retries indefinitely on purpose —
+# somebody is watching fans they asked for — but the *retired* path must not
+# become the only thing in this poller still talking to the network, once a
+# minute, forever, with `if ok:` swallowing every notification. Counted per
+# process, so restarting the poller is a deliberate "try again".
+RELEASE_MAX_ATTEMPTS = 5
+_release_attempts: dict[int, int] = {}
 
 
 @dataclass(frozen=True)
@@ -297,11 +312,15 @@ def _command_fan(conn, notifier, config: FansConfig, fan_id, action, reason, now
     Shared by the drive path (`check_fans`) and the release path
     (`release_fans`) so both inherit `decide`'s no-op filter and rate limit, and
     both persist failures the same way.
+
+    Returns True/False for the actuation result, or None when nothing was due —
+    `release_fans` needs to tell "the command failed" from "no command was owed
+    this poll" to count its attempts honestly.
     """
     state = db.get_fan_state(conn, fan_id)
     decision = decide(fan_id, action, reason, state, now)
     if decision is None:
-        return
+        return None
     ok = actuate(decision, config)
     log.info(
         "fan %d -> %s (%s) actuate=%s",
@@ -325,6 +344,32 @@ def _command_fan(conn, notifier, config: FansConfig, fan_id, action, reason, now
             f"fan {fan_id} -> {decision.action} ({decision.reason})",
             title="Awair fan mitigation",
         )
+    return ok
+
+
+def _release_one(conn, notifier, config: FansConfig, fan_id, now) -> None:
+    """Release one fan, giving up loudly after RELEASE_MAX_ATTEMPTS failures."""
+    if _release_attempts.get(fan_id, 0) >= RELEASE_MAX_ATTEMPTS:
+        return
+    ok = _command_fan(conn, notifier, config, fan_id, "off", RELEASE_REASON, now)
+    if ok is None:  # nothing owed this poll — already off, or rate-limited
+        return
+    if ok:
+        _release_attempts.pop(fan_id, None)
+        return
+    _release_attempts[fan_id] = _release_attempts.get(fan_id, 0) + 1
+    if _release_attempts[fan_id] < RELEASE_MAX_ATTEMPTS:
+        return
+    log.warning(
+        "giving up releasing fan %d after %d attempts", fan_id, RELEASE_MAX_ATTEMPTS
+    )
+    notifier.send(
+        f"could not turn fan {fan_id} off after {RELEASE_MAX_ATTEMPTS} tries —"
+        " it may still be running. Fan mitigation is retired (#61), so nothing"
+        " will try again until the poller restarts; switch it off at the wall.",
+        title="Awair fan mitigation",
+        priority="high",
+    )
 
 
 def release_fans(conn, notifier, config: FansConfig, now) -> None:
@@ -336,12 +381,18 @@ def release_fans(conn, notifier, config: FansConfig, now) -> None:
     nothing left running that would ever turn them back off — the complaint the
     switch exists to answer, made permanent.
 
-    `decide`'s no-op filter makes this exactly one command per fan per
-    transition: once `last_action` is "off" every later poll is silent, so a
-    disabled poller does not fight a fan switched on at the wall afterwards.
+    This is deliberately *not* `desired_action`'s verdict. On the live box the
+    open voc event is latched, so the verdict is still "speed1"; asking for it
+    would no-op against `last_action == "speed1"` and strand the fans exactly as
+    the early return did. A release is unconditional: off, because we have
+    stopped managing this fan, not because the air is clean.
+
+    `decide`'s no-op filter makes it exactly one command per fan per transition:
+    once `last_action` is "off" every later poll is silent, so a disabled poller
+    does not fight a fan switched on at the wall afterwards.
     """
     for fan_id in config.fan_ids:
-        _command_fan(conn, notifier, config, fan_id, "off", RELEASE_REASON, now)
+        _release_one(conn, notifier, config, fan_id, now)
 
 
 def check_fans(conn, notifier, config: FansConfig, now) -> None:

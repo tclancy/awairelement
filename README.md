@@ -144,13 +144,18 @@ the time". Full reasoning and the condition under which we'd bring it back:
 [ADR-001](docs/decisions/001-retire-automatic-fan-mitigation.md).
 
 A poller running with mitigation off **releases** the fans: any fan it still
-believes it left running gets one `off` command, then it stops touching them.
-Turning a fan on at the wall afterwards is safe — the poller will not fight you.
+believes it left running gets one `off` command on the next poll that stores a
+reading, then it stops touching them. (No reading, no release — if the Awair is
+unreachable the fans stay put until it recovers.) Turning a fan on at the wall
+afterwards is safe: the poller will not fight you. If the NodeMCU can't be
+reached it retries a handful of times, then sends one high-priority ntfy asking
+you to use the wall switch rather than retrying forever.
 
-The machinery is intact and fully tested, so re-enabling is one constant
-(`MITIGATION_RETIRED = False`) plus whatever change made it worth having again.
-`AWAIR_FAN_HOST` (default `192.168.68.68`, the NodeMCU on the LAN) still
-configures where commands go.
+The machinery is intact and fully tested. Re-enabling is three deliberate edits —
+`MITIGATION_RETIRED = False`, the `test_fan_mitigation_ships_retired` test that
+pins it, and the homelab `awair_fan_mitigation_enabled` variable — plus whatever
+change made it worth having again; see the ADR. `AWAIR_FAN_HOST` (default
+`192.168.68.68`, the NodeMCU on the LAN) still configures where commands go.
 
 Smoke-test the fan + ntfy plumbing — `--test` deliberately ignores every gate
 above, including the retirement:
@@ -159,8 +164,8 @@ above, including the retirement:
 python -m awair.poller --test   # fans to speed1, sends "Fan test", exits
 ```
 
-A running poller releases them off again within a poll or two (after the 60s
-rate limit).
+A running poller releases them off again on the next poll or two that stores a
+reading (after the 60s rate limit).
 
 ## Deploy (homelab)
 `restart.sh` in the repo root runs `uv sync --frozen` and restarts both units

@@ -6,6 +6,8 @@ Each scenario maps to a rule in issue #10 / #14. Trigger surface is
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from awair import db, fans
 from awair.fans import (
     FansConfig,
@@ -23,6 +25,24 @@ NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 # Below FAN_SCORE_GATE — the score at which an event is worth spending fans on.
 BAD_SCORE = 70
 GOOD_SCORE = 84
+
+
+@pytest.fixture(autouse=True)
+def _clear_release_budget():
+    """`fans._release_attempts` is per-process state; don't leak it across tests."""
+    fans._release_attempts.clear()
+    yield
+    fans._release_attempts.clear()
+
+
+def _counting(fn, sink):
+    """Wrap `fn`, appending one entry to `sink` per call."""
+
+    def wrapper(*args, **kwargs):
+        sink.append(args)
+        return fn(*args, **kwargs)
+
+    return wrapper
 
 
 def _event(metric, tier="relative", fans_engaged=1, event_id=1):
@@ -356,7 +376,14 @@ def test_disabled_poller_releases_fans_it_left_running(conn, monkeypatch):
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1, 2))
     _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "voc", tier="ceiling")
+    # LATCHED, not merely open. `db.open_event` leaves fans_engaged at its schema
+    # default of 0, and an unlatched event is inert to every fan verdict — so a
+    # fixture without this line lets a release that just delegates to
+    # `desired_action` pass, while on the real box (event 42, fans_engaged=1)
+    # that verdict is "speed1", no-ops against last_action, and strands the fans.
+    db.mark_fans_engaged(conn, _seed_event(conn, "voc", tier="ceiling"))
+    assert db.get_open_events(conn)["voc"]["fans_engaged"]
+    assert desired_action(db.get_open_events(conn), 5.0)[0] == "speed1"
     for fan_id in (1, 2):
         db.upsert_fan_state(
             conn, fan_id=fan_id, action="speed1", command_at=NOW - timedelta(hours=10)
@@ -370,7 +397,10 @@ def test_disabled_poller_releases_fans_it_left_running(conn, monkeypatch):
     ]
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
     assert db.get_fan_state(conn, 2)["last_action"] == "off"
-    assert len(notifier.sent) == 2
+    assert [msg for _, msg, _ in notifier.sent] == [
+        f"fan 1 -> off ({fans.RELEASE_REASON})",
+        f"fan 2 -> off ({fans.RELEASE_REASON})",
+    ]
 
 
 def test_release_is_one_shot_not_a_command_every_poll(conn, monkeypatch):
@@ -388,6 +418,64 @@ def test_release_is_one_shot_not_a_command_every_poll(conn, monkeypatch):
     for extra_polls in range(1, 5):
         check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(minutes=extra_polls * 5))
     assert len(calls) == 1
+
+
+def test_release_gives_up_loudly_instead_of_retrying_a_dead_nodemcu_forever(
+    conn, monkeypatch
+):
+    """A release that can never land must stop, and must say so.
+
+    On origin/main a disabled poller made *zero* fan network calls. Routing it
+    through `release_fans` means a NodeMCU that is unplugged — the natural thing
+    to do after "kill that behavior entirely" — would otherwise make the retired
+    path the only thing in this poller still talking to the network, one GET per
+    fan per minute forever, with `if ok:` swallowing every notification.
+    """
+
+    def broken(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken)
+    notifier = FakeNotifier()
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(hours=1)
+    )
+
+    # A day of 30s polls, well past RELEASE_MAX_ATTEMPTS.
+    attempts = []
+    monkeypatch.setattr(fans, "actuate", _counting(fans.actuate, attempts))
+    for poll in range(2880):
+        check_fans(conn, notifier, cfg, NOW + timedelta(seconds=30 * poll))
+
+    assert len(attempts) == fans.RELEASE_MAX_ATTEMPTS
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"  # never lies
+    assert len(notifier.sent) == 1
+    _, message, priority = notifier.sent[0]
+    assert priority == "high"
+    assert "switch it off at the wall" in message
+
+
+def test_release_attempt_budget_resets_when_the_nodemcu_comes_back(conn, monkeypatch):
+    # Four failures then a success must not leave the fan one failure away from
+    # being abandoned the next time mitigation is disabled mid-outage.
+    def broken(url, timeout):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken)
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(hours=1)
+    )
+    for poll in range(fans.RELEASE_MAX_ATTEMPTS - 1):
+        check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(seconds=90 * poll))
+    assert fans._release_attempts[1] == fans.RELEASE_MAX_ATTEMPTS - 1
+
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(hours=1))
+    assert calls
+    assert 1 not in fans._release_attempts
 
 
 def test_release_keeps_db_truth_and_retries_when_the_nodemcu_is_down(conn, monkeypatch):
@@ -599,9 +687,9 @@ def test_stale_score_does_not_engage_fans(conn, monkeypatch):
 
 
 def test_config_from_env_defaults_off(monkeypatch):
-    # Retirement is lifted for the two parse tests below. With it in force they
-    # would pass for free — every input maps to enabled=False — and would stop
-    # saying anything about the parse they exist to pin.
+    # Each parse test lifts the retirement for itself (monkeypatch is
+    # function-scoped). With it in force these would pass for free — every input
+    # maps to enabled=False — and would stop saying anything about the parse.
     monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     monkeypatch.delenv("AWAIR_FAN_MITIGATION_ENABLED", raising=False)
     monkeypatch.delenv("AWAIR_FAN_HOST", raising=False)

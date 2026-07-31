@@ -208,6 +208,27 @@ def test_handle_device_health_recovered_without_prior_event_still_notifies(conn)
     assert notifier.calls[-1]["title"] == "Awair device recovered"
 
 
+def test_startup_banner_says_retired_not_merely_off(monkeypatch):
+    """`retired` is a third state and the banner has to carry it (#61).
+
+    Once homelab's `awair_fan_mitigation_enabled` is also false, the warning in
+    `config_from_env` never fires again — so this line becomes the only thing
+    in the logs distinguishing the retirement from someone having simply left
+    fan mitigation switched off.
+    """
+    from awair import fans
+
+    off = fans.FansConfig(enabled=False, fan_host="h", fan_ids=(1,))
+    on = fans.FansConfig(enabled=True, fan_host="h", fan_ids=(1,))
+
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
+    assert poller._fan_mitigation_status(off) == "retired (#61)"
+
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
+    assert poller._fan_mitigation_status(off) == "off"
+    assert poller._fan_mitigation_status(on) == "on"
+
+
 def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
     """Drive the main() poll loop through exactly one iteration."""
     monkeypatch.setenv("AWAIR_DB", str(tmp_path / "poller.db"))
