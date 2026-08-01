@@ -7,14 +7,33 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.6
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
   - repo: local
     hooks:
+      # ruff comes from THIS project's uv.lock, not from a pinned
+      # ruff-pre-commit rev (#56). Two pins for one tool is two versions: the
+      # rev said v0.15.6 while uv.lock said 0.16.0, and asking each binary
+      # directly confirmed pre-commit really was running 0.15.6 -- the exact
+      # local-green / CI-red split #54 cost four blocked PRs to diagnose.
+      #
+      # `--frozen` installs exactly what the lock pins and never re-resolves,
+      # so a commit cannot silently rewrite uv.lock. (CI uses `uv lock --check`
+      # + `uv sync --frozen`, which is the same guarantee from the other end.)
+      #
+      # The trade, taken deliberately: this gives up pre-commit's isolated hook
+      # environment and needs `uv` on PATH. The radon hook below is already
+      # `language: system`, so that is not a new requirement here.
+      - id: ruff
+        name: ruff check
+        language: system
+        entry: uv run --frozen ruff check --fix
+        types_or: [python, pyi, jupyter]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        language: system
+        entry: uv run --frozen ruff format
+        types_or: [python, pyi, jupyter]
+        require_serial: true
       - id: radon-complexity
         name: Radon complexity gate (no block at grade C or worse)
         language: system
