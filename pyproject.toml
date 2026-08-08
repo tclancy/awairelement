@@ -15,7 +15,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pyyaml>=6.0.3",
     "radon>=6.0.1",
-    "ruff>=0.15.22",
+    "ruff>=0.16.1",
 ]
 
 [tool.ruff.lint]
