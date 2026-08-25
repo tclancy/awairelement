@@ -358,3 +358,11 @@ def test_latest_pm25_returns_none_when_only_stale_readings(conn):
     )
     conn.commit()
     assert db.latest_pm25(conn, since=NOW - timedelta(minutes=5)) is None
+
+
+def test_readings_since_rejects_an_unknown_column(conn):
+    """The guard `latest_reading`'s own test cites as its precedent, which
+    until #70 had no test of its own — both build their SQL by interpolating
+    the caller's column list, so both are injection points."""
+    with pytest.raises(ValueError, match="unknown columns"):
+        db.readings_since(conn, ("score; DROP TABLE readings",), NOW)

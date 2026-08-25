@@ -594,3 +594,55 @@ def test_latest_excludes_derived_and_raw_sensor_columns(client):
     reading = client.get("/api/latest").get_json()["reading"]
     for internal in ("abs_humid", "dew_point", "co2_est", "voc_h2_raw", "pm10_est"):
         assert internal not in reading
+
+
+def test_latest_reads_a_stored_timestamp_without_an_offset_as_utc(make_raw_client):
+    """`_iso_utc` promises this in prose; nothing held it to the promise.
+
+    Every writer in this app stamps UTC with an offset, so the naive branch is
+    unreachable today — but it is the branch that runs if a row is ever
+    restored, migrated, or hand-inserted, and getting it wrong is silent. A
+    naive value handed to `astimezone` is read as *local* time, so on this
+    machine a reading that arrived at noon UTC would publish as 16:00Z and the
+    consumer would measure a four-hour-old poll as fresh — or as negative.
+    """
+    arrived = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn,
+            ts=iso_z(arrived),
+            received_at=arrived.replace(tzinfo=None).isoformat(),
+            score=88,
+            temp=22.5,
+        )
+
+    reading = make_raw_client("naive", seed).get("/api/latest").get_json()["reading"]
+    assert reading["received_at"] == "2026-08-25T12:00:00Z"
+
+
+def test_latest_publishes_open_events_oldest_first(make_raw_client):
+    """`db.get_open_events` has no ORDER BY, so its rows arrive in insertion
+    order — which is the order events happened to be *written*, not the order
+    they opened. Seeded here so the two disagree: a consumer rendering the list
+    should not have the longest-standing problem show up second."""
+    now = datetime.now(UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn, ts=iso_z(now), received_at=now.isoformat(), score=88, temp=22.5
+        )
+        for metric, minutes in (("co2", 10), ("temp", 30)):
+            db.open_event(
+                conn,
+                metric=metric,
+                tier="ceiling",
+                opened_at=now - timedelta(minutes=minutes),
+                value=1400.0,
+                baseline=500.0,
+                threshold=1200.0,
+                notified=True,
+            )
+
+    payload = make_raw_client("order", seed).get("/api/latest").get_json()
+    assert [event["metric"] for event in payload["open_events"]] == ["temp", "co2"]
