@@ -28,6 +28,15 @@ _TEMP_EVENT_FIELDS = ("peak_value", "baseline", "threshold")
 # and a consumer that starts depending on them makes them a contract.
 LATEST_METRICS = ("score", "temp", "humid", "co2", "voc", "pm25")
 
+# `metric` values on an alert_event that are not measurements, and so are not
+# part of the `/api/latest` contract. `poller.handle_device_health` opens one
+# with `metric="device"` and `tier` in ("unreachable", "stale") whose
+# peak_value/baseline/threshold are all None — a transport fact wearing a
+# measurement's shape. Excluded deliberately (#70): the hub already learns the
+# same thing, earlier and more reliably, from `received_at` going stale, since
+# an unreachable device writes no readings at all. See README.
+_NON_MEASUREMENT_METRICS = frozenset({"device"})
+
 # The open-event fields `/api/latest` publishes, in the order #70 lists them.
 # Also a whitelist rather than a passthrough — `db.get_open_events` carries
 # `id`, `fans_engaged`, `notified_value` and `renotified_at`, which are this
@@ -45,22 +54,41 @@ _OPEN_EVENT_FIELDS = (
 def _iso_utc(value):
     """Normalise a stored timestamp to one ISO-8601 UTC spelling, or None.
 
-    The two timestamps on a reading are written by different code in different
-    formats — `ts` is the device's own string via `db.iso_z` (`...Z`), while
-    `received_at` is `datetime.now(UTC).isoformat()` (`...+00:00`). Both parse,
-    but publishing them as stored would hand a consumer two formats for two
-    fields whose whole purpose is to be compared against each other.
+    Accepts either spelling this app stores *and* an already-parsed datetime,
+    because the three fields `/api/latest` publishes arrive in three shapes:
+    `ts` is the device's own string via `db.iso_z` (`...Z`), `received_at` is
+    `datetime.now(UTC).isoformat()` (`...+00:00`), and `opened_at` has already
+    been through `datetime.fromisoformat` inside `db.get_open_events`.
+    Publishing them as stored would hand a consumer three formats for fields
+    whose whole purpose is to be compared against each other.
 
-    A stored value with no offset is read as UTC rather than rejected: every
-    writer in this app is UTC, and refusing here would take the endpoint down
-    over a row it can still describe correctly.
+    A value with no offset is read as UTC rather than rejected: every writer in
+    this app is UTC, and refusing here would take the endpoint down over a row
+    it can still describe correctly. Note the failure this prevents is silent
+    rather than loud — a naive value handed straight to `astimezone` is read as
+    *local* time, so a poll that landed at noon UTC would publish as 16:00Z and
+    a consumer's staleness clock would run four hours fast.
     """
     if value is None:
         return None
-    parsed = datetime.fromisoformat(value)
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _public_event(event):
+    """One open event as `/api/latest` publishes it.
+
+    A whitelist rather than a passthrough, and named rather than inlined so the
+    contract with the hub has one place to be read and one place to be tested.
+    `db.get_open_events` carries `id`, `fans_engaged`, `notified_value` and
+    `renotified_at` as well — this app's own notification bookkeeping, which
+    means nothing to a consumer and which publishing would make a contract.
+    """
+    return {field: event[field] for field in _OPEN_EVENT_FIELDS} | {
+        "opened_at": _iso_utc(event["opened_at"])
+    }
 
 
 # "today" == since local midnight, not the last 24h — it's the single-day
@@ -225,11 +253,20 @@ def create_app(db_path=None):
             # parsing units wants the identifier, not the glyph.
             "temp_unit": "C",
             "reading": None,
-            "open_events": [
-                {field: event[field] for field in _OPEN_EVENT_FIELDS}
-                | {"opened_at": _iso_utc(event["opened_at"].isoformat())}
-                for event in sorted(open_events.values(), key=lambda e: e["opened_at"])
-            ],
+            # Sorted on the *normalised* stamp rather than the parsed
+            # datetime: `db.get_open_events` has no ORDER BY, so without a sort
+            # the list arrives in the order rows happened to be written — and
+            # sorting the datetimes directly would raise on a naive/aware mix
+            # and 500 the endpoint, ahead of the branch in `_iso_utc` that
+            # exists to survive exactly that row.
+            "open_events": sorted(
+                (
+                    _public_event(event)
+                    for metric, event in open_events.items()
+                    if metric not in _NON_MEASUREMENT_METRICS
+                ),
+                key=lambda event: event["opened_at"],
+            ),
         }
         if reading is not None:
             payload["reading"] = {

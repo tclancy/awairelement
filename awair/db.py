@@ -331,6 +331,11 @@ def latest_reading(conn, columns) -> dict | None:
     module. That is the device's clock, so a device whose clock runs fast pins
     itself at the top until real time catches up — which is exactly why the
     caller is given `received_at` as well and told to run staleness off it.
+    The ordering is also *lexicographic*, since `ts` is stored as text: it
+    equals chronological order only because every value is the Awair local
+    API's fixed-width UTC `...Z` spelling, which `iso_z` exists to match. A row
+    stored with a numeric offset would sort into the wrong place here and in
+    `readings_since`, `metric_history`, `latest_score` and `latest_pm25` alike.
     """
     unknown = set(columns) - set(READING_COLUMNS)
     if unknown:

@@ -28,8 +28,12 @@ def _seed_db(db_path):
     now = datetime.now(UTC)
     rows = []
     for i in range(120):  # one hour of 30s readings, newest last
-        ts = iso_z(now - timedelta(seconds=30 * (119 - i)))
-        rows.append((ts, ts, 500 + i, 200, 5.0, 22.5, 45.0, 88))
+        at = now - timedelta(seconds=30 * (119 - i))
+        # Two spellings on purpose, because production writes two: `ts` is the
+        # device's `...Z` string, `received_at` is `datetime.now(UTC)` with a
+        # numeric offset (`awair/poller.py`). A fixture that wrote both as `Z`
+        # made every "normalised to Z" assertion vacuous.
+        rows.append((iso_z(at), at.isoformat(), 500 + i, 200, 5.0, 22.5, 45.0, 88))
     conn.executemany(
         "INSERT INTO readings (ts, received_at, co2, voc, pm25, temp, humid, score)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -450,7 +454,19 @@ def _insert_reading(conn, *, ts, received_at, **values):
 def test_latest_returns_the_newest_reading_with_both_clocks(client):
     payload = client.get("/api/latest").get_json()
     reading = payload["reading"]
-    assert set(reading) == {"ts", "received_at", *web.LATEST_METRICS}
+    # A literal set, not `{*web.LATEST_METRICS}`: this is a contract with
+    # another repo, so widening the constant must fail here rather than pass by
+    # reading the same constant back.
+    assert set(reading) == {
+        "ts",
+        "received_at",
+        "score",
+        "temp",
+        "humid",
+        "co2",
+        "voc",
+        "pm25",
+    }
     # _seed_db writes co2 as 500 + i over 120 rows, newest last.
     assert reading["co2"] == 619
     assert reading["ts"].endswith("Z")
@@ -537,7 +553,18 @@ def test_latest_publishes_only_the_agreed_open_event_fields(client):
     payload = client.get("/api/latest").get_json()
     assert payload["open_events"]
     for event in payload["open_events"]:
-        assert set(event) == set(web._OPEN_EVENT_FIELDS)
+        # Literal, for the same reason as the reading whitelist above: asserting
+        # against `web._OPEN_EVENT_FIELDS` would let someone append
+        # "notified_value" to the constant and stay green, which is the exact
+        # regression this test names in its docstring.
+        assert set(event) == {
+            "metric",
+            "tier",
+            "opened_at",
+            "peak_value",
+            "baseline",
+            "threshold",
+        }
 
 
 def test_latest_omits_closed_events(client):
@@ -646,3 +673,87 @@ def test_latest_publishes_open_events_oldest_first(make_raw_client):
 
     payload = make_raw_client("order", seed).get("/api/latest").get_json()
     assert [event["metric"] for event in payload["open_events"]] == ["temp", "co2"]
+
+
+def test_latest_omits_device_health_events(make_raw_client):
+    """`poller.handle_device_health` opens an alert_event with `metric="device"`
+    and no peak_value, baseline or threshold — a transport fact wearing a
+    measurement's shape. Publishing it would widen `tier`'s vocabulary beyond
+    the two values in `spikes.py` and make three numeric fields nullable for
+    the one consumer this contract exists for.
+
+    The information is not lost: an unreachable device writes no readings, so
+    `received_at` stops advancing and the hub's own staleness clock fires —
+    earlier than this event, and without needing awairelement to have noticed.
+    """
+    now = datetime.now(UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn, ts=iso_z(now), received_at=now.isoformat(), score=88, temp=22.5
+        )
+        db.open_event(
+            conn,
+            metric="co2",
+            tier="ceiling",
+            opened_at=now - timedelta(minutes=30),
+            value=1400.0,
+            baseline=500.0,
+            threshold=1200.0,
+            notified=True,
+        )
+        db.open_event(
+            conn,
+            metric="device",
+            tier="unreachable",
+            opened_at=now - timedelta(minutes=5),
+            value=None,
+            baseline=None,
+            threshold=None,
+            notified=True,
+        )
+
+    payload = make_raw_client("device", seed).get("/api/latest").get_json()
+    assert [event["metric"] for event in payload["open_events"]] == ["co2"]
+
+
+def test_latest_survives_an_open_event_stamped_without_an_offset(make_raw_client):
+    """The naive/aware mix that used to 500 before the sort was normalised.
+
+    `db.get_open_events` parses `opened_at` with `datetime.fromisoformat`, so a
+    row stored without an offset comes back naive. Sorting parsed datetimes
+    raises `TypeError: can't compare offset-naive and offset-aware datetimes`
+    — ahead of the branch in `_iso_utc` written to survive exactly that row, so
+    the tolerance was defending the wrong end. Sorting the normalised strings
+    puts the guard in front of the comparison.
+    """
+    now = datetime.now(UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn, ts=iso_z(now), received_at=now.isoformat(), score=88, temp=22.5
+        )
+        db.open_event(
+            conn,
+            metric="co2",
+            tier="ceiling",
+            opened_at=now - timedelta(minutes=30),
+            value=1400.0,
+            baseline=500.0,
+            threshold=1200.0,
+            notified=True,
+        )
+        # Hand-written the way a restore or a migration would leave it.
+        conn.execute(
+            "INSERT INTO alert_events (metric, tier, opened_at, peak_value,"
+            " baseline, threshold, open_notified, notified_value)"
+            " VALUES ('pm25', 'ceiling', ?, 40.0, 5.0, 35.0, 1, 40.0)",
+            ((now - timedelta(minutes=45)).replace(tzinfo=None).isoformat(),),
+        )
+        conn.commit()
+
+    response = make_raw_client("naive-event", seed).get("/api/latest")
+    assert response.status_code == 200
+    events = response.get_json()["open_events"]
+    assert [event["metric"] for event in events] == ["pm25", "co2"]
+    assert all(event["opened_at"].endswith("Z") for event in events)
