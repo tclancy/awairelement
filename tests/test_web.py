@@ -405,3 +405,192 @@ def test_invalid_temperature_unit_fails_at_startup(monkeypatch, tmp_path):
     monkeypatch.setenv("TEMPERATURE_UNIT", "R")
     with pytest.raises(ValueError, match="TEMPERATURE_UNIT"):
         create_app(db_path=str(tmp_path / "unused.db"))
+
+
+# --- /api/latest (#70) ------------------------------------------------------
+#
+# The house hub polls this every ~5 minutes and stores nothing. Three of the
+# tests below guard traps the ticket named explicitly, and each one guards a
+# failure that is silent in production: a temperature off by 30 with nothing in
+# the payload to say so, a staleness clock that can never fire, and this app's
+# notification bookkeeping becoming someone else's contract.
+
+
+@pytest.fixture
+def make_raw_client(tmp_path):
+    """Factory: a client over a DB containing exactly what `seed` writes.
+
+    The shared `client` fixture seeds an hour of readings, which is the wrong
+    shape for the empty-table and clock-divergence cases below.
+    """
+
+    def _make(name, seed=None):
+        db_path = tmp_path / f"raw-{name}.db"
+        conn = db.connect(db_path)
+        if seed is not None:
+            seed(conn)
+        conn.close()
+        app = create_app(db_path=str(db_path))
+        app.testing = True
+        return app.test_client()
+
+    return _make
+
+
+def _insert_reading(conn, *, ts, received_at, **values):
+    columns = ("ts", "received_at", *values)
+    conn.execute(
+        f"INSERT INTO readings ({', '.join(columns)})"
+        f" VALUES ({', '.join('?' * len(columns))})",
+        (ts, received_at, *values.values()),
+    )
+    conn.commit()
+
+
+def test_latest_returns_the_newest_reading_with_both_clocks(client):
+    payload = client.get("/api/latest").get_json()
+    reading = payload["reading"]
+    assert set(reading) == {"ts", "received_at", *web.LATEST_METRICS}
+    # _seed_db writes co2 as 500 + i over 120 rows, newest last.
+    assert reading["co2"] == 619
+    assert reading["ts"].endswith("Z")
+    assert reading["received_at"].endswith("Z")
+
+
+def test_latest_is_always_celsius_whatever_the_display_unit_says(make_client):
+    """The trap #70 names first, and the one with no visible symptom.
+
+    `_seed_db` writes temp as exactly 22.5 C. Every sibling endpoint would hand
+    back 72.5 under `TEMPERATURE_UNIT=F`. This one must not: the consumer
+    formats for itself, so inheriting the setting is a silent add-30 the day
+    the config flips — the payload would still look entirely well-formed.
+    """
+    payload = make_client("F").get("/api/latest").get_json()
+    assert payload["reading"]["temp"] == 22.5
+    assert payload["temp_unit"] == "C"
+
+
+def test_latest_does_not_convert_temp_event_values_either(make_client):
+    """The same trap one layer down.
+
+    `/api/events` converts `peak_value`/`baseline`/`threshold` for a temp event
+    (30/22/28 C → 86/71.6/82.4 F). Those fields carry the metric's own unit, so
+    an endpoint that forgot them would be Celsius in one half of its payload
+    and Fahrenheit in the other — worse than being wrong consistently.
+    """
+    payload = make_client("F").get("/api/latest").get_json()
+    temp_event = next(e for e in payload["open_events"] if e["metric"] == "temp")
+    assert temp_event["peak_value"] == 30.0
+    assert temp_event["baseline"] == 22.0
+    assert temp_event["threshold"] == 28.0
+
+
+def test_latest_reports_the_two_clocks_separately_when_they_disagree(make_raw_client):
+    """The trap that makes the staleness clock work at all.
+
+    A device clock running fast is the case: `ts` is four hours in the future
+    while `received_at` says the last poll landed four hours ago. If the
+    consumer had only `ts`, `now - ts` would be *negative* — the card could
+    never go stale and a dead poller would render healthy indefinitely. Both
+    values must survive the boundary as distinct numbers.
+    """
+    now = datetime.now(UTC)
+    fast_device = now + timedelta(hours=4)
+    stale_arrival = now - timedelta(hours=4)
+
+    def seed(conn):
+        _insert_reading(
+            conn,
+            ts=iso_z(fast_device),
+            received_at=stale_arrival.isoformat(),
+            score=88,
+            temp=22.5,
+        )
+
+    payload = make_raw_client("skew", seed).get("/api/latest").get_json()
+    reading = payload["reading"]
+    assert reading["ts"] != reading["received_at"]
+    assert datetime.fromisoformat(reading["ts"]) > now
+    assert datetime.fromisoformat(reading["received_at"]) < now
+
+
+def test_latest_normalises_both_clocks_to_one_iso_spelling(make_raw_client):
+    """`ts` is stored as `...Z` and `received_at` as `...+00:00` — two formats
+    for two fields whose entire purpose is to be compared to each other."""
+    now = datetime.now(UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn, ts=iso_z(now), received_at=now.isoformat(), score=88, temp=22.5
+        )
+
+    reading = make_raw_client("iso", seed).get("/api/latest").get_json()["reading"]
+    assert reading["ts"].endswith("Z")
+    assert reading["received_at"].endswith("Z")
+    assert "+00:00" not in reading["received_at"]
+
+
+def test_latest_publishes_only_the_agreed_open_event_fields(client):
+    """`db.get_open_events` carries `id`, `fans_engaged`, `notified_value` and
+    `renotified_at` — this app's own notification bookkeeping. Publishing them
+    would make them a contract with a consumer that has no use for them."""
+    payload = client.get("/api/latest").get_json()
+    assert payload["open_events"]
+    for event in payload["open_events"]:
+        assert set(event) == set(web._OPEN_EVENT_FIELDS)
+
+
+def test_latest_omits_closed_events(client):
+    """_seed_db closes an ancient VOC event; only co2 and temp are open."""
+    payload = client.get("/api/latest").get_json()
+    assert {e["metric"] for e in payload["open_events"]} == {"co2", "temp"}
+
+
+def test_latest_publishes_open_event_times_in_the_same_iso_spelling(client):
+    payload = client.get("/api/latest").get_json()
+    for event in payload["open_events"]:
+        assert event["opened_at"].endswith("Z")
+        assert datetime.fromisoformat(event["opened_at"]).tzinfo is not None
+
+
+def test_latest_on_an_empty_table_is_a_200_with_a_null_reading(make_raw_client):
+    """Not a 5xx. The consumer tells "answered, but the poller is dead" from
+    "unreachable", and those are different colours on its card — an error
+    status collapses the first into the second."""
+    response = make_raw_client("empty").get("/api/latest")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["reading"] is None
+    assert payload["open_events"] == []
+    assert payload["temp_unit"] == "C"
+
+
+def test_latest_hands_back_an_ancient_reading_rather_than_null(make_raw_client):
+    """`latest_reading` is deliberately unbounded, unlike `latest_score`.
+
+    A bounded query would return None for a reading a week old, which is the
+    same answer as an empty table — and telling those apart is the whole reason
+    the consumer is given `received_at`. Staleness is its judgement, not ours.
+    """
+    ancient = datetime.now(UTC) - timedelta(days=7)
+
+    def seed(conn):
+        _insert_reading(
+            conn,
+            ts=iso_z(ancient),
+            received_at=ancient.isoformat(),
+            score=88,
+            temp=22.5,
+        )
+
+    reading = make_raw_client("ancient", seed).get("/api/latest").get_json()["reading"]
+    assert reading is not None
+    assert reading["score"] == 88
+
+
+def test_latest_excludes_derived_and_raw_sensor_columns(client):
+    """`LATEST_METRICS` is a whitelist, not `READING_COLUMNS`. `abs_humid`,
+    `dew_point`, `co2_est*`, `voc_*_raw` and `pm10_est` are internal."""
+    reading = client.get("/api/latest").get_json()["reading"]
+    for internal in ("abs_humid", "dew_point", "co2_est", "voc_h2_raw", "pm10_est"):
+        assert internal not in reading

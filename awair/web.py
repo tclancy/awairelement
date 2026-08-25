@@ -22,6 +22,47 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # metric itself — converted for temp events at the API boundary.
 _TEMP_EVENT_FIELDS = ("peak_value", "baseline", "threshold")
 
+# The reading columns `/api/latest` publishes. Deliberately a short, explicit
+# list rather than READING_COLUMNS: the derived and raw-sensor columns
+# (`abs_humid`, `dew_point`, `co2_est*`, `voc_*_raw`, `pm10_est`) are internal,
+# and a consumer that starts depending on them makes them a contract.
+LATEST_METRICS = ("score", "temp", "humid", "co2", "voc", "pm25")
+
+# The open-event fields `/api/latest` publishes, in the order #70 lists them.
+# Also a whitelist rather than a passthrough — `db.get_open_events` carries
+# `id`, `fans_engaged`, `notified_value` and `renotified_at`, which are this
+# app's own notification bookkeeping and mean nothing to a consumer.
+_OPEN_EVENT_FIELDS = (
+    "metric",
+    "tier",
+    "opened_at",
+    "peak_value",
+    "baseline",
+    "threshold",
+)
+
+
+def _iso_utc(value):
+    """Normalise a stored timestamp to one ISO-8601 UTC spelling, or None.
+
+    The two timestamps on a reading are written by different code in different
+    formats — `ts` is the device's own string via `db.iso_z` (`...Z`), while
+    `received_at` is `datetime.now(UTC).isoformat()` (`...+00:00`). Both parse,
+    but publishing them as stored would hand a consumer two formats for two
+    fields whose whole purpose is to be compared against each other.
+
+    A stored value with no offset is read as UTC rather than rejected: every
+    writer in this app is UTC, and refusing here would take the endpoint down
+    over a row it can still describe correctly.
+    """
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 # "today" == since local midnight, not the last 24h — it's the single-day
 # detail view (#46). Bucket is 60 s (indoor poll cadence is 30 s → 2 samples
 # per bucket) so the finer granularity actually shows up.
@@ -154,6 +195,55 @@ def create_app(db_path=None):
                         if field in event:
                             event[field] = units.from_celsius(event[field], unit)
         return jsonify({"events": rows, "temp_unit_symbol": units.symbol(unit)})
+
+    @app.get("/api/latest")
+    def latest():
+        """Latest indoor reading + open events, for the house hub (#70).
+
+        **Always Celsius, whatever `TEMPERATURE_UNIT` says.** Every sibling
+        endpoint converts here because it feeds a browser a human reads; this
+        one feeds a machine that formats for itself. Inheriting the setting
+        would hand that machine a silent 30-degree error the day the config
+        flips, with nothing in the payload to reveal it — so the unit is a
+        literal below, not a lookup, and it is named in the response.
+
+        **An empty table is a 200 with a null reading, not an error.** The
+        consumer distinguishes "awairelement answered, its poller is dead" from
+        "awairelement is unreachable", and those are different colours on its
+        card. A 5xx here would collapse the first case into the second.
+        """
+        conn = connect()
+        try:
+            reading = db.latest_reading(conn, ("ts", "received_at", *LATEST_METRICS))
+            open_events = db.get_open_events(conn)
+        finally:
+            conn.close()
+
+        payload = {
+            # Celsius always — see the docstring. Not `temp_unit_symbol`: the
+            # siblings publish "°C" for a template to print, and a consumer
+            # parsing units wants the identifier, not the glyph.
+            "temp_unit": "C",
+            "reading": None,
+            "open_events": [
+                {field: event[field] for field in _OPEN_EVENT_FIELDS}
+                | {"opened_at": _iso_utc(event["opened_at"].isoformat())}
+                for event in sorted(open_events.values(), key=lambda e: e["opened_at"])
+            ],
+        }
+        if reading is not None:
+            payload["reading"] = {
+                # Both clocks, deliberately. `received_at` is this machine's,
+                # and is the one a consumer runs staleness off; `ts` is the
+                # Element's, and is what a human reads as "as of". Sending only
+                # `ts` would make age a subtraction across two machines, so a
+                # device clock running fast would render a dead poller green
+                # forever instead of stale.
+                "ts": _iso_utc(reading["ts"]),
+                "received_at": _iso_utc(reading["received_at"]),
+                **{name: reading[name] for name in LATEST_METRICS},
+            }
+        return jsonify(payload)
 
     @app.get("/api/outdoor-series")
     def outdoor_series():

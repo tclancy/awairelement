@@ -95,6 +95,19 @@ ingestion, so a wrong URL or 401 just gets logged.)
 - **Dashboard** — small multiples for CO2, TVOC, PM2.5, temp, humidity, and
   score over 7d or 30d. Detected events overlay as shaded spans. LAN-only by
   default (no auth).
+- **`GET /api/latest`** — the newest reading plus every open event, as
+  read-only JSON, for the house hub to poll (#70). awairelement stays the
+  system of record; the hub stores nothing and derives its own card colour
+  from `score`. Two things about this endpoint differ from its siblings on
+  purpose, because it feeds a machine rather than a browser: it is **always
+  Celsius whatever `TEMPERATURE_UNIT` says** (and says so, via `temp_unit`),
+  and it publishes **both** timestamps — `ts` is the Element's clock, for a
+  human to read as "as of", while `received_at` is this machine's and is the
+  one a consumer should measure staleness against. Measuring age off `ts`
+  alone is a subtraction across two clocks: a device running fast yields a
+  negative age, so a dead poller would render healthy forever. An empty
+  `readings` table answers 200 with `"reading": null`, not an error, so a
+  consumer can tell "up, but the poller is dead" from "unreachable".
 
 ## Running as a systemd user service
 

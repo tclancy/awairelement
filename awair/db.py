@@ -314,6 +314,33 @@ def escalate_event(conn, event_id, at, value, tier) -> None:
     conn.commit()
 
 
+def latest_reading(conn, columns) -> dict | None:
+    """Most recent reading for `columns`, or None when the table is empty.
+
+    **Deliberately unbounded, unlike `latest_pm25` / `latest_score`.** Those two
+    take a `since` because they gate spending fans, where a stale value must not
+    be allowed to authorize or veto a turn-on — returning None is the safe
+    answer there. This one feeds a read-only consumer that does its own
+    staleness arithmetic (#70), and bounding it would destroy the distinction
+    that consumer exists to draw: an old reading and no reading would both
+    arrive as null, so "the poller died four hours ago" would be
+    indistinguishable from "this house has never had a sensor". Hand back what
+    is there, stamped with when it arrived, and let the caller judge it.
+
+    Ordered by `ts` to match `idx_readings_ts` and every other query in this
+    module. That is the device's clock, so a device whose clock runs fast pins
+    itself at the top until real time catches up — which is exactly why the
+    caller is given `received_at` as well and told to run staleness off it.
+    """
+    unknown = set(columns) - set(READING_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown columns {unknown}")
+    row = conn.execute(
+        f"SELECT {', '.join(columns)} FROM readings ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return dict(zip(columns, row, strict=True)) if row else None
+
+
 def latest_pm25(conn, since) -> float | None:
     """Most recent pm25 reading at or after `since`, or None.
 
