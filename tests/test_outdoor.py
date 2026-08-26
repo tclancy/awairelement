@@ -27,6 +27,12 @@ WEATHER = {
         "wind_speed_10m": 3.2,
         "pressure_msl": 1013.2,
         "precipitation": 0.0,
+        # Requested by WEATHER_FIELDS since #71, so every real response carries
+        # it. Kept on the shared fixture rather than only on the ad-hoc payload
+        # in the #71 block below: a fixture that omits a field production
+        # always sends is a shape production never produces, and the poll_once
+        # / main end-to-end tests drive off this one.
+        "weather_code": 3,
     }
 }
 WEATHER_TEXT = json.dumps(WEATHER)
@@ -272,9 +278,16 @@ def test_weather_code_is_requested_from_the_source():
 
 
 def test_parse_reading_stores_the_weather_code():
-    payload = {"current": dict(WEATHER["current"], weather_code=3)}
-    reading = parse_reading(payload, AIR_QUALITY, RECEIVED)
-    assert reading["weather_code"] == 3
+    """Off the shared fixture, which now carries the field production sends."""
+    assert parse_reading(WEATHER, AIR_QUALITY, RECEIVED)["weather_code"] == 3
+
+
+def test_a_response_without_a_weather_code_degrades_to_null():
+    """Upstream schema drift is a warning, not an outage -- the module rule."""
+    current = {k: v for k, v in WEATHER["current"].items() if k != "weather_code"}
+    reading = parse_reading({"current": current}, AIR_QUALITY, RECEIVED)
+    assert reading["weather_code"] is None
+    assert reading["temp"] == 22.4
 
 
 def test_parse_reading_stores_the_air_qualitys_own_timestamp():

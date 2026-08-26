@@ -978,3 +978,44 @@ def test_outdoor_latest_hands_back_an_ancient_reading_rather_than_null(
     )
     assert payload["reading"]["temp"] == 1.0
     assert payload["reading"]["ts"] == "2020-01-01T00:00:00Z"
+
+
+def test_outdoor_latest_survives_a_row_stamped_without_an_offset(make_raw_client):
+    """The legacy shape: `ts` written before `_normalize_source_time` existed.
+
+    Sibling of `/api/latest`'s naive-`opened_at` test. `_iso_utc` reads a naive
+    value as UTC rather than rejecting it, which is what keeps a pre-#71
+    homelab row serving instead of 500ing -- and reading it as *local* instead
+    would publish 04:30 as 08:30Z and run the hub's staleness clock four hours
+    fast.
+    """
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts="2026-07-12T04:30",  # bare, minute-precision, naive
+            received_at="2026-07-12T04:30:15+00:00",
+            temp=22.4,
+        )
+
+    response = make_raw_client("outdoor-naive", seed).get("/api/outdoor-latest")
+    assert response.status_code == 200
+    reading = response.get_json()["reading"]
+    assert reading["ts"] == "2026-07-12T04:30:00Z"
+    assert reading["aq_ts"] is None
+    assert reading["temp"] == 22.4
+
+
+def test_outdoor_latest_names_every_unit_the_hub_converts(outdoor_client):
+    """#71's card renders "62F, 8 mph, 0.00 in" -- three conversions, plus the
+    hPa/inHg split this app itself has. Each is a silent multiply on a number
+    the card exists to show, so each is labelled at the boundary.
+    """
+    payload = outdoor_client.get("/api/outdoor-latest").get_json()
+    assert payload["temp_unit"] == "C"
+    assert payload["pressure_unit"] == "hPa"
+    assert payload["wind_speed_unit"] == "km/h"
+    assert payload["precipitation_unit"] == "mm"
+    # Source values, unconverted -- the labels have to be true.
+    assert payload["reading"]["wind_speed"] == 3.2
+    assert payload["reading"]["precipitation"] == 0.4

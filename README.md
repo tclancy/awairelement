@@ -133,15 +133,20 @@ ingestion, so a wrong URL or 401 just gets logged.)
   read that as *"no current AQI"* (yellow) rather than folding an undateable
   number into a green.
 
-  Two units are named in the payload, `temp_unit` and `pressure_unit`, and
-  only two. Those are the two values this app converts somewhere else:
-  `temp_unit()` turns temp into F for every browser-facing endpoint, and
-  `/api/outdoor-series` divides pressure by `_HPA_PER_INHG` to hand the
-  dashboard inHg. A consumer reading raw hPa here and inHg there, with neither
-  labelled, would have no way to notice. Everything else has exactly one
-  spelling in this codebase — Open-Meteo's native km/h (`wind_speed`), mm
-  (`precipitation`) and µg/m³ (`pm25`, `pm10`) — so labelling them would be
-  documentation rather than disambiguation.
+  Four units are named in the payload — `temp_unit`, `pressure_unit`,
+  `wind_speed_unit`, `precipitation_unit` — and they are the four somebody
+  converts. #71's own motivating card reads `62°F, 8 mph, 0.00 in`, so the hub
+  turns Celsius into F, km/h into mph and mm into inches; and this app
+  separately turns hPa into inHg at the `/api/outdoor-series` boundary and
+  Celsius into F at every browser-facing one. Each of those is a silent
+  multiply on a number the card exists to display, and an unlabelled payload
+  gives a consumer no way to notice it guessed wrong.
+
+  The particulate and gas fields are deliberately **not** labelled. They have
+  one spelling everywhere (Open-Meteo's native µg/m³), `us_aqi` is a
+  dimensionless index and `humid` a percent, and nothing on either side of this
+  contract converts them — so naming them would be documentation rather than
+  disambiguation, and this paragraph is that documentation.
 
   `weather_code` is the WMO interpretation code as the **integer** the source
   published. The code→word mapping is the hub's, for the same reason

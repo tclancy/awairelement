@@ -29,11 +29,13 @@ _TEMP_EVENT_FIELDS = ("peak_value", "baseline", "threshold")
 LATEST_METRICS = ("score", "temp", "humid", "co2", "voc", "pm25")
 
 # The outdoor columns `/api/outdoor-latest` publishes, in the order #71 lists
-# them. A whitelist for the same reason `LATEST_METRICS` is one -- but note
-# that here it happens to be every non-`received_at` column in the table, so
-# the list is doing less filtering than its indoor sibling and more
-# *ordering-and-contract* work. A column added to `outdoor_readings` later is
-# private until someone adds it here on purpose.
+# them, excluding the three clocks (`ts`, `received_at`, `aq_ts`) which the
+# handler passes separately because each goes through `_iso_utc`. A whitelist
+# for the same reason `LATEST_METRICS` is one -- but note that here it happens
+# to cover every remaining column in the table, so the list is doing less
+# filtering than its indoor sibling and more *ordering-and-contract* work. A
+# column added to `outdoor_readings` later is private until someone adds it
+# here on purpose.
 OUTDOOR_LATEST_FIELDS = (
     "weather_code",
     "temp",
@@ -311,16 +313,20 @@ def create_app(db_path=None):
         display config says**, and **an empty table is a 200 with a null
         reading, not an error**.
 
-        Two units are named in the payload rather than left implied, and only
-        two, because those are the two this app actually converts somewhere
-        else. `temp_unit()` turns temp into F for every browser-facing
-        endpoint, and `/api/outdoor-series` divides pressure by `_HPA_PER_INHG`
-        to hand the dashboard inHg. A consumer reading raw hPa here and inHg
-        there, with neither labelled, would have no way to notice. The
-        remaining fields have exactly one spelling in this codebase -- they are
-        Open-Meteo's native km/h, mm and µg/m³ everywhere -- so naming them
-        would be documentation, not disambiguation, and the README carries it
-        instead.
+        Four units are named in the payload rather than left implied: the
+        four the consumer is known to convert. #71's own motivating card reads
+        `62°F, 8 mph, 0.00 in`, so the hub turns Celsius into F, km/h into mph
+        and mm into inches -- and this app separately turns hPa into inHg at
+        the `/api/outdoor-series` boundary and Celsius into F at every
+        browser-facing one. Every one of those is a silent multiply on a
+        number the card exists to display, and an unlabelled payload gives a
+        consumer no way to notice it guessed wrong.
+
+        The particulate and gas fields are deliberately unlabelled. They have
+        one spelling everywhere (Open-Meteo's µg/m³), `us_aqi` is a
+        dimensionless index and `humid` a percent, and nothing on either side
+        of this contract converts them -- so naming them would be
+        documentation rather than disambiguation. The README carries that.
 
         `aq_ts` is the field to read carefully. It is the air-quality block's
         own observation time, which is hourly while `ts` is quarter-hourly, so
@@ -344,6 +350,8 @@ def create_app(db_path=None):
             # in this module and must not reach this endpoint.
             "temp_unit": "C",
             "pressure_unit": "hPa",
+            "wind_speed_unit": "km/h",
+            "precipitation_unit": "mm",
             "reading": None,
         }
         if reading is not None:

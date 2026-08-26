@@ -196,14 +196,27 @@ def latest_outdoor_reading(conn, columns) -> dict | None:
     `since` filter collapses them into one null.
 
     Ordered by `ts` DESC, which for this table is Open-Meteo's `current.time`
-    -- the source's publish clock, not ours. That ordering is lexicographic
-    (`ts` is TEXT), and it equals chronological order only because
-    `outdoor.parse_reading` funnels every value through
-    `outdoor._normalize_source_time` into one fixed-width `+00:00` spelling.
-    A row written with a bare `"YYYY-MM-DDTHH:MM"` would sort before every
-    normalised row and pin this query to the wrong end of the table -- which is
-    the same hazard `_normalize_source_time`'s own docstring describes for
-    `outdoor_readings_since`'s range filter.
+    -- the source's publish clock, not ours. That ordering is lexicographic,
+    since `ts` is TEXT.
+
+    **Mixed spellings are not the hazard here.** Rows predating the
+    normalisation in `outdoor._normalize_source_time` hold a bare
+    `"YYYY-MM-DDTHH:MM"`, and those still sort chronologically against
+    normalised rows because the shared `YYYY-MM-DDTHH:MM` date prefix
+    dominates the comparison; a bare value sorts early only against a
+    normalised value denoting the same instant, where either answer is right.
+    (`outdoor_readings_since`'s *range filter* is a different comparison and
+    genuinely does need the normalisation -- see that docstring. Do not
+    "fix" this one with a backfill.)
+
+    The invariant that does need protecting is that `ts` is always UTC.
+    `_normalize_source_time` canonicalises the spelling but only stamps
+    `tzinfo` on a naive value -- a source time arriving with a real non-UTC
+    offset would be stored verbatim as e.g. `...+05:00` and would sort and
+    range-filter wrongly, while `web._iso_utc` (which does call `astimezone`)
+    would still *publish* it correctly. That split is silent in both
+    directions. Only `timezone=UTC` in `outdoor._build_url` keeps it from
+    arising.
 
     Note this deliberately does NOT order by `received_at`. If Open-Meteo
     republishes a stale `current.time`, the older source reading is the correct
