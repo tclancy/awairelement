@@ -37,6 +37,10 @@ WEATHER_FIELDS = (
     "wind_speed_10m",
     "pressure_msl",
     "precipitation",
+    # WMO interpretation code (#71) -- the only field here that can say
+    # "Overcast" rather than a number. Requested and stored as the source's
+    # integer; the word is the hub's job (GLOSSARY.md: `weather_code`).
+    "weather_code",
 )
 AIR_QUALITY_FIELDS = (
     "pm2_5",
@@ -54,6 +58,7 @@ WEATHER_TO_COLUMN = {
     "wind_speed_10m": "wind_speed",
     "pressure_msl": "pressure",
     "precipitation": "precipitation",
+    "weather_code": "weather_code",
 }
 AIR_QUALITY_TO_COLUMN = {
     "pm2_5": "pm25",
@@ -78,6 +83,28 @@ def _normalize_source_time(source_time: str) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.isoformat()
+
+
+def _normalize_aq_time(source_time) -> str | None:
+    """`_normalize_source_time` for the auxiliary air-quality clock, or None.
+
+    Same canonicalisation, different failure policy. The weather block's time
+    is the row's primary key, so a bad value there must stop the row. This one
+    only annotates the AQ columns, so a bad or absent value degrades to NULL —
+    which is already the exact signal the consumer is told to act on ("no
+    current AQI"), so nothing has to be invented to represent it.
+
+    Normalising rather than storing verbatim matters for the same reason it
+    does for `ts`: the two are meant to be *subtracted*, and Open-Meteo's
+    minute-precision naive form would compare as a different kind of thing.
+    """
+    if not source_time:
+        return None
+    try:
+        return _normalize_source_time(source_time)
+    except (TypeError, ValueError) as exc:
+        log.warning("air-quality current.time unparseable (%r): %s", source_time, exc)
+        return None
 
 
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
@@ -110,6 +137,19 @@ def parse_reading(
     as auxiliary — its values are stitched in but its timestamp is not the
     primary key. Missing fields (either endpoint) degrade to NULL rather
     than halting; upstream schema drift is a warning, not an outage.
+
+    That auxiliary timestamp is **stored** as `aq_ts` (#71) rather than read
+    and dropped. Both blocks are fetched every 15 min but air quality is
+    CAMS-backed and hourly, so a row stamped 14:15 routinely carries a `us_aqi`
+    measured at 13:00. Without `aq_ts` nothing downstream can tell, and the
+    hub's weather verdict is driven mostly by AQI — the one number in this
+    payload that can genuinely be bad. `received_at` does not substitute: that
+    is our poll time, not anyone's observation time.
+
+    A malformed `current.time` on the air-quality block degrades to NULL rather
+    than raising, because it is auxiliary — the weather half of the row is
+    still worth writing. The weather block's own `time` keeps raising, since
+    without it there is no primary key and no row at all.
     """
     weather_current = weather_payload["current"]
     reading = {col: None for col in db.OUTDOOR_COLUMNS}
@@ -121,6 +161,7 @@ def parse_reading(
         aq_current = air_quality_payload.get("current", {})
         for source_field, column in AIR_QUALITY_TO_COLUMN.items():
             reading[column] = aq_current.get(source_field)
+        reading["aq_ts"] = _normalize_aq_time(aq_current.get("time"))
     return reading
 
 

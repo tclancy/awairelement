@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS outdoor_readings (
     ts TEXT PRIMARY KEY,
     received_at TEXT NOT NULL,
     temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
-    pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL
+    weather_code INTEGER,
+    pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL,
+    aq_ts TEXT
 );
 """
 
@@ -61,11 +63,20 @@ OUTDOOR_COLUMNS = (
     "wind_speed",
     "pressure",
     "precipitation",
+    # Open-Meteo's WMO weather interpretation code (#71). Stored as the integer
+    # the source published, not as a word: awairelement is the system of record
+    # and the hub owns presentation, exactly as it owns card colour for indoor
+    # events. See the `weather_code` entry in GLOSSARY.md for the full call.
+    "weather_code",
     "pm25",
     "pm10",
     "us_aqi",
     "co",
     "o3",
+    # The air-quality block's OWN observation time (#71) -- hourly, and so
+    # routinely older than `ts`, which is the weather block's. Not the primary
+    # key and not a substitute for `received_at`. See GLOSSARY.md: `aq_ts`.
+    "aq_ts",
 )
 
 READING_COLUMNS = (
@@ -108,6 +119,14 @@ def _migrate(conn) -> None:
     # events at migration time, and they must land unlatched rather than
     # spuriously driving the fans on the first poll after deploy.
     _add_column(conn, "alert_events", "fans_engaged INTEGER NOT NULL DEFAULT 0")
+    # #71. Both nullable with no DEFAULT, which is the whole point: rows written
+    # before this migration genuinely do not know their weather code or the age
+    # of their AQI, and NULL is the only honest way to say so. Backfilling
+    # either one -- even from the row's own `ts` -- would manufacture a
+    # measurement time the source never published, and `aq_ts` exists precisely
+    # so a consumer can refuse to trust an AQI it cannot date.
+    _add_column(conn, "outdoor_readings", "weather_code INTEGER")
+    _add_column(conn, "outdoor_readings", "aq_ts TEXT")
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -166,6 +185,51 @@ def outdoor_readings_since(conn, columns, since) -> list:
         (since.isoformat(),),
     )
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
+
+
+def latest_outdoor_reading(conn, columns) -> dict | None:
+    """Most recent outdoor reading for `columns`, or None when none are stored.
+
+    The outdoor sibling of `latest_reading`, and unbounded for the same reason
+    (#70, #71): a consumer that wants to know whether the outdoor poller is
+    dead needs "old row" and "no row" to arrive as different answers, and a
+    `since` filter collapses them into one null.
+
+    Ordered by `ts` DESC, which for this table is Open-Meteo's `current.time`
+    -- the source's publish clock, not ours. That ordering is lexicographic,
+    since `ts` is TEXT.
+
+    **Mixed spellings are not the hazard here.** Rows predating the
+    normalisation in `outdoor._normalize_source_time` hold a bare
+    `"YYYY-MM-DDTHH:MM"`, and those still sort chronologically against
+    normalised rows because the shared `YYYY-MM-DDTHH:MM` date prefix
+    dominates the comparison; a bare value sorts early only against a
+    normalised value denoting the same instant, where either answer is right.
+    (`outdoor_readings_since`'s *range filter* is a different comparison and
+    genuinely does need the normalisation -- see that docstring. Do not
+    "fix" this one with a backfill.)
+
+    The invariant that does need protecting is that `ts` is always UTC.
+    `_normalize_source_time` canonicalises the spelling but only stamps
+    `tzinfo` on a naive value -- a source time arriving with a real non-UTC
+    offset would be stored verbatim as e.g. `...+05:00` and would sort and
+    range-filter wrongly, while `web._iso_utc` (which does call `astimezone`)
+    would still *publish* it correctly. That split is silent in both
+    directions. Only `timezone=UTC` in `outdoor._build_url` keeps it from
+    arising.
+
+    Note this deliberately does NOT order by `received_at`. If Open-Meteo
+    republishes a stale `current.time`, the older source reading is the correct
+    answer to "what is the latest outdoor observation" even though our row for
+    it landed later.
+    """
+    unknown = set(columns) - set(OUTDOOR_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown outdoor columns {unknown}")
+    row = conn.execute(
+        f"SELECT {', '.join(columns)} FROM outdoor_readings ORDER BY ts DESC LIMIT 1"
+    ).fetchone()
+    return dict(zip(columns, row, strict=True)) if row else None
 
 
 def iso_z(dt) -> str:

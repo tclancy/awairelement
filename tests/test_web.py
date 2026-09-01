@@ -757,3 +757,265 @@ def test_latest_survives_an_open_event_stamped_without_an_offset(make_raw_client
     events = response.get_json()["open_events"]
     assert [event["metric"] for event in events] == ["pm25", "co2"]
     assert all(event["opened_at"].endswith("Z") for event in events)
+
+
+# --- /api/outdoor-latest (#71) ----------------------------------------------
+#
+# The outdoor sibling of /api/latest. Same two machine-facing rules (source
+# units always; empty table is a 200 with a null reading), plus a third clock:
+# `aq_ts`, which dates the AQI specifically and is hourly where `ts` is
+# quarter-hourly.
+
+
+def _seed_outdoor_row(conn, **values):
+    columns = tuple(values)
+    conn.execute(
+        f"INSERT INTO outdoor_readings ({', '.join(columns)})"
+        f" VALUES ({', '.join('?' * len(columns))})",
+        tuple(values.values()),
+    )
+    conn.commit()
+
+
+@pytest.fixture
+def outdoor_client(make_raw_client):
+    """A client over one fully-populated outdoor row.
+
+    `ts` 04:30, `aq_ts` 04:00 and `received_at` 04:30:15 are three distinct
+    values on purpose — a fixture that reused one stamp would make every
+    "publishes three clocks" assertion vacuous.
+    """
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts="2026-07-12T04:30:00+00:00",
+            received_at="2026-07-12T04:30:15+00:00",
+            aq_ts="2026-07-12T04:00:00+00:00",
+            weather_code=61,
+            temp=22.4,
+            humid=68.0,
+            wind_speed=3.2,
+            pressure=1013.2,
+            precipitation=0.4,
+            pm25=5.6,
+            pm10=8.1,
+            us_aqi=32,
+            co=200.0,
+            o3=55.0,
+        )
+
+    return make_raw_client("outdoor", seed)
+
+
+def test_outdoor_latest_publishes_exactly_the_agreed_fields(outdoor_client):
+    """A literal set, not `{*web.OUTDOOR_LATEST_FIELDS}`.
+
+    This is a contract with another repo, so widening the constant has to fail
+    here rather than pass by reading the same constant back.
+    """
+    reading = outdoor_client.get("/api/outdoor-latest").get_json()["reading"]
+    assert set(reading) == {
+        "ts",
+        "received_at",
+        "aq_ts",
+        "weather_code",
+        "temp",
+        "humid",
+        "wind_speed",
+        "pressure",
+        "precipitation",
+        "pm25",
+        "pm10",
+        "us_aqi",
+        "co",
+        "o3",
+    }
+
+
+def test_outdoor_latest_publishes_the_values_it_stored(outdoor_client):
+    reading = outdoor_client.get("/api/outdoor-latest").get_json()["reading"]
+    assert reading["weather_code"] == 61
+    assert reading["temp"] == 22.4
+    assert reading["us_aqi"] == 32
+    assert reading["pressure"] == 1013.2
+
+
+def test_outdoor_latest_publishes_three_distinct_clocks(outdoor_client):
+    """`ts` (source publish), `received_at` (ours), `aq_ts` (the AQI's own).
+
+    The ordering assertion is the load-bearing half: on a healthy row `aq_ts`
+    lags `ts` because air quality is hourly, and that lag is the entire reason
+    the column exists.
+    """
+    reading = outdoor_client.get("/api/outdoor-latest").get_json()["reading"]
+    assert reading["aq_ts"] < reading["ts"] < reading["received_at"]
+    assert reading["ts"] == "2026-07-12T04:30:00Z"
+    assert reading["aq_ts"] == "2026-07-12T04:00:00Z"
+    assert reading["received_at"] == "2026-07-12T04:30:15Z"
+
+
+def test_outdoor_latest_normalises_every_clock_to_one_iso_spelling(outdoor_client):
+    """Same `Z` spelling `/api/latest` publishes, so one parser handles both."""
+    reading = outdoor_client.get("/api/outdoor-latest").get_json()["reading"]
+    for field in ("ts", "received_at", "aq_ts"):
+        assert reading[field].endswith("Z"), field
+
+
+def test_outdoor_latest_is_always_celsius_whatever_the_display_unit_says(
+    tmp_path, monkeypatch
+):
+    """The #70 trap, re-armed for this endpoint.
+
+    `temp_unit()` lives in this module and converts for every browser-facing
+    sibling. If it ever reaches here the error is silent: 22.4 becomes 72.3
+    with nothing in the payload to reveal it.
+    """
+    monkeypatch.setenv("TEMPERATURE_UNIT", "F")
+    db_path = tmp_path / "f.db"
+    conn = db.connect(db_path)
+    _seed_outdoor_row(
+        conn,
+        ts="2026-07-12T04:30:00+00:00",
+        received_at="2026-07-12T04:30:15+00:00",
+        temp=22.4,
+    )
+    conn.close()
+    app = create_app(db_path=str(db_path))
+    app.testing = True
+    payload = app.test_client().get("/api/outdoor-latest").get_json()
+    assert payload["temp_unit"] == "C"
+    assert payload["reading"]["temp"] == 22.4
+
+
+def test_outdoor_latest_publishes_pressure_in_source_hpa(outdoor_client):
+    """Not inHg.
+
+    `/api/outdoor-series` divides by `_HPA_PER_INHG` to feed the dashboard, so
+    this app genuinely has two spellings for pressure. A consumer reading raw
+    hPa here and inHg there, unlabelled, could not tell — hence the explicit
+    `pressure_unit`, and hence this test asserting the raw value survives.
+    """
+    payload = outdoor_client.get("/api/outdoor-latest").get_json()
+    assert payload["pressure_unit"] == "hPa"
+    assert payload["reading"]["pressure"] == 1013.2
+    # Guards the specific wrong answer: 1013.2 / 33.8639 == 29.92...
+    assert payload["reading"]["pressure"] != pytest.approx(29.92, abs=0.01)
+
+
+def test_outdoor_latest_on_an_empty_table_is_a_200_with_a_null_reading(
+    make_raw_client,
+):
+    """ "Up, but the outdoor poller is dead" must not read as "unreachable"."""
+    response = make_raw_client("outdoor-empty").get("/api/outdoor-latest")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["reading"] is None
+    assert payload["temp_unit"] == "C"
+
+
+def test_outdoor_latest_publishes_a_null_aq_ts_rather_than_omitting_it(
+    make_raw_client,
+):
+    """The partial-poll and pre-migration shape, which is the hub's yellow.
+
+    Present-and-null, not absent: the hub branches on the value, and a missing
+    key would make `payload["aq_ts"]` a KeyError instead of a verdict.
+    """
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts="2026-07-12T04:30:00+00:00",
+            received_at="2026-07-12T04:30:15+00:00",
+            temp=22.4,
+        )
+
+    reading = (
+        make_raw_client("outdoor-partial", seed)
+        .get("/api/outdoor-latest")
+        .get_json()["reading"]
+    )
+    assert "aq_ts" in reading
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] is None
+    assert reading["weather_code"] is None
+    assert reading["temp"] == 22.4  # the weather half still published
+
+
+def test_outdoor_latest_returns_the_newest_row(make_raw_client):
+    def seed(conn):
+        for stamp, temp in (
+            ("2026-07-12T04:30:00+00:00", 22.4),
+            ("2026-07-12T05:00:00+00:00", 23.9),
+            ("2026-07-12T04:45:00+00:00", 23.0),
+        ):
+            _seed_outdoor_row(conn, ts=stamp, received_at=stamp, temp=temp)
+
+    reading = (
+        make_raw_client("outdoor-many", seed)
+        .get("/api/outdoor-latest")
+        .get_json()["reading"]
+    )
+    assert reading["temp"] == 23.9
+
+
+def test_outdoor_latest_hands_back_an_ancient_reading_rather_than_null(
+    make_raw_client,
+):
+    """Unbounded, so the hub can say "stale since March" instead of "no data"."""
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts="2020-01-01T00:00:00+00:00",
+            received_at="2020-01-01T00:00:05+00:00",
+            temp=1.0,
+        )
+
+    payload = (
+        make_raw_client("outdoor-ancient", seed).get("/api/outdoor-latest").get_json()
+    )
+    assert payload["reading"]["temp"] == 1.0
+    assert payload["reading"]["ts"] == "2020-01-01T00:00:00Z"
+
+
+def test_outdoor_latest_survives_a_row_stamped_without_an_offset(make_raw_client):
+    """The legacy shape: `ts` written before `_normalize_source_time` existed.
+
+    Sibling of `/api/latest`'s naive-`opened_at` test. `_iso_utc` reads a naive
+    value as UTC rather than rejecting it, which is what keeps a pre-#71
+    homelab row serving instead of 500ing -- and reading it as *local* instead
+    would publish 04:30 as 08:30Z and run the hub's staleness clock four hours
+    fast.
+    """
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts="2026-07-12T04:30",  # bare, minute-precision, naive
+            received_at="2026-07-12T04:30:15+00:00",
+            temp=22.4,
+        )
+
+    response = make_raw_client("outdoor-naive", seed).get("/api/outdoor-latest")
+    assert response.status_code == 200
+    reading = response.get_json()["reading"]
+    assert reading["ts"] == "2026-07-12T04:30:00Z"
+    assert reading["aq_ts"] is None
+    assert reading["temp"] == 22.4
+
+
+def test_outdoor_latest_names_every_unit_the_hub_converts(outdoor_client):
+    """#71's card renders "62F, 8 mph, 0.00 in" -- three conversions, plus the
+    hPa/inHg split this app itself has. Each is a silent multiply on a number
+    the card exists to show, so each is labelled at the boundary.
+    """
+    payload = outdoor_client.get("/api/outdoor-latest").get_json()
+    assert payload["temp_unit"] == "C"
+    assert payload["pressure_unit"] == "hPa"
+    assert payload["wind_speed_unit"] == "km/h"
+    assert payload["precipitation_unit"] == "mm"
+    # Source values, unconverted -- the labels have to be true.
+    assert payload["reading"]["wind_speed"] == 3.2
+    assert payload["reading"]["precipitation"] == 0.4
