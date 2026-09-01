@@ -142,6 +142,63 @@ def _open_voc_event(conn):
 # --- latest_score: freshness-bounded, mirrors latest_pm25 ---
 
 
+def test_latest_reading_empty_is_none(conn):
+    assert db.latest_reading(conn, ("ts", "score")) is None
+
+
+def test_latest_reading_returns_the_newest_row_by_device_clock(conn):
+    for minutes_ago, score in ((4, 84), (1, 70)):
+        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
+            (ts, ts, score),
+        )
+    conn.commit()
+    assert db.latest_reading(conn, ("ts", "score"))["score"] == 70
+
+
+def test_latest_reading_is_unbounded_where_latest_score_is_not(conn):
+    """The pair that makes the difference concrete, asserted side by side.
+
+    `latest_score` gates spending fans, so an hour-old value must read as "no
+    data" — that is `test_latest_score_returns_none_when_only_stale_readings`
+    one screen below. `latest_reading` feeds a consumer that does its own
+    staleness arithmetic (#70), and returning None for an old row would make
+    "the poller died" and "there has never been a sensor" the same answer.
+    """
+    ts = db.iso_z(NOW - timedelta(hours=1))
+    conn.execute(
+        "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)", (ts, ts, 70)
+    )
+    conn.commit()
+    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
+    assert db.latest_reading(conn, ("ts", "score"))["score"] == 70
+
+
+def test_latest_reading_keeps_nulls_rather_than_skipping_the_row(conn):
+    """Unlike `latest_score`, which skips null rows to find a usable gate value.
+
+    Here the newest row *is* the answer even if a sensor channel is missing:
+    dropping it would silently serve an older, more complete reading under a
+    newer timestamp, which is worse than publishing the null.
+    """
+    for minutes_ago, score in ((4, 72), (1, None)):
+        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
+            (ts, ts, score),
+        )
+    conn.commit()
+    assert db.latest_reading(conn, ("ts", "score"))["score"] is None
+
+
+def test_latest_reading_rejects_an_unknown_column(conn):
+    """Same guard as `readings_since` — the column list is interpolated into
+    the SQL, so an unvalidated name is an injection point, not just a typo."""
+    with pytest.raises(ValueError, match="unknown columns"):
+        db.latest_reading(conn, ("ts", "score; DROP TABLE readings"))
+
+
 def test_latest_score_empty_is_none(conn):
     assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
 
@@ -301,3 +358,11 @@ def test_latest_pm25_returns_none_when_only_stale_readings(conn):
     )
     conn.commit()
     assert db.latest_pm25(conn, since=NOW - timedelta(minutes=5)) is None
+
+
+def test_readings_since_rejects_an_unknown_column(conn):
+    """The guard `latest_reading`'s own test cites as its precedent, which
+    until #70 had no test of its own — both build their SQL by interpolating
+    the caller's column list, so both are injection points."""
+    with pytest.raises(ValueError, match="unknown columns"):
+        db.readings_since(conn, ("score; DROP TABLE readings",), NOW)
