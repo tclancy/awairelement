@@ -1,6 +1,7 @@
 """Open-Meteo outdoor poller: parse, dedup, error and partial paths."""
 
 import json
+import logging
 from urllib.error import URLError
 
 import pytest
@@ -167,6 +168,29 @@ def test_build_url_carries_all_air_quality_fields():
         assert field in url
 
 
+def test_build_url_requests_source_units_and_utc():
+    """`/api/outdoor-latest`'s unit labels are assertions about *this* request.
+
+    `web.OUTDOOR_LATEST_FIELDS` publishes `C` / `hPa` / `km/h` / `mm` as fixed
+    strings. Those are right only because this function sends no unit override,
+    so Open-Meteo answers in its defaults -- the two files agree by coincidence
+    and nothing connected them. Adding `"wind_speed_unit": "mph"` here is a
+    one-line, obviously-reasonable change that would make the endpoint lie to
+    the hub about a number the weather card exists to show, with every other
+    test still green.
+
+    `timezone=UTC` is pinned for the reason `latest_outdoor_reading`'s docstring
+    gives: `_normalize_source_time` stamps `tzinfo` on a *naive* value but stores
+    a real offset verbatim, so a non-UTC answer would sort wrongly on `ts`. This
+    parameter is the only thing preventing that, and it had no test.
+    """
+    url = _build_url("https://example.test/x", 43.1, -70.9, WEATHER_FIELDS)
+    assert "timezone=UTC" in url
+    assert "_unit=" not in url
+    for override in ("temperature_unit", "wind_speed_unit", "precipitation_unit"):
+        assert override not in url
+
+
 class _FakeResponse:
     def __init__(self, body):
         self._body = body
@@ -327,7 +351,22 @@ def test_aq_ts_is_null_when_the_air_quality_fetch_failed():
     assert reading["temp"] == 22.4  # weather half still written
 
 
-@pytest.mark.parametrize("bad", ["", None, "not-a-timestamp", "2026-13-45T99:99"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        None,
+        "not-a-timestamp",
+        "2026-13-45T99:99",
+        # Non-strings, which is the half `except (TypeError, ValueError)` exists
+        # for. Without one here, narrowing that catch to `ValueError` alone leaves
+        # the whole suite green -- measured, it is a live mutation survivor. An
+        # epoch int is the most plausible real drift; the list is the shape a
+        # JSON object would take.
+        1752292800,
+        [],
+    ],
+)
 def test_a_bad_air_quality_time_degrades_to_null_rather_than_losing_the_row(bad):
     """Auxiliary, so it must not take the weather half down with it.
 
@@ -339,6 +378,28 @@ def test_a_bad_air_quality_time_degrades_to_null_rather_than_losing_the_row(bad)
     reading = parse_reading(WEATHER, payload, RECEIVED)
     assert reading["aq_ts"] is None
     assert reading["us_aqi"] == 32  # the AQ values themselves still landed
+
+
+def test_an_absent_aq_time_is_silent_but_a_malformed_one_warns(caplog):
+    """The falsy guard in `_normalize_aq_time` earns its place on the log, not the value.
+
+    Both paths return None, so no assertion about `aq_ts` can tell them apart --
+    deleting the guard leaves the whole suite green (measured). What differs is
+    whether we shout: an absent AQ `time` is the ordinary shape of a partial
+    poll and would otherwise warn every 15 minutes during a CAMS outage, drowning
+    the malformed case that actually means upstream drift.
+    """
+    absent = {
+        "current": {k: v for k, v in AIR_QUALITY["current"].items() if k != "time"}
+    }
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        assert parse_reading(WEATHER, absent, RECEIVED)["aq_ts"] is None
+    assert caplog.records == []
+
+    malformed = {"current": dict(AIR_QUALITY["current"], time="not-a-timestamp")}
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        assert parse_reading(WEATHER, malformed, RECEIVED)["aq_ts"] is None
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
 
 
 def test_a_missing_air_quality_time_key_degrades_to_null():

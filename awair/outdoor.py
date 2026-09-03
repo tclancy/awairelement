@@ -98,6 +98,13 @@ def _normalize_aq_time(source_time) -> str | None:
     does for `ts`: the two are meant to be *subtracted*, and Open-Meteo's
     minute-precision naive form would compare as a different kind of thing.
     """
+    # Behaviourally redundant -- `_normalize_source_time(None)` raises TypeError
+    # and `("")` raises ValueError, both caught below. It is kept for the log:
+    # an *absent* AQ time is the ordinary shape of a partial poll and should not
+    # warn every 15 minutes, while a *malformed* one is upstream drift worth
+    # seeing. Deleting it is a live mutation survivor against the assertions
+    # alone, so the distinction is pinned on the log instead
+    # (`test_an_absent_aq_time_is_silent_but_a_malformed_one_warns`).
     if not source_time:
         return None
     try:
@@ -108,6 +115,16 @@ def _normalize_aq_time(source_time) -> str | None:
 
 
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
+    """Build one Open-Meteo `current=` request.
+
+    **Do not add a unit override here.** `web.OUTDOOR_LATEST_FIELDS` publishes
+    `C` / `hPa` / `km/h` / `mm` to the hub as fixed strings, and those are
+    correct only because this request asks for Open-Meteo's defaults. A
+    `wind_speed_unit` or `temperature_unit` parameter would change the stored
+    values and leave the published labels behind, silently. `timezone=UTC` is
+    load-bearing for the same reason -- see `db.latest_outdoor_reading`.
+    Pinned by `test_build_url_requests_source_units_and_utc`.
+    """
     params = urllib.parse.urlencode(
         {
             "latitude": lat,
