@@ -1,6 +1,7 @@
 """Open-Meteo outdoor poller: parse, dedup, error and partial paths."""
 
 import json
+import logging
 from urllib.error import URLError
 
 import pytest
@@ -27,6 +28,12 @@ WEATHER = {
         "wind_speed_10m": 3.2,
         "pressure_msl": 1013.2,
         "precipitation": 0.0,
+        # Requested by WEATHER_FIELDS since #71, so every real response carries
+        # it. Kept on the shared fixture rather than only on the ad-hoc payload
+        # in the #71 block below: a fixture that omits a field production
+        # always sends is a shape production never produces, and the poll_once
+        # / main end-to-end tests drive off this one.
+        "weather_code": 3,
     }
 }
 WEATHER_TEXT = json.dumps(WEATHER)
@@ -161,6 +168,29 @@ def test_build_url_carries_all_air_quality_fields():
         assert field in url
 
 
+def test_build_url_requests_source_units_and_utc():
+    """`/api/outdoor-latest`'s unit labels are assertions about *this* request.
+
+    `web.OUTDOOR_LATEST_FIELDS` publishes `C` / `hPa` / `km/h` / `mm` as fixed
+    strings. Those are right only because this function sends no unit override,
+    so Open-Meteo answers in its defaults -- the two files agree by coincidence
+    and nothing connected them. Adding `"wind_speed_unit": "mph"` here is a
+    one-line, obviously-reasonable change that would make the endpoint lie to
+    the hub about a number the weather card exists to show, with every other
+    test still green.
+
+    `timezone=UTC` is pinned for the reason `latest_outdoor_reading`'s docstring
+    gives: `_normalize_source_time` stamps `tzinfo` on a *naive* value but stores
+    a real offset verbatim, so a non-UTC answer would sort wrongly on `ts`. This
+    parameter is the only thing preventing that, and it had no test.
+    """
+    url = _build_url("https://example.test/x", 43.1, -70.9, WEATHER_FIELDS)
+    assert "timezone=UTC" in url
+    assert "_unit=" not in url
+    for override in ("temperature_unit", "wind_speed_unit", "precipitation_unit"):
+        assert override not in url
+
+
 class _FakeResponse:
     def __init__(self, body):
         self._body = body
@@ -247,3 +277,146 @@ def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+# --- weather_code + aq_ts (#71) ---------------------------------------------
+#
+# Two columns that exist so the hub's weather card can say a word and can date
+# its AQI. The aq_ts half is the non-obvious one: it was already being read and
+# discarded, so a row stamped 14:15 could carry an AQI measured at 13:00 with
+# nothing downstream able to tell.
+
+
+def test_weather_code_is_requested_from_the_source():
+    """It cannot be stored if it is never asked for.
+
+    Pinned separately from `parse_reading` because the two failures are
+    independent and only one of them is visible in a parsed fixture: a hand-
+    written test payload carries `weather_code` whether or not the real URL
+    asks Open-Meteo for it, so a mapping test alone would stay green against a
+    poller that receives the field never.
+    """
+    assert "weather_code" in WEATHER_FIELDS
+    url = _build_url("https://x/y", 1.0, 2.0, WEATHER_FIELDS)
+    assert "weather_code" in url
+
+
+def test_parse_reading_stores_the_weather_code():
+    """Off the shared fixture, which now carries the field production sends."""
+    assert parse_reading(WEATHER, AIR_QUALITY, RECEIVED)["weather_code"] == 3
+
+
+def test_a_response_without_a_weather_code_degrades_to_null():
+    """Upstream schema drift is a warning, not an outage -- the module rule."""
+    current = {k: v for k, v in WEATHER["current"].items() if k != "weather_code"}
+    reading = parse_reading({"current": current}, AIR_QUALITY, RECEIVED)
+    assert reading["weather_code"] is None
+    assert reading["temp"] == 22.4
+
+
+def test_parse_reading_stores_the_air_qualitys_own_timestamp():
+    """The whole point of #71's second column, asserted on the lag itself.
+
+    The shared fixtures already disagree by design -- weather publishes 04:30,
+    air quality 04:00 -- so this asserts the two clocks land in different
+    columns rather than one overwriting the other.
+    """
+    reading = parse_reading(WEATHER, AIR_QUALITY, RECEIVED)
+    assert reading["aq_ts"] == "2026-07-12T04:00:00+00:00"
+    assert reading["ts"] == "2026-07-12T04:30:00+00:00"
+    assert reading["aq_ts"] < reading["ts"]
+
+
+def test_aq_ts_is_normalised_to_the_same_spelling_as_ts():
+    """They are meant to be subtracted, so they must be the same kind of string.
+
+    Open-Meteo publishes `"YYYY-MM-DDTHH:MM"` -- naive, minute precision. Two
+    fields stored in two spellings compare wrongly and sort wrongly, which is
+    the same hazard `_normalize_source_time`'s docstring describes for `ts`.
+    """
+    reading = parse_reading(WEATHER, AIR_QUALITY, RECEIVED)
+    assert reading["aq_ts"].endswith("+00:00")
+    assert reading["aq_ts"][:19] == "2026-07-12T04:00:00"
+
+
+def test_aq_ts_is_null_when_the_air_quality_fetch_failed():
+    """`poll_once` passes None for the AQ payload on a partial poll.
+
+    NULL here is the signal the hub acts on ("no current AQI" -> yellow), so it
+    has to survive the partial path rather than being backfilled from `ts`.
+    """
+    reading = parse_reading(WEATHER, None, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] is None
+    assert reading["temp"] == 22.4  # weather half still written
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        None,
+        "not-a-timestamp",
+        "2026-13-45T99:99",
+        # Non-strings, which is the half `except (TypeError, ValueError)` exists
+        # for. Without one here, narrowing that catch to `ValueError` alone leaves
+        # the whole suite green -- measured, it is a live mutation survivor. An
+        # epoch int is the most plausible real drift; the list is the shape a
+        # JSON object would take.
+        1752292800,
+        [],
+    ],
+)
+def test_a_bad_air_quality_time_degrades_to_null_rather_than_losing_the_row(bad):
+    """Auxiliary, so it must not take the weather half down with it.
+
+    The weather block's own `time` is the primary key and keeps raising -- that
+    asymmetry is the reason `_normalize_aq_time` exists as a separate function
+    instead of `parse_reading` calling `_normalize_source_time` twice.
+    """
+    payload = {"current": dict(AIR_QUALITY["current"], time=bad)}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] == 32  # the AQ values themselves still landed
+
+
+def test_an_absent_aq_time_is_silent_but_a_malformed_one_warns(caplog):
+    """The falsy guard in `_normalize_aq_time` earns its place on the log, not the value.
+
+    Both paths return None, so no assertion about `aq_ts` can tell them apart --
+    deleting the guard leaves the whole suite green (measured). What differs is
+    whether we shout: an absent AQ `time` is the ordinary shape of a partial
+    poll and would otherwise warn every 15 minutes during a CAMS outage, drowning
+    the malformed case that actually means upstream drift.
+    """
+    absent = {
+        "current": {k: v for k, v in AIR_QUALITY["current"].items() if k != "time"}
+    }
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        assert parse_reading(WEATHER, absent, RECEIVED)["aq_ts"] is None
+    assert caplog.records == []
+
+    malformed = {"current": dict(AIR_QUALITY["current"], time="not-a-timestamp")}
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        assert parse_reading(WEATHER, malformed, RECEIVED)["aq_ts"] is None
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+
+
+def test_a_missing_air_quality_time_key_degrades_to_null():
+    """Distinct from the malformed case above: the key is absent, not bad."""
+    current = {k: v for k, v in AIR_QUALITY["current"].items() if k != "time"}
+    reading = parse_reading(WEATHER, {"current": current}, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] == 32
+
+
+def test_a_bad_weather_time_still_raises():
+    """The asymmetry the two normalisers exist to express, pinned.
+
+    If this ever degrades to NULL too, `insert_outdoor_reading` starts writing
+    rows with a NULL primary key and the dedup that makes the poll loop
+    idempotent stops working.
+    """
+    payload = {"current": dict(WEATHER["current"], time="not-a-timestamp")}
+    with pytest.raises(ValueError):
+        parse_reading(payload, AIR_QUALITY, RECEIVED)

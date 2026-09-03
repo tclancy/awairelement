@@ -28,6 +28,28 @@ _TEMP_EVENT_FIELDS = ("peak_value", "baseline", "threshold")
 # and a consumer that starts depending on them makes them a contract.
 LATEST_METRICS = ("score", "temp", "humid", "co2", "voc", "pm25")
 
+# The outdoor columns `/api/outdoor-latest` publishes, in the order #71 lists
+# them, excluding the three clocks (`ts`, `received_at`, `aq_ts`) which the
+# handler passes separately because each goes through `_iso_utc`. A whitelist
+# for the same reason `LATEST_METRICS` is one -- but note that here it happens
+# to cover every remaining column in the table, so the list is doing less
+# filtering than its indoor sibling and more *ordering-and-contract* work. A
+# column added to `outdoor_readings` later is private until someone adds it
+# here on purpose.
+OUTDOOR_LATEST_FIELDS = (
+    "weather_code",
+    "temp",
+    "humid",
+    "wind_speed",
+    "pressure",
+    "precipitation",
+    "pm25",
+    "pm10",
+    "us_aqi",
+    "co",
+    "o3",
+)
+
 # `metric` values on an alert_event that are not measurements, and so are not
 # part of the `/api/latest` contract. `poller.handle_device_health` opens one
 # with `metric="device"` and `tier` in ("unreachable", "stale") whose
@@ -279,6 +301,72 @@ def create_app(db_path=None):
                 "ts": _iso_utc(reading["ts"]),
                 "received_at": _iso_utc(reading["received_at"]),
                 **{name: reading[name] for name in LATEST_METRICS},
+            }
+        return jsonify(payload)
+
+    @app.get("/api/outdoor-latest")
+    def outdoor_latest():
+        """Latest outdoor reading, for the house hub's weather card (#71).
+
+        The outdoor sibling of `/api/latest`, and it inherits that endpoint's
+        two machine-facing rules verbatim: **source units, always, whatever the
+        display config says**, and **an empty table is a 200 with a null
+        reading, not an error**.
+
+        Four units are named in the payload rather than left implied: the
+        four the consumer is known to convert. #71's own motivating card reads
+        `62°F, 8 mph, 0.00 in`, so the hub turns Celsius into F, km/h into mph
+        and mm into inches -- and this app separately turns hPa into inHg at
+        the `/api/outdoor-series` boundary and Celsius into F at every
+        browser-facing one. Every one of those is a silent multiply on a
+        number the card exists to display, and an unlabelled payload gives a
+        consumer no way to notice it guessed wrong.
+
+        The particulate and gas fields are deliberately unlabelled. They have
+        one spelling everywhere (Open-Meteo's µg/m³), `us_aqi` is a
+        dimensionless index and `humid` a percent, and nothing on either side
+        of this contract converts them -- so naming them would be
+        documentation rather than disambiguation. The README carries that.
+
+        `aq_ts` is the field to read carefully. It is the air-quality block's
+        own observation time, which is hourly while `ts` is quarter-hourly, so
+        it is *expected* to lag `ts` by up to an hour on a perfectly healthy
+        row. NULL means this row's AQI has no known observation time -- either
+        the air-quality fetch failed for that poll (`poll_once` returns
+        "partial" and writes the weather half anyway) or the row predates #71.
+        Per #71 the hub treats both as "no current AQI" and renders yellow,
+        rather than folding an undateable number into a green.
+        """
+        conn = connect()
+        try:
+            reading = db.latest_outdoor_reading(
+                conn, ("ts", "received_at", "aq_ts", *OUTDOOR_LATEST_FIELDS)
+            )
+        finally:
+            conn.close()
+
+        payload = {
+            # Literals, not lookups — see the docstring. `temp_unit()` exists
+            # in this module and must not reach this endpoint.
+            "temp_unit": "C",
+            "pressure_unit": "hPa",
+            "wind_speed_unit": "km/h",
+            "precipitation_unit": "mm",
+            "reading": None,
+        }
+        if reading is not None:
+            payload["reading"] = {
+                # Three clocks, and they answer three different questions.
+                # `ts` is Open-Meteo's publish time for the weather block —
+                # what a human reads as "as of". `received_at` is this
+                # machine's poll time and is the one to measure staleness
+                # against, for the same cross-clock reason `/api/latest`
+                # publishes it. `aq_ts` dates the AQI specifically and is
+                # routinely older than both.
+                "ts": _iso_utc(reading["ts"]),
+                "received_at": _iso_utc(reading["received_at"]),
+                "aq_ts": _iso_utc(reading["aq_ts"]),
+                **{name: reading[name] for name in OUTDOOR_LATEST_FIELDS},
             }
         return jsonify(payload)
 
