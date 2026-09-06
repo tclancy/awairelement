@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS alert_events (
 CREATE TABLE IF NOT EXISTS fan_state (
     fan_id INTEGER PRIMARY KEY,
     last_action TEXT NOT NULL CHECK (last_action IN ('off', 'speed1', 'speed2', 'speed3')),
-    last_command_at TEXT NOT NULL
+    last_command_at TEXT NOT NULL,
+    run_started_at TEXT,
+    capped INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS outdoor_readings (
@@ -127,6 +129,13 @@ def _migrate(conn) -> None:
     # so a consumer can refuse to trust an AQI it cannot date.
     _add_column(conn, "outdoor_readings", "weather_code INTEGER")
     _add_column(conn, "outdoor_readings", "aq_ts TEXT")
+    # The duration cap's bookkeeping (ADR-002). `run_started_at` is nullable and
+    # starts NULL: a fan already running at migration time has no recorded
+    # start, and `run_exhausted` treats "no start" as "not yet exhausted", so
+    # the first poll after deploy adopts it into a fresh run rather than
+    # capping it instantly on a start time we never observed.
+    _add_column(conn, "fan_state", "run_started_at TEXT")
+    _add_column(conn, "fan_state", "capped INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -309,16 +318,6 @@ def get_open_events(conn) -> dict:
     }
 
 
-def mark_fans_engaged(conn, event_id) -> None:
-    """Latch this event as fan-worthy: the score dipped below the gate while it
-    was open. Write-once — the score is never consulted again for this event."""
-    conn.execute(
-        "UPDATE alert_events SET fans_engaged = 1 WHERE id = ?",
-        (event_id,),
-    )
-    conn.commit()
-
-
 def open_event(
     conn, metric, tier, opened_at, value, baseline, threshold, notified
 ) -> int:
@@ -381,7 +380,7 @@ def escalate_event(conn, event_id, at, value, tier) -> None:
 def latest_reading(conn, columns) -> dict | None:
     """Most recent reading for `columns`, or None when the table is empty.
 
-    **Deliberately unbounded, unlike `latest_pm25` / `latest_score`.** Those two
+    **Deliberately unbounded, unlike `latest_pm25` / `latest_co2`.** Those two
     take a `since` because they gate spending fans, where a stale value must not
     be allowed to authorize or veto a turn-on — returning None is the safe
     answer there. This one feeds a read-only consumer that does its own
@@ -399,7 +398,7 @@ def latest_reading(conn, columns) -> dict | None:
     equals chronological order only because every value is the Awair local
     API's fixed-width UTC `...Z` spelling, which `iso_z` exists to match. A row
     stored with a numeric offset would sort into the wrong place here and in
-    `readings_since`, `metric_history`, `latest_score` and `latest_pm25` alike.
+    `readings_since`, `metric_history`, `latest_co2` and `latest_pm25` alike.
     """
     unknown = set(columns) - set(READING_COLUMNS)
     if unknown:
@@ -426,17 +425,17 @@ def latest_pm25(conn, since) -> float | None:
     return float(row[0]) if row else None
 
 
-def latest_score(conn, since) -> float | None:
-    """Most recent Awair score at or after `since`, or None.
+def latest_co2(conn, since) -> float | None:
+    """Most recent co2 reading at or after `since`, or None.
 
-    Bounded by `since` for the same reason as `latest_pm25`: the score is a
-    gate on spending fans, and a stale value must not authorize (or veto) a
-    turn-on. Returns None when the last read is older than the window; the
-    caller treats that as 'no data' and declines to engage.
+    Bounded by `since` for the same reason as `latest_pm25`: co2 is now the
+    only thing that turns fans *on* (ADR-002), so a stale value must not keep them
+    running through a sensor outage. None reads as 'no data' and the caller
+    declines to act rather than guessing.
     """
     row = conn.execute(
-        "SELECT score FROM readings"
-        " WHERE ts >= ? AND score IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        "SELECT co2 FROM readings"
+        " WHERE ts >= ? AND co2 IS NOT NULL ORDER BY ts DESC LIMIT 1",
         (iso_z(since),),
     ).fetchone()
     return float(row[0]) if row else None
@@ -449,7 +448,8 @@ def get_fan_state(conn, fan_id: int) -> dict:
     is not blocking on first use.
     """
     row = conn.execute(
-        "SELECT last_action, last_command_at FROM fan_state WHERE fan_id = ?",
+        "SELECT last_action, last_command_at, run_started_at, capped"
+        " FROM fan_state WHERE fan_id = ?",
         (fan_id,),
     ).fetchone()
     if row is None:
@@ -457,12 +457,18 @@ def get_fan_state(conn, fan_id: int) -> dict:
             "fan_id": fan_id,
             "last_action": "off",
             "last_command_at": _NEVER,
+            "run_started_at": None,
+            "capped": False,
         }
-    last_action, last_command_at = row
+    last_action, last_command_at, run_started_at, capped = row
     return {
         "fan_id": fan_id,
         "last_action": last_action,
         "last_command_at": datetime.fromisoformat(last_command_at),
+        "run_started_at": (
+            datetime.fromisoformat(run_started_at) if run_started_at else None
+        ),
+        "capped": bool(capped),
     }
 
 
@@ -480,5 +486,34 @@ def upsert_fan_state(conn, fan_id: int, action: str, command_at) -> None:
         " last_action = excluded.last_action,"
         " last_command_at = excluded.last_command_at",
         (fan_id, action, command_at.isoformat()),
+    )
+    conn.commit()
+
+
+def set_fan_run(conn, fan_id: int, started_at, capped: bool) -> None:
+    """Persist the duration cap's bookkeeping for one fan (ADR-002).
+
+    Deliberately separate from `upsert_fan_state`: the cap has to be recorded
+    on polls where *no command is owed*. Clearing `capped` is the case that
+    forces this — it happens while the fans are already off and co2 has
+    finally recovered, so `decide()` returns None and nothing else would write.
+    Folding this into upsert_fan_state would tie it to commands actually sent
+    and the flag would never clear.
+
+    Touches only the run columns, so a failed actuate's "keep the old
+    last_action" contract is unaffected.
+    """
+    conn.execute(
+        "INSERT INTO fan_state (fan_id, last_action, last_command_at,"
+        " run_started_at, capped) VALUES (?, 'off', ?, ?, ?)"
+        " ON CONFLICT(fan_id) DO UPDATE SET"
+        " run_started_at = excluded.run_started_at,"
+        " capped = excluded.capped",
+        (
+            fan_id,
+            _NEVER.isoformat(),
+            started_at.isoformat() if started_at else None,
+            int(capped),
+        ),
     )
     conn.commit()

@@ -109,21 +109,12 @@ def test_connect_adds_fans_engaged_column_to_legacy_db(tmp_path):
 
 
 def test_open_event_starts_unlatched(conn):
+    # `fans_engaged` is retained history (ADR-002 removed the code that wrote
+    # it). Nothing sets it any more, so the schema default is now the only
+    # value a new event can have — pinned here so a migration cannot quietly
+    # start defaulting rows to 1.
     _open_voc_event(conn)
     assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
-
-
-def test_mark_fans_engaged_sets_the_latch(conn):
-    event_id = _open_voc_event(conn)
-    db.mark_fans_engaged(conn, event_id)
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
-
-
-def test_mark_fans_engaged_is_idempotent(conn):
-    event_id = _open_voc_event(conn)
-    db.mark_fans_engaged(conn, event_id)
-    db.mark_fans_engaged(conn, event_id)
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
 
 
 def _open_voc_event(conn):
@@ -139,7 +130,7 @@ def _open_voc_event(conn):
     )
 
 
-# --- latest_score: freshness-bounded, mirrors latest_pm25 ---
+# --- latest_reading: unbounded, unlike the freshness-bounded getters ---
 
 
 def test_latest_reading_empty_is_none(conn):
@@ -157,26 +148,32 @@ def test_latest_reading_returns_the_newest_row_by_device_clock(conn):
     assert db.latest_reading(conn, ("ts", "score"))["score"] == 70
 
 
-def test_latest_reading_is_unbounded_where_latest_score_is_not(conn):
+def test_latest_reading_is_unbounded_where_latest_pm25_is_not(conn):
     """The pair that makes the difference concrete, asserted side by side.
 
-    `latest_score` gates spending fans, so an hour-old value must read as "no
-    data" — that is `test_latest_score_returns_none_when_only_stale_readings`
-    one screen below. `latest_reading` feeds a consumer that does its own
-    staleness arithmetic (#70), and returning None for an old row would make
-    "the poller died" and "there has never been a sensor" the same answer.
+    `latest_pm25` gates the fan suppressor, so an hour-old value must read as
+    "no data" — that is `test_latest_pm25_returns_none_when_only_stale_readings`
+    further down. `latest_reading` feeds a consumer that does its own staleness
+    arithmetic (#70), and returning None for an old row would make "the poller
+    died" and "there has never been a sensor" the same answer.
+
+    Written against `latest_score` in #70 and re-pointed here when ADR-002
+    removed the score gate that was its only production caller. Any
+    freshness-bounded getter carries the contrast; this one is chosen because
+    it is still live.
     """
     ts = db.iso_z(NOW - timedelta(hours=1))
     conn.execute(
-        "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)", (ts, ts, 70)
+        "INSERT INTO readings (ts, received_at, score, pm25) VALUES (?, ?, ?, ?)",
+        (ts, ts, 70, 5.0),
     )
     conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
+    assert db.latest_pm25(conn, since=NOW - timedelta(minutes=5)) is None
     assert db.latest_reading(conn, ("ts", "score"))["score"] == 70
 
 
 def test_latest_reading_keeps_nulls_rather_than_skipping_the_row(conn):
-    """Unlike `latest_score`, which skips null rows to find a usable gate value.
+    """Unlike `latest_pm25`, which skips null rows to find a usable value.
 
     Here the newest row *is* the answer even if a sensor channel is missing:
     dropping it would silently serve an older, more complete reading under a
@@ -197,42 +194,6 @@ def test_latest_reading_rejects_an_unknown_column(conn):
     the SQL, so an unvalidated name is an injection point, not just a typo."""
     with pytest.raises(ValueError, match="unknown columns"):
         db.latest_reading(conn, ("ts", "score; DROP TABLE readings"))
-
-
-def test_latest_score_empty_is_none(conn):
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
-
-
-def test_latest_score_returns_most_recent_within_window(conn):
-    for minutes_ago, score in ((4, 84), (1, 70)):
-        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
-        conn.execute(
-            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
-            (ts, ts, score),
-        )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 70
-
-
-def test_latest_score_returns_none_when_only_stale_readings(conn):
-    # A score from an hour ago must not gate today's fans.
-    ts = db.iso_z(NOW - timedelta(hours=1))
-    conn.execute(
-        "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)", (ts, ts, 70)
-    )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
-
-
-def test_latest_score_skips_nulls(conn):
-    for minutes_ago, score in ((4, 72), (1, None)):
-        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
-        conn.execute(
-            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
-            (ts, ts, score),
-        )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 72
 
 
 def test_insert_reading_stores_all_fields(conn):
@@ -281,7 +242,82 @@ NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
 def test_fan_state_schema_present(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(fan_state)")}
-    assert cols == {"fan_id", "last_action", "last_command_at"}
+    assert cols == {
+        "fan_id",
+        "last_action",
+        "last_command_at",
+        "run_started_at",
+        "capped",
+    }
+
+
+def test_connect_adds_run_columns_to_legacy_fan_state(tmp_path):
+    """The duration cap's bookkeeping lands on a DB that predates it (ADR-002).
+
+    A live box has fan_state rows written before the cap existed. The ALTER
+    must supply defaults rather than a bare NOT NULL, and a fan recorded as
+    running must migrate to "no known start" — `run_exhausted` reads that as
+    not-yet-exhausted, so the next poll adopts it rather than capping it on a
+    start time nobody ever observed.
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE fan_state ("
+        " fan_id INTEGER PRIMARY KEY, last_action TEXT NOT NULL,"
+        " last_command_at TEXT NOT NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO fan_state (fan_id, last_action, last_command_at)"
+        " VALUES (1, 'speed1', ?)",
+        (NOW.isoformat(),),
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fan_state)")}
+    assert {"run_started_at", "capped"} <= cols
+    state = db.get_fan_state(conn, 1)
+    assert state["last_action"] == "speed1"  # pre-existing state survives
+    assert state["run_started_at"] is None
+    assert state["capped"] is False
+
+
+def test_set_fan_run_round_trips(conn):
+    db.set_fan_run(conn, fan_id=1, started_at=NOW, capped=True)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["run_started_at"] == NOW
+    assert state["capped"] is True
+
+    db.set_fan_run(conn, fan_id=1, started_at=None, capped=False)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["run_started_at"] is None
+    assert state["capped"] is False
+
+
+def test_set_fan_run_leaves_the_command_state_alone(conn):
+    """Run bookkeeping must not disturb what the fan is doing.
+
+    `_drive_one` writes the run before `_command_fan` decides anything, so if
+    this clobbered last_action the no-op filter would compare against the wrong
+    value and re-send commands the fan is already obeying.
+    """
+    db.upsert_fan_state(conn, fan_id=1, action="speed1", command_at=NOW)
+    db.set_fan_run(conn, fan_id=1, started_at=NOW, capped=True)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["last_action"] == "speed1"
+    assert state["last_command_at"] == NOW
+
+
+def test_set_fan_run_creates_a_row_for_an_unknown_fan(conn):
+    # First poll after a fresh install writes the run before any command.
+    db.set_fan_run(conn, fan_id=9, started_at=NOW, capped=False)
+    state = db.get_fan_state(conn, fan_id=9)
+    assert state["last_action"] == "off"
+    assert state["run_started_at"] == NOW
 
 
 def test_fan_state_rejects_out_of_domain_action(conn):

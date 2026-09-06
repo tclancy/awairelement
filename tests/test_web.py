@@ -593,7 +593,7 @@ def test_latest_on_an_empty_table_is_a_200_with_a_null_reading(make_raw_client):
 
 
 def test_latest_hands_back_an_ancient_reading_rather_than_null(make_raw_client):
-    """`latest_reading` is deliberately unbounded, unlike `latest_score`.
+    """`latest_reading` is deliberately unbounded, unlike `latest_pm25`.
 
     A bounded query would return None for a reading a week old, which is the
     same answer as an empty table — and telling those apart is the whole reason

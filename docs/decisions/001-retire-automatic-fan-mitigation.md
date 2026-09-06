@@ -1,8 +1,16 @@
 # ADR-001: retire automatic fan mitigation
 
-**Status:** accepted
+**Status:** superseded by [ADR-002](002-co2-only-fan-mitigation.md) (2026-09-05)
 **Date:** 2026-07-31
 **Deciders:** tclancy (issue [#61](https://github.com/tclancy/awairelement/issues/61)), agent:opus
+
+> **Superseded in part.** ADR-002 un-retires fan mitigation on an absolute CO2
+> trigger, having measured the "reverses if" clause below as satisfied: a
+> median episode of ten minutes and a 0.62% duty cycle. What survives from this
+> ADR is the analysis of *why* the spike-event trigger failed, the
+> `MITIGATION_RETIRED` kill switch, and the release-on-disable behaviour — all
+> still live. What no longer holds is the retirement itself and the claim that
+> `awair/fans.py` has no production caller.
 
 ## Context
 

@@ -1,9 +1,12 @@
 """Fan mitigation: verdict, rate limit, actuation, and the check_fans glue.
 
-Each scenario maps to a rule in issue #10 / #14. Trigger surface is
-`spikes` open events; suppressor is a raw pm25 read.
+Trigger surface is an absolute co2 threshold with hysteresis (ADR-002); suppressors
+are a raw pm25 read and a per-run duration cap. Scenarios that predate ADR-002 and
+still hold — the rate limit, actuation, and the whole release path from #61 —
+are unchanged from the versions written against the spike-event trigger.
 """
 
+import pathlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,19 +15,23 @@ from awair import db, fans
 from awair.fans import (
     FansConfig,
     MitigationDecision,
+    RunState,
     actuate,
     check_fans,
+    co2_calls_for_fans,
     decide,
     desired_action,
-    events_to_engage,
+    next_run,
+    run_exhausted,
 )
 from tests._helpers import FakeNotifier, fake_url_opener
 
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 
-# Below FAN_SCORE_GATE — the score at which an event is worth spending fans on.
-BAD_SCORE = 70
-GOOD_SCORE = 84
+# Above CO2_FAN_ON, inside the hysteresis band, and below CO2_FAN_OFF.
+CO2_HIGH = 1100.0
+CO2_BAND = 950.0
+CO2_LOW = 500.0
 
 
 @pytest.fixture(autouse=True)
@@ -45,120 +52,41 @@ def _counting(fn, sink):
     return wrapper
 
 
-def _event(metric, tier="relative", fans_engaged=1, event_id=1):
-    """An open event. Latched by default — most fan rules predate the gate."""
-    return {
-        "metric": metric,
-        "tier": tier,
-        "id": event_id,
-        "fans_engaged": fans_engaged,
-    }
+def _run(running=False, started_at=None, capped=False):
+    """A RunState, defaulting to 'fan is off and has no history'."""
+    return RunState(running=running, started_at=started_at, capped=capped)
 
 
-# --- desired_action: spike-event tiers → fan speed ---
+# --- co2_calls_for_fans: the hysteresis band ---
 
 
-def test_no_events_and_clean_air_is_off():
-    action, reason = desired_action({}, latest_pm25=5.0)
-    assert action == "off"
-    assert "no co2/voc spike" in reason
+def test_at_or_above_the_on_threshold_calls_for_fans():
+    assert co2_calls_for_fans(fans.CO2_FAN_ON, running=False) is True
+    assert co2_calls_for_fans(fans.CO2_FAN_ON + 200, running=False) is True
 
 
-def test_single_trigger_relative_yields_speed1():
-    action, reason = desired_action({"co2": _event("co2")}, latest_pm25=5.0)
-    assert action == "speed1"
-    assert "co2" in reason
+def test_below_the_off_threshold_never_calls_for_fans():
+    assert co2_calls_for_fans(fans.CO2_FAN_OFF - 0.1, running=True) is False
+    assert co2_calls_for_fans(CO2_LOW, running=True) is False
 
 
-def test_both_triggers_relative_yield_speed2():
-    action, _ = desired_action(
-        {"co2": _event("co2"), "voc": _event("voc")}, latest_pm25=5.0
-    )
-    assert action == "speed2"
+def test_inside_the_band_holds_whatever_the_fan_is_already_doing():
+    """The band is the whole point: 950 ppm neither starts nor stops a fan.
+
+    Without it, co2 drifting either side of a single threshold would command
+    the fans several times a minute during an ordinary cooking episode.
+    """
+    assert co2_calls_for_fans(CO2_BAND, running=True) is True
+    assert co2_calls_for_fans(CO2_BAND, running=False) is False
 
 
-def test_both_triggers_with_any_ceiling_yield_speed3():
-    action, _ = desired_action(
-        {"co2": _event("co2", tier="ceiling"), "voc": _event("voc")},
-        latest_pm25=5.0,
-    )
-    assert action == "speed3"
+def test_the_off_threshold_is_the_inclusive_edge_of_the_band():
+    # >= CO2_FAN_OFF holds; strictly below releases.
+    assert co2_calls_for_fans(fans.CO2_FAN_OFF, running=True) is True
+    assert co2_calls_for_fans(fans.CO2_FAN_OFF, running=False) is False
 
 
-def test_pm25_suppressor_overrides_active_events():
-    # Fan re-suspends particulate — even with co2 spiking, pm25>=25 wins.
-    action, reason = desired_action(
-        {"co2": _event("co2", tier="ceiling")}, latest_pm25=30.0
-    )
-    assert action == "off"
-    assert "pm25" in reason
-
-
-def test_pm25_at_threshold_boundary_suppresses():
-    action, _ = desired_action({"co2": _event("co2")}, latest_pm25=25.0)
-    assert action == "off"
-
-
-def test_pm25_just_below_threshold_does_not_suppress():
-    action, _ = desired_action({"co2": _event("co2")}, latest_pm25=24.9)
-    assert action == "speed1"
-
-
-def test_missing_pm25_never_suppresses():
-    # Sensor null / cold-boot: don't hallucinate a suppression.
-    action, _ = desired_action({"co2": _event("co2")}, latest_pm25=None)
-    assert action == "speed1"
-
-
-def test_device_metric_events_do_not_trigger_fans():
-    # `device` unreachable/stale events must not be misread as air quality.
-    action, _ = desired_action({"device": _event("device", tier="unreachable")}, 5.0)
-    assert action == "off"
-
-
-def test_pm25_metric_event_does_not_trigger_fans():
-    # PM25 spikes must not turn fans on (still a suppressor at raw threshold).
-    action, _ = desired_action({"pm25": _event("pm25", tier="ceiling")}, 5.0)
-    assert action == "off"
-
-
-# --- desired_action: the score gate (only latched events drive fans) ---
-
-
-def test_unlatched_event_does_not_drive_fans():
-    # A voc spike the score never agreed with: TVOC is elevated but the air is
-    # fine overall. This is the "closed the windows, fans came on" complaint.
-    action, reason = desired_action(
-        {"voc": _event("voc", tier="ceiling", fans_engaged=0)}, latest_pm25=5.0
-    )
-    assert action == "off"
-    assert "no co2/voc spike" in reason
-
-
-def test_only_latched_events_count_toward_speed():
-    # co2 latched, voc not: one effective trigger, so speed1 — not speed2.
-    action, reason = desired_action(
-        {
-            "co2": _event("co2", fans_engaged=1),
-            "voc": _event("voc", fans_engaged=0),
-        },
-        latest_pm25=5.0,
-    )
-    assert action == "speed1"
-    assert "co2" in reason
-    assert "voc" not in reason
-
-
-def test_pm25_suppression_still_beats_a_latched_event():
-    # The latch is a relevance gate, not an override of the safety suppressor.
-    action, reason = desired_action(
-        {"voc": _event("voc", tier="ceiling", fans_engaged=1)}, latest_pm25=30.0
-    )
-    assert action == "off"
-    assert "pm25" in reason
-
-
-# --- the two predicates desired_action composes (#57) ---
+# --- pm25_suppresses / run_exhausted: the two vetoes ---
 
 
 def test_pm25_suppresses_needs_positive_evidence():
@@ -174,67 +102,169 @@ def test_pm25_suppresses_needs_positive_evidence():
     assert fans.pm25_suppresses(fans.PM25_SUPPRESS_THRESHOLD + 100) is True
 
 
-def test_engaged_triggers_returns_only_latched_co2_voc_events():
-    """Trigger metrics only, latch set only, and in FAN_TRIGGERS order."""
-    active = fans.engaged_triggers(
-        {
-            "voc": _event("voc", fans_engaged=1),
-            "co2": _event("co2", fans_engaged=1),
-            "pm25": _event("pm25", fans_engaged=1),  # suppressor, never a trigger
-            "temp": _event("temp", fans_engaged=1),  # not a fan metric at all
-        }
+def test_run_exhausted_needs_a_recorded_start():
+    """No start time means not exhausted — the migration case.
+
+    A fan already running when the cap shipped has no observed start. Treating
+    that as exhausted would cap it the instant the poller restarts; treating it
+    as ancient would cap it forever. It is adopted into a fresh run instead.
+    """
+    assert run_exhausted(None, NOW) is False
+
+
+def test_run_exhausted_at_and_around_the_cap():
+    assert run_exhausted(NOW - fans.FAN_MAX_RUN, NOW) is True  # inclusive
+    assert run_exhausted(NOW - fans.FAN_MAX_RUN + timedelta(seconds=1), NOW) is False
+    assert run_exhausted(NOW - fans.FAN_MAX_RUN * 3, NOW) is True
+
+
+# --- desired_action: co2 + the two vetoes, in precedence order ---
+
+
+def test_clean_air_is_off():
+    verdict = desired_action(CO2_LOW, 5.0, _run(), NOW)
+    assert verdict.action == "off"
+    assert "below" in verdict.reason
+
+
+def test_high_co2_runs_the_fans_at_speed1():
+    verdict = desired_action(CO2_HIGH, 5.0, _run(), NOW)
+    assert verdict.action == fans.FAN_SPEED == "speed1"
+    assert "1100" in verdict.reason
+
+
+def test_pm25_suppressor_overrides_high_co2():
+    # Fans re-suspend particulate — even with co2 well over the line, pm25 wins.
+    verdict = desired_action(CO2_HIGH, fans.PM25_SUPPRESS_THRESHOLD + 5, _run(), NOW)
+    assert verdict.action == "off"
+    assert verdict.reason.startswith(fans.PM25_SUPPRESS_REASON_PREFIX)
+
+
+def test_pm25_just_below_threshold_does_not_suppress():
+    verdict = desired_action(CO2_HIGH, fans.PM25_SUPPRESS_THRESHOLD - 0.1, _run(), NOW)
+    assert verdict.action == "speed1"
+
+
+def test_missing_pm25_never_suppresses():
+    # Sensor null / cold-boot: don't hallucinate a suppression.
+    assert desired_action(CO2_HIGH, None, _run(), NOW).action == "speed1"
+
+
+def test_missing_co2_is_off_not_a_guess():
+    """A stale or absent co2 read must not keep the fans running.
+
+    `check_fans` only passes readings inside CO2_FRESHNESS, so None means the
+    device has gone quiet. Absent data means don't act — the same rule the old
+    score gate followed.
+    """
+    verdict = desired_action(None, 5.0, _run(running=True, started_at=NOW), NOW)
+    assert verdict.action == "off"
+    assert "no fresh co2" in verdict.reason
+
+
+def test_missing_co2_does_not_clear_the_cap():
+    # A sensor gap is not evidence the air recovered; it must not hand back a
+    # fresh 90 minutes of runtime for free.
+    verdict = desired_action(None, 5.0, _run(capped=True), NOW)
+    assert verdict.capped is True
+
+
+def test_pm25_suppression_does_not_clear_the_cap():
+    verdict = desired_action(CO2_HIGH, 500.0, _run(capped=True), NOW)
+    assert verdict.action == "off"
+    assert verdict.capped is True
+
+
+# --- desired_action: the duration cap ---
+
+
+def test_a_run_past_the_cap_is_turned_off_and_latched():
+    run = _run(running=True, started_at=NOW - fans.FAN_MAX_RUN)
+    verdict = desired_action(CO2_HIGH, 5.0, run, NOW)
+    assert verdict.action == "off"
+    assert verdict.capped is True
+    assert "cap" in verdict.reason
+
+
+def test_a_run_inside_the_cap_keeps_going():
+    run = _run(running=True, started_at=NOW - fans.FAN_MAX_RUN + timedelta(minutes=1))
+    verdict = desired_action(CO2_HIGH, 5.0, run, NOW)
+    assert verdict.action == "speed1"
+    assert verdict.capped is False
+
+
+def test_capped_fans_stay_off_while_co2_is_still_high():
+    """The cap has to outlast the episode that triggered it.
+
+    Without the latch the cap defeats itself: it fires at 90 minutes while co2
+    is still 1100, and the very next poll's hysteresis turns the fans back on.
+    """
+    verdict = desired_action(CO2_HIGH, 5.0, _run(capped=True), NOW)
+    assert verdict.action == "off"
+    assert verdict.capped is True
+    assert "capped" in verdict.reason
+
+
+def test_capped_fans_stay_off_inside_the_hysteresis_band():
+    # Recovery is measured against CO2_FAN_OFF, not CO2_FAN_ON — otherwise the
+    # cap would release while co2 is still high enough to immediately re-engage.
+    verdict = desired_action(CO2_BAND, 5.0, _run(capped=True), NOW)
+    assert verdict.action == "off"
+    assert verdict.capped is True
+
+
+def test_the_cap_clears_once_co2_recovers():
+    verdict = desired_action(CO2_LOW, 5.0, _run(capped=True), NOW)
+    assert verdict.action == "off"
+    assert verdict.capped is False
+
+
+def test_fans_may_run_again_after_a_cap_clears():
+    # Recover, then spike again: a new episode gets a fresh run.
+    cleared = desired_action(CO2_LOW, 5.0, _run(capped=True), NOW)
+    assert cleared.capped is False
+    again = desired_action(CO2_HIGH, 5.0, _run(capped=cleared.capped), NOW)
+    assert again.action == "speed1"
+
+
+# --- next_run: the bookkeeping desired_action's verdict implies ---
+
+
+def test_a_new_run_starts_now():
+    started_at, capped = next_run(_run(), fans.Verdict("speed1", "co2", False), NOW)
+    assert started_at == NOW
+    assert capped is False
+
+
+def test_a_continuing_run_keeps_its_original_start():
+    """The cap measures the whole run, not the time since the last poll."""
+    began = NOW - timedelta(minutes=40)
+    started_at, _ = next_run(
+        _run(running=True, started_at=began),
+        fans.Verdict("speed1", "co2", False),
+        NOW,
     )
-    assert [e["metric"] for e in active] == ["co2", "voc"]
-    assert fans.engaged_triggers({"co2": _event("co2", fans_engaged=0)}) == []
-    assert fans.engaged_triggers({}) == []
+    assert started_at == began
 
 
-# --- events_to_engage: which open events latch on this poll ---
+def test_a_fan_found_running_without_a_start_adopts_now():
+    # Migration: the cap measures from when we first knew, rather than never.
+    started_at, _ = next_run(
+        _run(running=True, started_at=None),
+        fans.Verdict("speed1", "co2", False),
+        NOW,
+    )
+    assert started_at == NOW
 
 
-def test_score_below_gate_engages_an_open_trigger():
-    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
-    assert events_to_engage(open_events, latest_score=BAD_SCORE) == [7]
-
-
-def test_score_above_gate_engages_nothing():
-    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
-    assert events_to_engage(open_events, latest_score=GOOD_SCORE) == []
-
-
-def test_score_exactly_at_gate_does_not_engage():
-    # Gate is a strict "drops below 75" — 75 itself is still acceptable air.
-    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
-    assert events_to_engage(open_events, latest_score=fans.FAN_SCORE_GATE) == []
-
-
-def test_missing_score_engages_nothing():
-    # Absent/stale data means don't act. Never hallucinate a bad score.
-    open_events = {"voc": _event("voc", fans_engaged=0, event_id=7)}
-    assert events_to_engage(open_events, latest_score=None) == []
-
-
-def test_already_latched_event_is_not_re_engaged():
-    # Idempotence: the latch is written once, not re-stamped every poll.
-    open_events = {"voc": _event("voc", fans_engaged=1, event_id=7)}
-    assert events_to_engage(open_events, latest_score=BAD_SCORE) == []
-
-
-def test_non_fan_trigger_events_never_engage():
-    # A pm25 or device event must not latch — they aren't fan triggers.
-    open_events = {
-        "pm25": _event("pm25", fans_engaged=0, event_id=7),
-        "device": _event("device", fans_engaged=0, event_id=8),
-    }
-    assert events_to_engage(open_events, latest_score=BAD_SCORE) == []
-
-
-def test_multiple_open_triggers_engage_together():
-    open_events = {
-        "co2": _event("co2", fans_engaged=0, event_id=3),
-        "voc": _event("voc", fans_engaged=0, event_id=4),
-    }
-    assert sorted(events_to_engage(open_events, latest_score=BAD_SCORE)) == [3, 4]
+def test_turning_off_clears_the_run_but_keeps_the_cap_flag():
+    started_at, capped = next_run(
+        _run(running=True, started_at=NOW - timedelta(hours=2)),
+        fans.Verdict("off", "run hit the cap", True),
+        NOW,
+    )
+    assert started_at is None
+    assert capped is True
 
 
 # --- decide: no-op filter + 1-cmd/min per-fan rate limit ---
@@ -245,11 +275,13 @@ def _state(action="off", last_cmd_seconds_ago=3600):
         "fan_id": 1,
         "last_action": action,
         "last_command_at": NOW - timedelta(seconds=last_cmd_seconds_ago),
+        "run_started_at": None,
+        "capped": False,
     }
 
 
 def test_same_action_is_noop():
-    assert decide(1, "off", "no spike", _state("off"), NOW) is None
+    assert decide(1, "off", "co2 low", _state("off"), NOW) is None
 
 
 def test_state_change_within_rate_limit_is_skipped():
@@ -274,32 +306,35 @@ def test_rate_limit_at_exact_boundary_allows():
 def test_fresh_fan_state_never_blocks():
     # A never-set fan state has last_command_at at the 1970 sentinel — must not
     # rate-limit the first-ever command.
-    state = {
-        "fan_id": 1,
-        "last_action": "off",
-        "last_command_at": datetime(1970, 1, 1, tzinfo=UTC),
-    }
-    d = decide(1, "speed1", "co2 spike", state, NOW)
-    assert d is not None
+    state = _state()
+    state["last_command_at"] = datetime(1970, 1, 1, tzinfo=UTC)
+    assert decide(1, "speed1", "co2 spike", state, NOW) is not None
 
 
 def test_pm25_safety_off_bypasses_rate_limit():
-    # Fans were just kicked to speed3 for a co2 spike; 20s later pm25 crosses
+    # Fans were just kicked to speed1 for a co2 spike; 20s later pm25 crosses
     # the suppressor threshold. Waiting the rest of the 60s to turn them off
     # would keep them stirring particulate — the safety-off must fire now.
-    reason = "pm25 40 suppresses fans"
-    d = decide(1, "off", reason, _state("speed3", last_cmd_seconds_ago=20), NOW)
+    reason = "pm25 140 suppresses fans"
+    d = decide(1, "off", reason, _state("speed1", last_cmd_seconds_ago=20), NOW)
     assert d is not None
     assert d.action == "off"
 
 
 def test_non_pm25_off_still_respects_rate_limit():
-    # Ordinary "spike closed → off" transitions are not safety-critical; they
-    # still respect the rate limit.
-    d = decide(
-        1, "off", "no co2/voc spike", _state("speed1", last_cmd_seconds_ago=20), NOW
+    # Ordinary "co2 recovered → off" transitions are not safety-critical; they
+    # still respect the rate limit. The duration cap included: 90 minutes in,
+    # another 40 seconds of fan is not an emergency.
+    assert (
+        decide(
+            1,
+            "off",
+            "run hit the 90 min cap",
+            _state("speed1", last_cmd_seconds_ago=20),
+            NOW,
+        )
+        is None
     )
-    assert d is None
 
 
 # --- actuate: fire-and-forget urllib GET ---
@@ -308,7 +343,7 @@ def test_non_pm25_off_still_respects_rate_limit():
 def test_actuate_hits_the_fan_endpoint():
     calls = []
     ok = actuate(
-        MitigationDecision(fan_id=2, action="speed1", reason="voc"),
+        MitigationDecision(fan_id=2, action="speed1", reason="co2"),
         FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2)),
         opener=fake_url_opener(calls),
     )
@@ -331,29 +366,15 @@ def test_actuate_failure_returns_false():
 # --- check_fans: end-to-end glue over the DB ---
 
 
-def _seed_reading(conn, pm25, ts=NOW, score=BAD_SCORE):
-    """One reading. Score defaults BELOW the gate so fans are free to engage —
-    tests that care about the gate pass GOOD_SCORE explicitly."""
+def _seed_reading(conn, pm25, co2=CO2_LOW, ts=NOW, score=80):
+    """One reading. co2 defaults below the band so fans stay off by default."""
     ts_iso = db.iso_z(ts)
     conn.execute(
         "INSERT INTO readings (ts, received_at, score, co2, voc, pm25)"
         " VALUES (?, ?, ?, ?, ?, ?)",
-        (ts_iso, ts_iso, score, 500, 100, pm25),
+        (ts_iso, ts_iso, score, co2, 100, pm25),
     )
     conn.commit()
-
-
-def _seed_event(conn, metric, tier="relative"):
-    return db.open_event(
-        conn,
-        metric=metric,
-        tier=tier,
-        opened_at=NOW - timedelta(minutes=5),
-        value=1500.0,
-        baseline=500.0,
-        threshold=800.0,
-        notified=True,
-    )
 
 
 def test_disabled_poller_touches_nothing_when_no_fan_is_running(conn):
@@ -367,23 +388,24 @@ def test_disabled_poller_touches_nothing_when_no_fan_is_running(conn):
 
 
 def test_disabled_poller_releases_fans_it_left_running(conn, monkeypatch):
-    # The state on the homelab when #61 was filed: voc-ceiling event 42 open and
-    # latched, both fans at speed1 since 15:22 ET, ten hours and counting. Under
-    # the old early return, disabling mitigation here stranded them at speed1
-    # forever — the complaint the kill switch exists to answer, made permanent.
+    """Disabling must mean "the fans are not running", not "frozen where they were".
+
+    The state on the homelab when #61 was filed: both fans at speed1 for ten
+    hours with the trigger still true. A release that merely asked for
+    `desired_action`'s verdict would get "speed1" back — co2 is still high —
+    no-op against last_action, and strand them exactly as the old early return
+    did. The release is unconditional for that reason, so the fixture keeps co2
+    high to prove it.
+    """
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1, 2))
-    _seed_reading(conn, pm25=5.0)
-    # LATCHED, not merely open. `db.open_event` leaves fans_engaged at its schema
-    # default of 0, and an unlatched event is inert to every fan verdict — so a
-    # fixture without this line lets a release that just delegates to
-    # `desired_action` pass, while on the real box (event 42, fans_engaged=1)
-    # that verdict is "speed1", no-ops against last_action, and strands the fans.
-    db.mark_fans_engaged(conn, _seed_event(conn, "voc", tier="ceiling"))
-    assert db.get_open_events(conn)["voc"]["fans_engaged"]
-    assert desired_action(db.get_open_events(conn), 5.0)[0] == "speed1"
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    assert (
+        desired_action(CO2_HIGH, 5.0, _run(running=True, started_at=NOW), NOW).action
+        == "speed1"
+    )
     for fan_id in (1, 2):
         db.upsert_fan_state(
             conn, fan_id=fan_id, action="speed1", command_at=NOW - timedelta(hours=10)
@@ -425,11 +447,11 @@ def test_release_gives_up_loudly_instead_of_retrying_a_dead_nodemcu_forever(
 ):
     """A release that can never land must stop, and must say so.
 
-    On origin/main a disabled poller made *zero* fan network calls. Routing it
-    through `release_fans` means a NodeMCU that is unplugged — the natural thing
-    to do after "kill that behavior entirely" — would otherwise make the retired
-    path the only thing in this poller still talking to the network, one GET per
-    fan per minute forever, with `if ok:` swallowing every notification.
+    Routing a disabled poller through `release_fans` means a NodeMCU that is
+    unplugged — the natural thing to do after "kill that behavior entirely" —
+    would otherwise make the disabled path the only thing in this poller still
+    talking to the network, one GET per fan per minute forever, with `if ok:`
+    swallowing every notification.
     """
 
     def broken(url, timeout):
@@ -504,21 +526,32 @@ def test_release_keeps_db_truth_and_retries_when_the_nodemcu_is_down(conn, monke
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
-def test_check_fans_drives_both_fans_on_co2_ceiling(conn, monkeypatch):
+def test_check_fans_drives_both_fans_on_high_co2(conn, monkeypatch):
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     notifier = FakeNotifier()
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
-    _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "co2", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
     check_fans(conn, notifier, cfg, NOW)
 
-    # One event open only (co2) => speed1 on both fans.
     urls = [url for url, _ in calls]
     assert urls == ["http://host.local/fan/1/speed1", "http://host.local/fan/2/speed1"]
     assert len(notifier.sent) == 2
     assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
     assert db.get_fan_state(conn, 2)["last_action"] == "speed1"
+    # The run is stamped so the cap has something to measure from.
+    assert db.get_fan_state(conn, 1)["run_started_at"] == NOW
+
+
+def test_check_fans_leaves_fans_off_below_the_threshold(conn, monkeypatch):
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert calls == []
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
 def test_check_fans_forces_off_when_pm25_suppresses(conn, monkeypatch):
@@ -527,16 +560,11 @@ def test_check_fans_forces_off_when_pm25_suppresses(conn, monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     # Seed: fan 1 already at speed1 from an earlier tick, 5 min ago.
     db.upsert_fan_state(
-        conn,
-        fan_id=1,
-        action="speed1",
-        command_at=NOW - timedelta(minutes=5),
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(minutes=5)
     )
-    _seed_reading(conn, pm25=30.0)
-    _seed_event(conn, "co2", tier="ceiling")  # would drive speed3 without pm25
+    _seed_reading(conn, pm25=fans.PM25_SUPPRESS_THRESHOLD + 5, co2=CO2_HIGH)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
-    notifier = FakeNotifier()
-    check_fans(conn, notifier, cfg, NOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
 
     assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
@@ -547,16 +575,11 @@ def test_check_fans_holds_when_rate_limited(conn, monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     # Fan 1 changed 30s ago — inside the 60s cooldown.
     db.upsert_fan_state(
-        conn,
-        fan_id=1,
-        action="off",
-        command_at=NOW - timedelta(seconds=30),
+        conn, fan_id=1, action="off", command_at=NOW - timedelta(seconds=30)
     )
-    _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "co2", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
-    notifier = FakeNotifier()
-    check_fans(conn, notifier, cfg, NOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
 
     assert calls == []
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
@@ -573,8 +596,7 @@ def test_check_fans_actuate_failure_does_not_advance_last_action(conn, monkeypat
         raise OSError("boom")
 
     monkeypatch.setattr("urllib.request.urlopen", broken)
-    _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "co2", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     notifier = FakeNotifier()
     check_fans(conn, notifier, cfg, NOW)
@@ -589,108 +611,213 @@ def test_check_fans_actuate_failure_does_not_advance_last_action(conn, monkeypat
     assert state["last_command_at"] == NOW
 
 
-# --- check_fans: the score gate + latch, end to end ---
-
-
-def test_check_fans_ignores_a_spike_the_score_disagrees_with(conn, monkeypatch):
-    """The bug report: TVOC ceiling breached, but overall air is fine (score 84).
-
-    Closing the windows nudges TVOC up without meaningfully degrading air
-    quality. No fan should move, and no latch should be written.
-    """
+def test_check_fans_ignores_a_stale_co2_reading(conn, monkeypatch):
+    """A co2 read older than CO2_FRESHNESS reads as no data — don't act on it."""
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
-    _seed_reading(conn, pm25=5.0, score=GOOD_SCORE)
-    _seed_event(conn, "voc", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH, ts=NOW - timedelta(hours=1))
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     check_fans(conn, FakeNotifier(), cfg, NOW)
 
     assert calls == []
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
 
 
-def test_check_fans_engages_and_persists_the_latch(conn, monkeypatch):
-    calls = []
-    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
-    _seed_reading(conn, pm25=5.0, score=BAD_SCORE)
-    _seed_event(conn, "voc", tier="ceiling")
-    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
-    check_fans(conn, FakeNotifier(), cfg, NOW)
-
-    assert [url for url, _ in calls] == ["http://host.local/fan/1/speed1"]
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
-
-
-def test_latched_event_keeps_fans_on_after_the_score_recovers(conn, monkeypatch):
-    """The whole point of the latch.
-
-    The score lives astride the gate (p1=73, p5=76 in real data). Once we've
-    committed to running the fans for an event, a score bobbing back over 75
-    must NOT turn them off — that oscillation is what would have Tom fighting
-    the fans.
-    """
+def test_check_fans_releases_fans_when_the_device_goes_quiet(conn, monkeypatch):
+    """Fans running + co2 goes stale => turn them off, don't run on forever."""
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
-
-    # Poll 1: score dips, event latches, fan spins up.
-    _seed_reading(conn, pm25=5.0, score=BAD_SCORE)
-    _seed_event(conn, "voc", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
     check_fans(conn, FakeNotifier(), cfg, NOW)
     assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
 
-    # Poll 2, two minutes later (past the rate limit): score has recovered to 84,
-    # but the event is still open and still latched.
+    # An hour later with no new reading at all.
     calls.clear()
-    later = NOW + timedelta(minutes=2)
-    _seed_reading(conn, pm25=5.0, ts=later, score=GOOD_SCORE)
+    check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(hours=1))
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
+
+
+# --- check_fans: hysteresis and the duration cap, end to end ---
+
+
+def test_fans_keep_running_inside_the_band(conn, monkeypatch):
+    """Once on, co2 sagging to 950 must not turn the fans off and on again."""
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+
+    calls.clear()
+    later = NOW + timedelta(minutes=5)
+    _seed_reading(conn, pm25=5.0, co2=CO2_BAND, ts=later)
     check_fans(conn, FakeNotifier(), cfg, later)
 
-    # No new command at all: desired is still speed1, so decide() no-ops.
-    assert calls == []
+    assert calls == []  # no command at all: desired is still speed1
     assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
 
 
-def test_score_gate_does_not_block_the_pm25_safety_off(conn, monkeypatch):
-    """A good score must never strand the fans ON during a particulate spike."""
+def test_fans_stop_once_co2_drops_below_the_release_threshold(conn, monkeypatch):
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
-    db.upsert_fan_state(
-        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(minutes=5)
-    )
-    # Score is fine, pm25 is not. Suppressor must still force the fan off.
-    _seed_reading(conn, pm25=30.0, score=GOOD_SCORE)
-    _seed_event(conn, "voc", tier="ceiling")
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
     check_fans(conn, FakeNotifier(), cfg, NOW)
 
+    calls.clear()
+    later = NOW + timedelta(minutes=5)
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW, ts=later)
+    check_fans(conn, FakeNotifier(), cfg, later)
+
     assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
+    assert db.get_fan_state(conn, 1)["run_started_at"] is None
+
+
+def test_the_cap_stops_a_run_that_outlasts_it(conn, monkeypatch):
+    """ADR-001's failure mode, bounded: a trigger that stays true all day.
+
+    co2 never recovers, so the hysteresis alone would run the fans
+    indefinitely. The cap ends the run and the latch keeps them off until the
+    air actually improves.
+    """
+    calls = []
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+
+    calls.clear()
+    capped_at = NOW + fans.FAN_MAX_RUN
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH, ts=capped_at)
+    check_fans(conn, FakeNotifier(), cfg, capped_at)
+
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
+    state = db.get_fan_state(conn, 1)
+    assert state["capped"] is True
+    assert state["run_started_at"] is None
+
+    # Still high an hour later: the fans must stay off, not re-engage.
+    calls.clear()
+    for extra in (1, 2, 3):
+        at = capped_at + timedelta(hours=extra)
+        _seed_reading(conn, pm25=5.0, co2=CO2_HIGH, ts=at)
+        check_fans(conn, FakeNotifier(), cfg, at)
+    assert calls == []
     assert db.get_fan_state(conn, 1)["last_action"] == "off"
 
 
-def test_stale_score_does_not_engage_fans(conn, monkeypatch):
-    """A score older than SCORE_FRESHNESS reads as no data — don't act on it."""
+def test_a_cleared_cap_lets_the_next_episode_run(conn, monkeypatch):
+    """The cap is a bound on one run, not a permanent shutdown."""
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
-    # Bad score, but from an hour ago — well outside the freshness window.
-    _seed_reading(conn, pm25=5.0, ts=NOW - timedelta(hours=1), score=BAD_SCORE)
-    _seed_event(conn, "voc", tier="ceiling")
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
-    check_fans(conn, FakeNotifier(), cfg, NOW)
+    db.upsert_fan_state(
+        conn, fan_id=1, action="off", command_at=NOW - timedelta(hours=1)
+    )
+    db.set_fan_run(conn, 1, started_at=None, capped=True)
 
+    # Air recovers: the flag clears even though no command is owed.
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
     assert calls == []
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
+    assert db.get_fan_state(conn, 1)["capped"] is False
+
+    # A later episode runs normally.
+    later = NOW + timedelta(hours=1)
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH, ts=later)
+    check_fans(conn, FakeNotifier(), cfg, later)
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/speed1"]
+
+
+# --- replay: the measured duty cycle is a regression gate (ADR-002) ---
+
+
+FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "co2_summer_2026.txt"
+
+
+def _replay_samples():
+    """`(minutes_from_start, co2)` from the recorded fixture.
+
+    A bare line is a reading one grid step (5 min) after the previous one;
+    `!N` says the next reading is N minutes later instead (a polling outage).
+    """
+    minute, gap, first = 0, None, True
+    for line in FIXTURE.read_text().splitlines():
+        if line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            gap = int(line[1:])
+            continue
+        if first:
+            first = False
+        else:
+            minute += gap if gap is not None else 5
+        gap = None
+        yield minute, float(line)
+
+
+def _replay_duty_cycle():
+    """Fraction of recorded time the shipped rules would have run the fans.
+
+    pm25 is passed as None throughout: the fixture carries co2 only, so this
+    isolates the trigger and the cap. Real duty is lower, because the pm25
+    suppressor can only ever subtract fan-on time.
+    """
+    base = datetime(2026, 7, 11, tzinfo=UTC)
+    run = RunState(running=False, started_at=None, capped=False)
+    on_minutes = total_minutes = 0
+    previous = None
+    for minute, co2 in _replay_samples():
+        now = base + timedelta(minutes=minute)
+        verdict = desired_action(co2, None, run, now)
+        started_at, capped = next_run(run, verdict, now)
+        if previous is not None:
+            # Credit the elapsed interval to the state that held during it.
+            step = min(minute - previous, 10)
+            total_minutes += step
+            on_minutes += step if run.running else 0
+        previous = minute
+        run = RunState(
+            running=verdict.action != "off", started_at=started_at, capped=capped
+        )
+    return on_minutes / total_minutes
+
+
+def test_replay_summer_2026_stays_under_two_percent_duty():
+    """The measurement that justified un-retiring, pinned as a gate (ADR-002).
+
+    ADR-001 retired fan mitigation over a 32% duty cycle. The shipped co2 rules
+    measure 0.62% across the same house's next eight weeks, and this replays
+    that recording through them so a future threshold change cannot quietly
+    walk back toward #61.
+
+    Summer data: windows open, low baseline co2. It is a regression gate on the
+    rules, not a promise about January — see ADR-002.
+    """
+    duty = _replay_duty_cycle()
+    assert 0 < duty < 0.02, f"duty cycle {duty:.1%} over the recorded 8 weeks"
+
+
+def test_replay_would_fail_at_a_lower_threshold(monkeypatch):
+    """Proves the gate above can actually fail.
+
+    At 800 ppm the same recording gives 7.6% — the tuning mistake the gate
+    exists to catch. A test that passes at every threshold would be worthless.
+    """
+    monkeypatch.setattr(fans, "CO2_FAN_ON", 800.0)
+    monkeypatch.setattr(fans, "CO2_FAN_OFF", 700.0)
+    assert _replay_duty_cycle() > 0.02
 
 
 # --- config: env parsing ---
 
 
 def test_config_from_env_defaults_off(monkeypatch):
-    # Each parse test lifts the retirement for itself (monkeypatch is
-    # function-scoped). With it in force these would pass for free — every input
-    # maps to enabled=False — and would stop saying anything about the parse.
-    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     monkeypatch.delenv("AWAIR_FAN_MITIGATION_ENABLED", raising=False)
     monkeypatch.delenv("AWAIR_FAN_HOST", raising=False)
     cfg = fans.config_from_env()
@@ -704,30 +831,29 @@ def test_config_from_env_reads_fan_host(monkeypatch):
     assert fans.config_from_env().fan_host == "10.0.0.10"
 
 
-def test_fan_mitigation_ships_retired(monkeypatch):
+def test_fan_mitigation_ships_live(monkeypatch):
     """The as-shipped default, asserted through behaviour and not monkeypatched.
 
-    Every other retirement test sets `MITIGATION_RETIRED` explicitly, which
-    leaves the value the repo actually ships completely unpinned — a mutation
-    round flipping it to False kept the whole suite green. That is the one
-    constant standing between #61 and the fans coming back on, so it gets a
-    test with nothing patched over it. Un-retiring should have to edit this
-    test on purpose, in the same diff, where a reviewer will see it.
+    The inverse of #61's `test_fan_mitigation_ships_retired`, and load-bearing
+    for the same reason: every other test sets `MITIGATION_RETIRED` explicitly,
+    which would leave the shipped value unpinned. Retiring mitigation again
+    should have to edit this test on purpose, in the same diff, where a
+    reviewer will see it — exactly as un-retiring had to.
     """
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
-    assert fans.MITIGATION_RETIRED is True
-    assert fans.config_from_env().enabled is False
+    assert fans.MITIGATION_RETIRED is False
+    assert fans.config_from_env().enabled is True
 
 
-def test_retirement_overrides_the_enable_flag(monkeypatch, caplog):
-    # The homelab deploy still ships AWAIR_FAN_MITIGATION_ENABLED=true; while
-    # mitigation is retired (#61) that variable must not be able to switch the
-    # fans back on, and it must say so rather than being silently dropped.
+def test_the_kill_switch_still_overrides_the_enable_flag(monkeypatch, caplog):
+    # ADR-002 turned mitigation back on but kept ADR-001's kill switch. Setting it
+    # must still beat the environment, and must say so rather than being
+    # silently dropped.
     monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
     with caplog.at_level("WARNING", logger="awair.fans"):
         assert fans.config_from_env().enabled is False
-    assert "retired (#61)" in caplog.text
+    assert "disabled in code" in caplog.text
 
 
 def test_no_warning_when_the_env_does_not_ask_for_fans(monkeypatch, caplog):
@@ -738,38 +864,27 @@ def test_no_warning_when_the_env_does_not_ask_for_fans(monkeypatch, caplog):
     assert caplog.text == ""
 
 
-def test_lifting_the_retirement_restores_the_enable_flag(monkeypatch):
-    # The whole point of retiring in place rather than deleting the module:
-    # un-retiring is one constant. If this ever fails, "flip it back" is a lie
-    # and the ADR's "reverses if" clause has nothing behind it.
-    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
-    monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
-    assert fans.config_from_env().enabled is True
-
-
-def test_lifting_the_retirement_restores_the_whole_drive_loop(conn, monkeypatch):
-    # End-to-end through config_from_env, not a hand-built FansConfig: proves
-    # the retired machinery is still wired to the env, not just still present.
+def test_the_kill_switch_makes_a_running_poller_release_the_fans(conn, monkeypatch):
+    # End-to-end through config_from_env: setting the switch must not merely
+    # stop driving the fans, it must let go of any it left running (#61).
     calls = []
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener(calls))
-    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
+    monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
     monkeypatch.setenv("AWAIR_FAN_HOST", "host.local")
-    _seed_reading(conn, pm25=5.0)
-    _seed_event(conn, "co2", tier="ceiling")
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(hours=1)
+    )
 
     check_fans(conn, FakeNotifier(), fans.config_from_env(), NOW)
 
-    assert [url for url, _ in calls] == [
-        "http://host.local/fan/1/speed1",
-        "http://host.local/fan/2/speed1",
-    ]
+    assert [url for url, _ in calls] == ["http://host.local/fan/1/off"]
 
 
 def test_config_from_env_enabled_is_strict(monkeypatch):
     # Anything other than the literal "true" (case-insensitive) is off — a
     # partial rename (e.g. "on") must never accidentally activate fans.
-    monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "on")
     assert fans.config_from_env().enabled is False
 
@@ -817,39 +932,35 @@ def test_run_fan_test_does_not_record_state_on_actuate_failure(conn):
 
 
 def test_check_fans_logs_pm25_near_miss(conn, monkeypatch, caplog):
-    """A pm25 reading at/above 15 is INFO-logged even when no fan candidacy exists."""
+    """A pm25 reading at/above the watchpoint is logged even with no candidacy."""
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
-    _seed_reading(conn, pm25=17.0)  # no open events -> no candidacy, just a near-miss
+    near_miss = fans.PM25_NEAR_MISS_THRESHOLD + 2
+    _seed_reading(conn, pm25=near_miss, co2=CO2_LOW)  # no candidacy, just a near-miss
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
     hits = [r for r in caplog.records if "pm25 near-miss" in r.message]
     assert len(hits) == 1
-    assert "17" in hits[0].message
+    assert f"{near_miss:g}" in hits[0].message
     # Suppressor threshold echoed so the log line is self-describing.
-    assert "25" in hits[0].message
+    assert f"{fans.PM25_SUPPRESS_THRESHOLD:g}" in hits[0].message
 
 
 def test_check_fans_does_not_log_near_miss_below_threshold(conn, monkeypatch, caplog):
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
-    _seed_reading(conn, pm25=10.0)
+    _seed_reading(conn, pm25=fans.PM25_NEAR_MISS_THRESHOLD - 1, co2=CO2_LOW)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
     assert not any("near-miss" in r.message for r in caplog.records)
 
 
-def test_check_fans_logs_candidacy_when_engaged_and_suppressor_passes(
+def test_check_fans_logs_candidacy_when_the_suppressor_passes(
     conn, monkeypatch, caplog
 ):
-    """An engaged event + clean pm25 records the value + a 'passed' verdict."""
+    """High co2 + clean pm25 records the value and a 'passed' verdict."""
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
-    _seed_reading(conn, pm25=8.0)
-    _seed_event(conn, "co2")  # opens with fans_engaged=1 via _seed_event default? no
-    # _seed_event doesn't set the latch; the score-gate path does. Emulate by
-    # writing the latch directly.
-    conn.execute("UPDATE alert_events SET fans_engaged=1")
-    conn.commit()
+    _seed_reading(conn, pm25=8.0, co2=CO2_HIGH)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
@@ -857,31 +968,39 @@ def test_check_fans_logs_candidacy_when_engaged_and_suppressor_passes(
     assert len(candidacy) == 1
     assert "pm25=8" in candidacy[0].message
     assert "suppressor=passed" in candidacy[0].message
+    assert "action=speed1" in candidacy[0].message
 
 
-def test_check_fans_logs_candidacy_when_suppressor_fires(conn, monkeypatch, caplog):
-    """Engaged event + pm25>=25 records the value + 'fired' verdict + action=off."""
+def test_check_fans_logs_candidacy_when_the_suppressor_fires(conn, monkeypatch, caplog):
+    """High co2 + high pm25 records the value, 'fired', and action=off."""
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
-    _seed_reading(conn, pm25=30.0)
-    _seed_event(conn, "co2")
-    conn.execute("UPDATE alert_events SET fans_engaged=1")
-    conn.commit()
+    dirty = fans.PM25_SUPPRESS_THRESHOLD + 20
+    _seed_reading(conn, pm25=dirty, co2=CO2_HIGH)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
     candidacy = [r for r in caplog.records if "fan-on candidacy" in r.message]
     assert len(candidacy) == 1
-    assert "pm25=30" in candidacy[0].message
+    assert f"pm25={dirty:g}" in candidacy[0].message
     assert "suppressor=fired" in candidacy[0].message
     assert "action=off" in candidacy[0].message
 
 
-def test_check_fans_no_candidacy_log_when_no_engaged_event(conn, monkeypatch, caplog):
-    """A near-miss without an engaged event logs the near-miss but not a candidacy."""
+def test_check_fans_no_candidacy_log_when_co2_is_low(conn, monkeypatch, caplog):
+    """A near-miss without a co2 candidacy logs the near-miss but no candidacy."""
     monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
-    _seed_reading(conn, pm25=18.0)  # near-miss zone but no open event
+    _seed_reading(conn, pm25=fans.PM25_NEAR_MISS_THRESHOLD + 5, co2=CO2_LOW)
     cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
     assert not any("fan-on candidacy" in r.message for r in caplog.records)
     assert any("pm25 near-miss" in r.message for r in caplog.records)
+
+
+def test_candidacy_is_logged_once_per_poll_not_once_per_fan(conn, monkeypatch, caplog):
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2, 3))
+    caplog.set_level("INFO", logger="awair.fans")
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    assert len([r for r in caplog.records if "fan-on candidacy" in r.message]) == 1

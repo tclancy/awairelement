@@ -107,9 +107,15 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
 
 
 def _fan_mitigation_status(fans_config) -> str:
-    """One word for the startup banner: on, off, or retired (#61)."""
+    """One word for the startup banner: on, off, or disabled-in-code.
+
+    The third state survives ADR-002 (which turned mitigation back on) because the
+    kill switch survives: "disabled in code" and "off" have different fixes, and
+    a banner that conflated them would send you to the Ansible variable when the
+    answer is a constant in `awair.fans`.
+    """
     if fans.MITIGATION_RETIRED:
-        return "retired (#61)"
+        return "disabled in code"
     return "on" if fans_config.enabled else "off"
 
 
@@ -159,10 +165,10 @@ def main(argv=None) -> None:
         url,
         interval,
         db_path,
-        # "retired" is a third state, not a synonym for "off": once the homelab
-        # env stops setting AWAIR_FAN_MITIGATION_ENABLED=true the warning in
-        # config_from_env never fires again, and this line would be the only
-        # thing distinguishing #61 from someone having simply left fans off.
+        # "disabled in code" is a third state, not a synonym for "off": the
+        # warning in config_from_env only fires when the env still asks for
+        # fans, so this line is the only thing that tells a code-level kill
+        # switch apart from someone having simply left the Ansible flag false.
         _fan_mitigation_status(fans_config),
     )
 

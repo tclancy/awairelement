@@ -71,6 +71,13 @@ omitted entirely to run without alerts.
 | `AWAIR_NTFY_TOPIC` | `awair` | ntfy topic name. Pick your own. |
 | `AWAIR_NTFY_TOKEN` | *(unset)* | Access token if your topic is protected. Empty string = no auth header sent. |
 | `AWAIR_TZ` | `UTC` | IANA zone (e.g. `America/New_York`) for the dashboard's sunrise/sunset markers. Ignored if `AWAIR_LAT` / `AWAIR_LON` are unset. |
+| `AWAIR_FAN_MITIGATION_ENABLED` | `false` | Drive the ceiling fans on high CO2. See [Fan mitigation](#fan-mitigation). |
+| `AWAIR_FAN_HOST` | `192.168.68.68` | The NodeMCU that relays fan commands. |
+| `AWAIR_CO2_FAN_ON` | `1000` | ppm at or above which the fans come on. |
+| `AWAIR_CO2_FAN_OFF` | `900` | ppm below which they go off again. The gap between the two is deliberate — see [Fan mitigation](#fan-mitigation). |
+| `AWAIR_FAN_MAX_RUN_MINUTES` | `90` | Longest single fan run, regardless of CO2. |
+| `AWAIR_PM25_SUPPRESS` | `100` | pm25 (µg/m³) at or above which fans are blocked outright. |
+| `AWAIR_PM25_NEAR_MISS` | `50` | pm25 at or above which a watchpoint line is logged. Behaviour-neutral. |
 
 To disable ntfy entirely, leave `AWAIR_NTFY_TOKEN` unset and pick a topic
 nobody's listening on — the poller will still POST but no one will see the
@@ -191,43 +198,62 @@ stays Celsius).
 If your checkout isn't at `~/sources/awairelement`, edit `WorkingDirectory=`
 and `ExecStart=` in each unit before symlinking.
 
-### Fan mitigation — retired
+### Fan mitigation
 
-Automatic fan mitigation (issues #10 / #14) is **retired** as of
-[#61](https://github.com/tclancy/awairelement/issues/61). The poller does not
-drive the ceiling fans, and `AWAIR_FAN_MITIGATION_ENABLED=true` no longer
-re-enables it — `awair.fans.MITIGATION_RETIRED` overrides the variable and logs
-a warning if a deploy still sets it.
+With `AWAIR_FAN_MITIGATION_ENABLED=true` the poller runs the ceiling fans while
+CO2 is high. **On at 1000 ppm, off below 900**, one speed, and never for more
+than 90 minutes at a stretch.
 
-Why: measured over 303 hours, the fans ran 97 of them — a 32% duty cycle, 25
-hours of it overnight, with one unbroken 34-hour span. Spike events in this
-house last half a day, so "mitigate the spike" meant "run the fans a third of
-the time". Full reasoning and the condition under which we'd bring it back:
-[ADR-001](docs/decisions/001-retire-automatic-fan-mitigation.md).
+Three rules, in precedence order:
 
-A poller running with mitigation off **releases** the fans: any fan it still
-believes it left running gets one `off` command on the next poll that stores a
-reading, then it stops touching them. (No reading, no release — if the Awair is
-unreachable the fans stay put until it recovers.) Turning a fan on at the wall
-afterwards is safe: the poller will not fight you. If the NodeMCU can't be
-reached it retries a handful of times, then sends one high-priority ntfy asking
-you to use the wall switch rather than retrying forever.
+1. **PM2.5 suppresses.** At or above 100 µg/m³ the fans are blocked, and a
+   running fan is forced off immediately — bypassing the rate limit, because
+   fans re-suspend settled dust and that is the exact failure this prevents.
+2. **The duration cap.** A run is bounded at `AWAIR_FAN_MAX_RUN_MINUTES`, after
+   which the fans stay off until CO2 recovers below the off-threshold — not
+   just until the 90 minutes elapse, or the fans would come straight back on.
+3. **The CO2 band.** On at or above `AWAIR_CO2_FAN_ON`, off below
+   `AWAIR_CO2_FAN_OFF`, hold in between. The gap is what stops the fans
+   chattering as CO2 wanders across a single line at 30-second polls.
 
-The machinery is intact and fully tested. Re-enabling is three deliberate edits —
-`MITIGATION_RETIRED = False`, the `test_fan_mitigation_ships_retired` test that
-pins it, and the homelab `awair_fan_mitigation_enabled` variable — plus whatever
-change made it worth having again; see the ADR. `AWAIR_FAN_HOST` (default
-`192.168.68.68`, the NodeMCU on the LAN) still configures where commands go.
+A missing or stale reading (older than 5 minutes) means **off** for both CO2
+and PM2.5 — absent data is never treated as good news.
+
+Why these numbers: fan mitigation was retired in
+[#61](https://github.com/tclancy/awairelement/issues/61) after running the fans
+32% of the time, and un-retired on this trigger only after measuring it against
+eight weeks of real readings — **0.62% duty cycle, 7 runs, longest 1.5 hours,
+no overnight running**. The reasoning, the measurements and what would reverse
+it again: [ADR-002](docs/decisions/002-co2-only-fan-mitigation.md).
+
+`tests/fixtures/co2_summer_2026.txt` holds that recording, and
+`test_replay_summer_2026_stays_under_two_percent_duty` replays it through the
+shipped rules on every test run — so lowering a threshold too far fails the
+suite rather than surprising you in the kitchen. It is summer data; a winter
+re-measurement is owed.
+
+**Turning it off.** Unset the env var, or set
+`awair.fans.MITIGATION_RETIRED = True` for a code-level kill switch that beats
+the environment (it logs a warning if a deploy still asks for fans, and the
+startup banner reads `disabled in code` rather than `off` — the two have
+different fixes). Either way a poller with mitigation off **releases** the
+fans: any fan it still believes it left running gets one `off` command on the
+next poll that stores a reading, then it stops touching them. (No reading, no
+release — if the Awair is unreachable the fans stay put until it recovers.)
+Turning a fan on at the wall afterwards is safe: the poller will not fight you.
+If the NodeMCU can't be reached it retries a handful of times, then sends one
+high-priority ntfy asking you to use the wall switch rather than retrying
+forever.
 
 Smoke-test the fan + ntfy plumbing — `--test` deliberately ignores every gate
-above, including the retirement:
+above, including the kill switch:
 
 ```bash
 python -m awair.poller --test   # fans to speed1, sends "Fan test", exits
 ```
 
-A running poller releases them off again on the next poll or two that stores a
-reading (after the 60s rate limit).
+A running poller with mitigation off releases them again on the next poll or
+two that stores a reading (after the 60s rate limit).
 
 ## Deploy (homelab)
 `restart.sh` in the repo root runs `uv sync --frozen` and restarts both units
