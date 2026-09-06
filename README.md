@@ -102,6 +102,68 @@ ingestion, so a wrong URL or 401 just gets logged.)
 - **Dashboard** — small multiples for CO2, TVOC, PM2.5, temp, humidity, and
   score over 7d or 30d. Detected events overlay as shaded spans. LAN-only by
   default (no auth).
+- **`GET /api/latest`** — the newest reading plus every open event, as
+  read-only JSON, for the house hub to poll (#70). awairelement stays the
+  system of record; the hub stores nothing and derives its own card colour
+  from `score`. Two things about this endpoint differ from its siblings on
+  purpose, because it feeds a machine rather than a browser: it is **always
+  Celsius whatever `TEMPERATURE_UNIT` says** (and says so, via `temp_unit`),
+  and it publishes **both** timestamps — `ts` is the Element's clock, for a
+  human to read as "as of", while `received_at` is this machine's and is the
+  one a consumer should measure staleness against. Measuring age off `ts`
+  alone is a subtraction across two clocks: a device running fast yields a
+  negative age, so a dead poller would render healthy forever. An empty
+  `readings` table answers 200 with `"reading": null`, not an error, so a
+  consumer can tell "up, but the poller is dead" from "unreachable".
+  `open_events` carries **spike events only** — the device-health event
+  `poller.handle_device_health` opens (`metric="device"`, no peak/baseline/
+  threshold) is filtered out, because a consumer learns the same thing earlier
+  from `received_at` going stale and publishing it would make three numeric
+  fields nullable for everyone.
+
+- **`GET /api/outdoor-latest`** — the newest outdoor reading, whole, as
+  read-only JSON, for the house hub's weather card (#71). The outdoor sibling
+  of `/api/latest` and it inherits both of that endpoint's machine-facing
+  rules: **source units regardless of `TEMPERATURE_UNIT`**, and an empty table
+  answers 200 with `"reading": null` rather than an error.
+
+  It publishes **three** clocks. `ts` is Open-Meteo's publish time for the
+  weather block (what a human reads as "as of"); `received_at` is this
+  machine's poll time and is the one to measure staleness against; and `aq_ts`
+  dates the *air-quality* half specifically. That third one is the
+  non-obvious one: air quality is CAMS-backed and hourly while weather is
+  quarter-hourly, so a row stamped 14:15 routinely carries a `us_aqi` measured
+  at 13:00. Before #71 that timestamp was parsed and thrown away, so a card
+  saying "as of 14:15" over an hour-old AQI had no way to know better. A NULL
+  `aq_ts` means the AQI has no known observation time — the air-quality fetch
+  failed for that poll, or the row predates #71 — and the hub is expected to
+  read that as *"no current AQI"* (yellow) rather than folding an undateable
+  number into a green.
+
+  Four units are named in the payload — `temp_unit`, `pressure_unit`,
+  `wind_speed_unit`, `precipitation_unit` — and they are the four somebody
+  converts. #71's own motivating card reads `62°F, 8 mph, 0.00 in`, so the hub
+  turns Celsius into F, km/h into mph and mm into inches; and this app
+  separately turns hPa into inHg at the `/api/outdoor-series` boundary and
+  Celsius into F at every browser-facing one. Each of those is a silent
+  multiply on a number the card exists to display, and an unlabelled payload
+  gives a consumer no way to notice it guessed wrong.
+
+  The particulate and gas fields are deliberately **not** labelled. They have
+  one spelling everywhere (Open-Meteo's native µg/m³), `us_aqi` is a
+  dimensionless index and `humid` a percent, and nothing on either side of this
+  contract converts them — so naming them would be documentation rather than
+  disambiguation, and this paragraph is that documentation.
+
+  `weather_code` is the WMO interpretation code as the **integer** the source
+  published. The code→word mapping is the hub's, for the same reason
+  `/api/latest` ships open events rather than a card colour: awairelement is
+  the system of record and publishes facts, the consumer renders. Rows written
+  before #71 carry NULL for both new columns — the migration deliberately does
+  not backfill either, since inventing an observation time is precisely what
+  `aq_ts` exists to prevent. **Expect NULLs for the first quarter-hour after
+  deploy**, until the outdoor poller writes its first post-migration row. That
+  is correct behaviour and it will look like a bug to whoever is watching.
 
 ## Running as a systemd user service
 
