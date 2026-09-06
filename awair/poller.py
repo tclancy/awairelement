@@ -9,7 +9,6 @@ import argparse
 import json
 import logging
 import os
-import time
 import urllib.request
 from datetime import UTC, datetime
 
@@ -21,6 +20,7 @@ from awair.fans import (
     run_fan_test,
 )
 from awair.monitor import DeviceHealth, check_metrics
+from awair.shutdown import install_handler
 
 log = logging.getLogger("awair.poller")
 
@@ -172,19 +172,29 @@ def main(argv=None) -> None:
         _fan_mitigation_status(fans_config),
     )
 
-    while True:
-        status = poll_once(conn, fetch)
-        log.log(
-            logging.INFO if status == "inserted" else logging.WARNING,
-            "poll: %s",
-            status,
-        )
-        now = datetime.now(UTC)
-        if status == "inserted":
-            check_metrics(conn, notifier, now)
-            check_fans(conn, notifier, fans_config, now)
-        handle_device_health(conn, notifier, health, status, now)
-        time.sleep(interval)
+    # Stop on SIGTERM rather than being killed mid-loop (#83): being killed
+    # exits non-zero, which systemd reports as a failure on every restart.
+    stop = install_handler()
+    try:
+        while not stop.is_set():
+            status = poll_once(conn, fetch)
+            log.log(
+                logging.INFO if status == "inserted" else logging.WARNING,
+                "poll: %s",
+                status,
+            )
+            now = datetime.now(UTC)
+            if status == "inserted":
+                check_metrics(conn, notifier, now)
+                check_fans(conn, notifier, fans_config, now)
+            handle_device_health(conn, notifier, health, status, now)
+            # Returns True the moment a signal lands, so a deploy does not wait
+            # out the rest of the interval. A poll already under way finishes.
+            if stop.wait(interval):
+                break
+    finally:
+        conn.close()
+    log.info("poller stopped cleanly")
 
 
 if __name__ == "__main__":

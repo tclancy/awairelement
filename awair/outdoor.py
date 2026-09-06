@@ -17,12 +17,12 @@ IGNORE, so a re-poll before Open-Meteo refreshes writes nothing.
 import json
 import logging
 import os
-import time
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 
 from awair import db
+from awair.shutdown import install_handler
 
 log = logging.getLogger("awair.outdoor")
 
@@ -252,14 +252,23 @@ def main() -> None:
         "polling Open-Meteo every %ss for (%s, %s) into %s", interval, lat, lon, db_path
     )
 
-    while True:
-        status = poll_once(conn, fetch_weather, fetch_air_quality)
-        log.log(
-            logging.INFO if status in ("inserted", "duplicate") else logging.WARNING,
-            "outdoor poll: %s",
-            status,
-        )
-        time.sleep(interval)
+    # Same clean-shutdown contract as the indoor poller (#83).
+    stop = install_handler()
+    try:
+        while not stop.is_set():
+            status = poll_once(conn, fetch_weather, fetch_air_quality)
+            log.log(
+                logging.INFO
+                if status in ("inserted", "duplicate")
+                else logging.WARNING,
+                "outdoor poll: %s",
+                status,
+            )
+            if stop.wait(interval):
+                break
+    finally:
+        conn.close()
+    log.info("outdoor poller stopped cleanly")
 
 
 if __name__ == "__main__":

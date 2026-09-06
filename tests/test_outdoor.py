@@ -2,6 +2,9 @@
 
 import json
 import logging
+import os
+import signal
+import time
 from urllib.error import URLError
 
 import pytest
@@ -244,34 +247,44 @@ def test_require_env_returns_value(monkeypatch):
     assert _require_env("AWAIR_LAT") == "43.1"
 
 
-def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
-    """Drive main() through one loop iteration by making time.sleep bail out."""
+def test_main_polls_once_then_exits_cleanly_on_sigterm(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """A SIGTERM finishes the poll in flight and returns — it does not raise (#83).
+
+    Outdoor logged four of these false failures in a week against the indoor
+    poller's three, and for the same reason: no handler, so systemd's stop
+    signal killed it mid-loop. The previous version of this test broke the loop
+    by making `time.sleep` raise, which is that exact non-zero exit.
+    """
     monkeypatch.setenv("AWAIR_LAT", "43.1")
     monkeypatch.setenv("AWAIR_LON", "-70.9")
     monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
-    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "1")
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "900")
 
-    # Both fetchers succeed so poll_once returns 'inserted' (INFO branch).
+    # Both fetchers succeed so poll_once returns 'inserted' (INFO branch); the
+    # weather one also asks to stop, standing in for systemd mid-poll.
+    def weather_then_sigterm():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return WEATHER_TEXT
+
     monkeypatch.setattr(
         outdoor,
         "make_fetch",
         lambda url: (
-            (lambda: WEATHER_TEXT)
+            weather_then_sigterm
             if "air-quality" not in url
             else (lambda: AIR_QUALITY_TEXT)
         ),
     )
 
-    class Stop(Exception):
-        pass
+    started = time.monotonic()
+    outdoor.main()  # returns normally; must not raise
+    # The interval is 900 s. Returning promptly proves the wait was interrupted.
+    assert time.monotonic() - started < 10
 
-    def stop(_seconds):
-        raise Stop
-
-    monkeypatch.setattr(outdoor.time, "sleep", stop)
-    with pytest.raises(Stop):
-        outdoor.main()
-    # One row landed — proves poll_once was invoked with a real connection.
+    # One row landed — proves poll_once was invoked with a real connection and
+    # the signal did not abandon the poll half-done.
     conn = outdoor.db.connect(str(tmp_path / "out.db"))
     try:
         assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
