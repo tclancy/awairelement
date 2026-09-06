@@ -224,7 +224,82 @@ NOW = datetime(2026, 7, 12, 12, 0, tzinfo=UTC)
 
 def test_fan_state_schema_present(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(fan_state)")}
-    assert cols == {"fan_id", "last_action", "last_command_at"}
+    assert cols == {
+        "fan_id",
+        "last_action",
+        "last_command_at",
+        "run_started_at",
+        "capped",
+    }
+
+
+def test_connect_adds_run_columns_to_legacy_fan_state(tmp_path):
+    """The duration cap's bookkeeping lands on a DB that predates it (ADR-002).
+
+    A live box has fan_state rows written before the cap existed. The ALTER
+    must supply defaults rather than a bare NOT NULL, and a fan recorded as
+    running must migrate to "no known start" — `run_exhausted` reads that as
+    not-yet-exhausted, so the next poll adopts it rather than capping it on a
+    start time nobody ever observed.
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE fan_state ("
+        " fan_id INTEGER PRIMARY KEY, last_action TEXT NOT NULL,"
+        " last_command_at TEXT NOT NULL)"
+    )
+    legacy.execute(
+        "INSERT INTO fan_state (fan_id, last_action, last_command_at)"
+        " VALUES (1, 'speed1', ?)",
+        (NOW.isoformat(),),
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(fan_state)")}
+    assert {"run_started_at", "capped"} <= cols
+    state = db.get_fan_state(conn, 1)
+    assert state["last_action"] == "speed1"  # pre-existing state survives
+    assert state["run_started_at"] is None
+    assert state["capped"] is False
+
+
+def test_set_fan_run_round_trips(conn):
+    db.set_fan_run(conn, fan_id=1, started_at=NOW, capped=True)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["run_started_at"] == NOW
+    assert state["capped"] is True
+
+    db.set_fan_run(conn, fan_id=1, started_at=None, capped=False)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["run_started_at"] is None
+    assert state["capped"] is False
+
+
+def test_set_fan_run_leaves_the_command_state_alone(conn):
+    """Run bookkeeping must not disturb what the fan is doing.
+
+    `_drive_one` writes the run before `_command_fan` decides anything, so if
+    this clobbered last_action the no-op filter would compare against the wrong
+    value and re-send commands the fan is already obeying.
+    """
+    db.upsert_fan_state(conn, fan_id=1, action="speed1", command_at=NOW)
+    db.set_fan_run(conn, fan_id=1, started_at=NOW, capped=True)
+    state = db.get_fan_state(conn, fan_id=1)
+    assert state["last_action"] == "speed1"
+    assert state["last_command_at"] == NOW
+
+
+def test_set_fan_run_creates_a_row_for_an_unknown_fan(conn):
+    # First poll after a fresh install writes the run before any command.
+    db.set_fan_run(conn, fan_id=9, started_at=NOW, capped=False)
+    state = db.get_fan_state(conn, fan_id=9)
+    assert state["last_action"] == "off"
+    assert state["run_started_at"] == NOW
 
 
 def test_fan_state_rejects_out_of_domain_action(conn):

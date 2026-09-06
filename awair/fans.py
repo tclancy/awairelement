@@ -1,38 +1,40 @@
-"""Ceiling-fan mitigation: turn fans on when CO2/TVOC spike, off otherwise.
+"""Ceiling-fan mitigation: run the fans while CO2 is high, off otherwise.
 
-**Automatic mitigation is RETIRED (#61).** `MITIGATION_RETIRED` below forces
-`config_from_env()` to report disabled no matter what the environment asks for,
-and a disabled poller now *releases* the fans rather than freezing them.
+Mitigation was retired in #61 and is **live again as of ADR-002**, on a different
+trigger. The retired design fired off co2/voc *spike events* — thresholds
+relative to a rolling baseline, latched by the Awair score. Measured over 303 h
+that ran the fans 32% of the time, because a voc-ceiling event in this house
+stays open for half a day. See
+`docs/decisions/001-retire-automatic-fan-mitigation.md`.
 
-Everything from `events_to_engage` down to `_log_pm25_observability` therefore
-has **no production caller** — it is intact and fully tested, not live. Tests
-are the only thing keeping it honest. Un-retiring means three edits, not one:
-this constant, `test_fan_mitigation_ships_retired` (which pins the shipped
-value on purpose), and homelab's `awair_fan_mitigation_enabled`. See
-`docs/decisions/001-retire-automatic-fan-mitigation.md`. The rest of this
-docstring describes the machinery as it behaves when un-retired.
+The trigger is now a single absolute number: **co2 >= CO2_FAN_ON (1000 ppm)**,
+with hysteresis releasing at CO2_FAN_OFF. An absolute threshold means the same
+thing in July and January, where a baseline-relative one drifts with the season.
+Replayed over the 1365 h to 2026-09-06, the shipped rules run the fans 8.4 h —
+a **0.62% duty cycle** across 7 runs, longest 1.5 h, none of it overnight. That
+is the transient-burst behaviour #14 assumed and voc never had.
+`docs/decisions/002-co2-only-fan-mitigation.md` records the reversal, and
+`test_replay_summer_2026_stays_under_two_percent_duty` keeps it honest.
 
-The trigger surface reuses `awair.spikes` events, but an open co2/voc event is not
-enough on its own: it must also have **latched** (`fans_engaged`), which happens the
-first time the Awair score drops below FAN_SCORE_GATE while that event is open. A
-spike the score never agreed with never moves a fan.
+Three numbers, because they are easy to confuse: the bare threshold (co2 >=
+1000, no hysteresis) covers 0.7% of the recording; adding hysteresis down to
+900 raises it to 1.29%, since a run holds through the sags that would otherwise
+end it; adding the cap brings it to 0.62%.
 
-The latch is write-once per event, and deliberately so. The score hovers right around
-the gate (p1=73, p5=76 in practice), so re-deciding every poll would oscillate the
-fans — and would re-engage them after a manual shutoff at the wall. Latching means we
-form an opinion exactly once per event; `decide()`'s no-op filter then guarantees we
-never re-command a fan the user has overridden.
+Two things outrank the trigger, in this order:
 
-PM2.5 remains a **suppressor** outranking all of it — an elevated pm25 reading blocks
-turn-on and forces any running fan off, because fans re-suspend particulate and would
-worsen the local reading. See issue #10 for the design memo.
+- **pm25 suppression** — particulate at or above PM25_SUPPRESS_THRESHOLD blocks
+  turn-on and forces a running fan off, because fans re-suspend settled dust.
+- **the duration cap** — FAN_MAX_RUN bounds one run regardless of co2; once
+  capped the fans stay off until co2 recovers below CO2_FAN_OFF.
 
 Split cleanly for testability:
 
-- `events_to_engage(open_events, latest_score)` — pure; which events latch now.
-- `engaged_triggers(open_events)` — pure; the already-latched co2/voc events.
+- `co2_calls_for_fans(latest_co2, running)` — pure; the hysteresis band.
 - `pm25_suppresses(latest_pm25)` — pure; does particulate veto the fans.
-- `desired_action(open_events, latest_pm25)` — pure verdict from sensor state.
+- `run_exhausted(started_at, now)` — pure; has this run hit the cap.
+- `desired_action(latest_co2, latest_pm25, run, now)` — pure verdict.
+- `next_run(run, verdict, now)` — pure; run bookkeeping to persist.
 - `decide(fan_id, action, reason, state, now)` — rate-limit + no-op filter.
 - `actuate(decision, config, opener)` — thin urllib GET at the NodeMCU endpoint.
 - `release_fans(conn, notifier, config, now)` — let go of any fan we left running.
@@ -49,37 +51,71 @@ from awair import db
 
 log = logging.getLogger("awair.fans")
 
-FAN_TRIGGERS = ("co2", "voc")
-PM25_SUPPRESS_THRESHOLD = 25.0
+
+def _env_float(name: str, default: float) -> float:
+    """Read one tunable from the environment, falling back to `default`.
+
+    Read at import because systemd sets the environment before the process
+    starts, and a malformed value should crash the poller at boot rather than
+    surface as a strange fan decision hours later.
+
+    These are env-tunable at all because CO2_FAN_ON sits close to the measured
+    p99 (see below): if a winter baseline shift makes 1000 too eager, the fix
+    should be a one-line env change and a restart, not a code deploy.
+    """
+    raw = os.environ.get(name)
+    return default if raw is None else float(raw)
+
+
+# Fans come on at CO2_FAN_ON and do not go off again until CO2_FAN_OFF. A single
+# threshold chatters: polls are 30 s apart and the median episode is ~10 minutes
+# of co2 wandering back and forth across the line.
+CO2_FAN_ON = _env_float("AWAIR_CO2_FAN_ON", 1000.0)
+CO2_FAN_OFF = _env_float("AWAIR_CO2_FAN_OFF", 900.0)
+# One trigger, one speed. The old speed1/2/3 ladder ranked co2+voc combinations
+# and has nothing left to rank; max observed co2 was 1408, so a magnitude ladder
+# would leave speed3 permanently unreachable anyway.
+FAN_SPEED = "speed1"
+# Trust co2 only within this window — the fans must not keep running on a
+# half-hour-old reading because the device dropped off the network.
+CO2_FRESHNESS = timedelta(minutes=5)
+# Raised 25 -> 100 in ADR-002. At 25 the suppressor vetoed 36.9% of fan-worthy time:
+# cooking drives co2 and particulate together, so the old threshold switched the
+# feature off in exactly the conditions that called for it. At 100 it vetoes
+# 21.2% — still substantial, and still the smokiest fifth. Env-tunable because
+# that trade is a judgement call about these fans in this kitchen, and 150
+# (6.7%) or no suppressor at all are both defensible settings.
+PM25_SUPPRESS_THRESHOLD = _env_float("AWAIR_PM25_SUPPRESS", 100.0)
 PM25_SUPPRESS_REASON_PREFIX = "pm25 "  # decide() uses this to detect safety-off
 # Near-miss watchpoint: pm25 readings at or above this value are logged so we
 # can see how close the suppressor is to firing without changing behavior.
-# Threshold-review context in #15 — max observed pm25 was 19 over 7 days, so
-# 15 is a floor above p99.9 noise (=17) and 10 below the suppressor.
-PM25_NEAR_MISS_THRESHOLD = 15.0
+# Re-based for the 100 suppressor (ADR-002) from 8 weeks of readings: p99 = 44,
+# p99.9 = 142, so 50 is a floor above ordinary noise and 50 below the
+# suppressor. Left at 15 it would have fired on 3.4% of all polls — a watchpoint
+# nobody reads is a watchpoint that never warns.
+PM25_NEAR_MISS_THRESHOLD = _env_float("AWAIR_PM25_NEAR_MISS", 50.0)
 RATE_LIMIT = timedelta(seconds=60)
 # Trust pm25 only within this window — the suppressor must not act on a hours-old
 # reading if the sensor drops pm25 for a while.
 PM25_FRESHNESS = timedelta(minutes=5)
-# An open co2/voc event only earns the fans once the Awair score agrees the air
-# has actually degraded. A spike that never moves the score isn't worth spinning
-# up for — that's the "closed the windows, fans came on" complaint.
-FAN_SCORE_GATE = 75.0
-SCORE_FRESHNESS = timedelta(minutes=5)
+# A single run is bounded regardless of what co2 is doing, and once capped the
+# fans stay off until co2 recovers below CO2_FAN_OFF.
+# This is a working part of the controller, not standby insurance: over the
+# recorded 8 weeks it ends 3 of 7 runs, holds the longest to 1.5 h rather than
+# 6.2 h, and takes overnight running from 1.6 h to zero. Raising it is a real
+# trade — at 240 min the duty cycle is 1.06% and two runs still cap; dropping to
+# 60 min caps 6 of 7 and makes the timer, not the air, the thing in charge.
+FAN_MAX_RUN = timedelta(minutes=_env_float("AWAIR_FAN_MAX_RUN_MINUTES", 90.0))
 FAN_CMD_TIMEOUT_SECONDS = 5
 DEFAULT_FAN_HOST = "192.168.68.68"
 DEFAULT_FAN_IDS = (1, 2)
-# Automatic fan mitigation is retired (#61): measured over 303 h it ran the
-# ceiling fans for 97 h — a 32% duty cycle, 25 h of it between 22:00 and 08:00,
-# with a single unbroken 34 h stretch. The design assumed spikes are transient;
-# this house's voc-ceiling events last half a day. `config_from_env()` therefore
-# reports disabled regardless of the environment, and `check_fans` releases the
-# fans instead of driving them. The machinery below stays intact and tested so
-# this stays reversible.
-# Flip this to False to bring the whole loop back — but see the module docstring:
-# it is one of three edits, not a one-liner.
-# See docs/decisions/001-retire-automatic-fan-mitigation.md.
-MITIGATION_RETIRED = True
+# Automatic fan mitigation was retired in #61 and is live again as of ADR-002 on a
+# different trigger — absolute co2 rather than baseline-relative co2/voc spike
+# events. This constant stays, rather than being deleted along with the
+# retirement, because it is the kill switch ADR-001 established: one edit here
+# takes the fans out of the loop and makes the poller release them.
+# See docs/decisions/002-co2-only-fan-mitigation.md.
+MITIGATION_RETIRED = False
 # Recorded when a *disabled* poller commands a fan off. Deliberately not a
 # verdict about the air like "no co2/voc spike" — it is the poller letting go of
 # a fan it has stopped managing.
@@ -108,13 +144,37 @@ class MitigationDecision:
     reason: str
 
 
+@dataclass(frozen=True)
+class RunState:
+    """What we know about one fan's current mitigation run.
+
+    Per-fan rather than global even though `check_fans` commands every fan
+    alike: if one NodeMCU call fails the fans genuinely diverge, and per-fan
+    state records that instead of averaging it away.
+    """
+
+    running: bool
+    started_at: object | None  # datetime, or None when the fan is off
+    capped: bool
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The pure verdict for one poll: what to do, why, and the run flag to keep."""
+
+    action: str
+    reason: str
+    capped: bool
+
+
 def config_from_env() -> FansConfig:
-    """Read fan config from the environment, honouring the retirement (#61).
+    """Read fan config from the environment, honouring the code kill switch.
 
     While `MITIGATION_RETIRED` is set the enable flag cannot turn mitigation on.
     It is logged rather than silently dropped: a deploy whose env still asks for
     fans should say so out loud, so nobody debugs "why aren't the fans running"
-    against a variable that no longer has any power.
+    against a variable that no longer has any power. That switch is off as
+    shipped (ADR-002) — this path is what a future retirement would use.
     """
     requested = (
         os.environ.get("AWAIR_FAN_MITIGATION_ENABLED", "false").lower() == "true"
@@ -122,7 +182,8 @@ def config_from_env() -> FansConfig:
     if requested and MITIGATION_RETIRED:
         log.warning(
             "ignoring AWAIR_FAN_MITIGATION_ENABLED=true: automatic fan mitigation"
-            " is retired (#61). Fans will be released off, not driven."
+            " is disabled in code (fans.MITIGATION_RETIRED). Fans will be"
+            " released off, not driven."
         )
     return FansConfig(
         enabled=requested and not MITIGATION_RETIRED,
@@ -131,22 +192,29 @@ def config_from_env() -> FansConfig:
     )
 
 
-def events_to_engage(open_events: dict, latest_score: float | None) -> list:
-    """Ids of open co2/voc events that should latch as fan-worthy on this poll.
+def co2_calls_for_fans(latest_co2: float, running: bool) -> bool:
+    """Hysteresis: on at CO2_FAN_ON, off under CO2_FAN_OFF, hold in between.
 
-    An event latches the first time the score drops below the gate while it is
-    open. Already-latched events are not returned — the latch is written once,
-    and after that the score is never consulted again for that event.
-
-    A missing/stale score (None) engages nothing: absent data means don't act.
+    The band is what makes a single absolute threshold usable at a 30 s poll
+    interval. Episodes here are ~10 minutes of co2 drifting across the line, so
+    a bare `>= CO2_FAN_ON` would command the fans several times a minute; the
+    rate limit would mask some of that and leave the rest as audible chatter.
     """
-    if latest_score is None or latest_score >= FAN_SCORE_GATE:
-        return []
-    return [
-        open_events[m]["id"]
-        for m in FAN_TRIGGERS
-        if m in open_events and not open_events[m].get("fans_engaged")
-    ]
+    if latest_co2 >= CO2_FAN_ON:
+        return True
+    if latest_co2 < CO2_FAN_OFF:
+        return False
+    return running
+
+
+def run_exhausted(started_at, now) -> bool:
+    """Whether the current run has been going for at least FAN_MAX_RUN.
+
+    A run with no recorded start is never exhausted. That is the migration case
+    — a fan already running when the cap shipped has no start time we actually
+    observed, and inventing one would either cap it instantly or never.
+    """
+    return started_at is not None and now - started_at >= FAN_MAX_RUN
 
 
 def pm25_suppresses(latest_pm25: float | None) -> bool:
@@ -159,45 +227,60 @@ def pm25_suppresses(latest_pm25: float | None) -> bool:
     return latest_pm25 is not None and latest_pm25 >= PM25_SUPPRESS_THRESHOLD
 
 
-def engaged_triggers(open_events: dict) -> list:
-    """The open co2/voc events whose `fans_engaged` latch is set.
+def desired_action(
+    latest_co2: float | None,
+    latest_pm25: float | None,
+    run: RunState,
+    now,
+) -> Verdict:
+    """The target fan action for one poll, from sensor state plus this fan's run.
 
-    An open spike the Awair score never agreed with has no latch and so is
-    invisible to the fan verdict — see the module docstring.
-    """
-    return [
-        open_events[m]
-        for m in FAN_TRIGGERS
-        if m in open_events and open_events[m].get("fans_engaged")
-    ]
+    Precedence:
+      1. pm25 at/above the suppressor → off (particulate re-suspension risk).
+      2. No fresh co2 reading → off; absent data means don't act.
+      3. Capped, and co2 has not yet recovered → stay off.
+      4. This run has hit FAN_MAX_RUN → off, and latch `capped`.
+      5. Otherwise the hysteresis band decides.
 
+    `capped` clears only once co2 drops under CO2_FAN_OFF. Without that the cap
+    would defeat itself: it fires at 90 minutes while co2 is still, say, 1100,
+    and the next poll's hysteresis would turn the fans straight back on.
 
-def _speed_for(active: list) -> tuple[str, str]:
-    """Pick a fan speed for a non-empty list of engaged trigger events."""
-    metrics = "+".join(sorted(e["metric"] for e in active))
-    if len(active) == 1:
-        return "speed1", f"{metrics} elevated"
-    if any(e["tier"] == "ceiling" for e in active):
-        return "speed3", f"{metrics} at ceiling"
-    return "speed2", f"{metrics} elevated"
-
-
-def desired_action(open_events: dict, latest_pm25: float | None) -> tuple[str, str]:
-    """From spike events + latest pm25, compute the target fan action.
-
-    Rules (see #10), in precedence order:
-      - pm25 >= 25 always suppresses fans (particulate re-suspension risk).
-      - No *engaged* co2/voc events open → off.
-      - One of co2/voc engaged → speed1.
-      - Both engaged, both relative tier → speed2.
-      - Both engaged, either at ceiling tier → speed3.
+    The two absent-data paths carry `run.capped` through unchanged rather than
+    clearing it. A sensor gap is not evidence the air recovered, and clearing on
+    it would hand back a fresh 90 minutes for free.
     """
     if pm25_suppresses(latest_pm25):
-        return "off", f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans"
-    active = engaged_triggers(open_events)
-    if not active:
-        return "off", "no co2/voc spike"
-    return _speed_for(active)
+        return Verdict(
+            "off",
+            f"{PM25_SUPPRESS_REASON_PREFIX}{latest_pm25:g} suppresses fans",
+            capped=run.capped,
+        )
+    if latest_co2 is None:
+        return Verdict("off", "no fresh co2 reading", capped=run.capped)
+    if run.capped and latest_co2 >= CO2_FAN_OFF:
+        return Verdict("off", f"co2 {latest_co2:g} still high, run capped", capped=True)
+    if run.running and run_exhausted(run.started_at, now):
+        minutes = int(FAN_MAX_RUN.total_seconds() // 60)
+        return Verdict("off", f"run hit the {minutes} min cap", capped=True)
+    if co2_calls_for_fans(latest_co2, run.running):
+        return Verdict(FAN_SPEED, f"co2 {latest_co2:g} elevated", capped=False)
+    return Verdict("off", f"co2 {latest_co2:g} below {CO2_FAN_OFF:g}", capped=False)
+
+
+def next_run(run: RunState, verdict: Verdict, now):
+    """The `(run_started_at, capped)` pair to persist after applying `verdict`.
+
+    A run starts when a stopped fan is told to spin up, carries its original
+    start while it keeps running, and clears when the fan goes off. A fan found
+    running with no recorded start — the migration case — adopts `now`, so the
+    cap measures from when we first knew about it rather than never firing.
+    """
+    if verdict.action == "off":
+        return None, verdict.capped
+    if run.running and run.started_at is not None:
+        return run.started_at, verdict.capped
+    return now, verdict.capped
 
 
 def decide(
@@ -258,33 +341,20 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
     notifier.send("Fan test")
 
 
-def _engage_qualifying_events(conn, open_events: dict, now) -> dict:
-    """Latch any open trigger whose air quality has now dropped below the gate.
-
-    Returns open_events refreshed from the DB when anything latched, so the
-    caller's verdict is computed against the state we just persisted.
-    """
-    score = db.latest_score(conn, since=now - SCORE_FRESHNESS)
-    newly_engaged = events_to_engage(open_events, score)
-    if not newly_engaged:
-        return open_events
-    for event_id in newly_engaged:
-        db.mark_fans_engaged(conn, event_id)
-        log.info("event %d engaged for fans (score %.0f)", event_id, score)
-    return db.get_open_events(conn)
-
-
 def _log_pm25_observability(
-    open_events: dict, latest_pm25: float | None, action: str
+    latest_co2: float | None, latest_pm25: float | None, verdict: Verdict
 ) -> None:
     """Emit two INFO lines for the pm25 suppressor without changing behavior (#15).
 
     1. **Near-miss**: any poll with pm25 >= PM25_NEAR_MISS_THRESHOLD is logged,
        whether or not a fan-on candidacy exists. Builds the distribution we need
        to see the suppressor's headroom shrink before it ever fires.
-    2. **Candidacy trace**: when at least one open trigger is engaged (fans
-       would run absent a suppressor), log the pm25 value the suppressor saw
-       and the verdict it produced. Retrospective query becomes trivial.
+    2. **Candidacy trace**: when co2 alone would call for fans, log the pm25 the
+       suppressor saw and the verdict it produced.
+
+    The #15 note about not inferring the suppressor from `action == "off"` has
+    since come true: the duration cap is a second off-path, so the trace asks
+    `pm25_suppresses` directly and reports the cap as its own field.
     """
     if latest_pm25 is not None and latest_pm25 >= PM25_NEAR_MISS_THRESHOLD:
         log.info(
@@ -292,17 +362,14 @@ def _log_pm25_observability(
             latest_pm25,
             PM25_SUPPRESS_THRESHOLD,
         )
-    if engaged_triggers(open_events):
+    if latest_co2 is not None and latest_co2 >= CO2_FAN_ON:
         log.info(
-            "fan-on candidacy: pm25=%s suppressor=%s action=%s",
+            "fan-on candidacy: co2=%g pm25=%s suppressor=%s capped=%s action=%s",
+            latest_co2,
             "unknown" if latest_pm25 is None else f"{latest_pm25:g}",
-            # Ask the suppressor directly rather than inferring it from
-            # `action == "off"`: today those agree (an engaged trigger can only
-            # be turned off by the suppressor), but the moment a second off-path
-            # exists — night-quiet, manual override — inferring would report the
-            # suppressor as having fired when it did not.
             "fired" if pm25_suppresses(latest_pm25) else "passed",
-            action,
+            verdict.capped,
+            verdict.action,
         )
 
 
@@ -365,8 +432,8 @@ def _release_one(conn, notifier, config: FansConfig, fan_id, now) -> None:
     )
     notifier.send(
         f"could not turn fan {fan_id} off after {RELEASE_MAX_ATTEMPTS} tries —"
-        " it may still be running. Fan mitigation is retired (#61), so nothing"
-        " will try again until the poller restarts; switch it off at the wall.",
+        " it may still be running. Fan mitigation is disabled, so nothing will"
+        " try again until the poller restarts; switch it off at the wall.",
         title="Awair fan mitigation",
         priority="high",
     )
@@ -395,6 +462,28 @@ def release_fans(conn, notifier, config: FansConfig, now) -> None:
         _release_one(conn, notifier, config, fan_id, now)
 
 
+def _drive_one(
+    conn, notifier, config: FansConfig, fan_id, latest_co2, latest_pm25, now
+):
+    """Decide, persist the run bookkeeping, and command one fan. Returns the verdict.
+
+    The `set_fan_run` write happens whether or not a command is owed: clearing
+    `capped` happens on a poll where the fans are already off and nothing else
+    would write. See `db.set_fan_run`.
+    """
+    state = db.get_fan_state(conn, fan_id)
+    run = RunState(
+        running=state["last_action"] != "off",
+        started_at=state["run_started_at"],
+        capped=state["capped"],
+    )
+    verdict = desired_action(latest_co2, latest_pm25, run, now)
+    started_at, capped = next_run(run, verdict, now)
+    db.set_fan_run(conn, fan_id, started_at=started_at, capped=capped)
+    _command_fan(conn, notifier, config, fan_id, verdict.action, verdict.reason, now)
+    return verdict
+
+
 def check_fans(conn, notifier, config: FansConfig, now) -> None:
     """One poll's worth of fan control.
 
@@ -404,10 +493,14 @@ def check_fans(conn, notifier, config: FansConfig, now) -> None:
     if not config.enabled:
         release_fans(conn, notifier, config, now)
         return
-    open_events = db.get_open_events(conn)
-    open_events = _engage_qualifying_events(conn, open_events, now)
+    latest_co2 = db.latest_co2(conn, since=now - CO2_FRESHNESS)
     latest_pm25 = db.latest_pm25(conn, since=now - PM25_FRESHNESS)
-    action, reason = desired_action(open_events, latest_pm25)
-    _log_pm25_observability(open_events, latest_pm25, action)
-    for fan_id in config.fan_ids:
-        _command_fan(conn, notifier, config, fan_id, action, reason, now)
+    verdicts = [
+        _drive_one(conn, notifier, config, fan_id, latest_co2, latest_pm25, now)
+        for fan_id in config.fan_ids
+    ]
+    # One trace per poll, not per fan: the fans are commanded alike, and the
+    # only thing that diverges between them is a failed actuate, which
+    # `_command_fan` already logs on its own.
+    if verdicts:
+        _log_pm25_observability(latest_co2, latest_pm25, verdicts[0])

@@ -208,13 +208,15 @@ def test_handle_device_health_recovered_without_prior_event_still_notifies(conn)
     assert notifier.calls[-1]["title"] == "Awair device recovered"
 
 
-def test_startup_banner_says_retired_not_merely_off(monkeypatch):
-    """`retired` is a third state and the banner has to carry it (#61).
+def test_startup_banner_says_disabled_in_code_not_merely_off(monkeypatch):
+    """The banner carries a third state, not just on/off.
 
-    Once homelab's `awair_fan_mitigation_enabled` is also false, the warning in
-    `config_from_env` never fires again — so this line becomes the only thing
-    in the logs distinguishing the retirement from someone having simply left
-    fan mitigation switched off.
+    The warning in `config_from_env` only fires while the environment still
+    asks for fans — so once the Ansible flag agrees, this line is the only
+    thing in the logs distinguishing a code-level kill switch (fix: the
+    constant in `awair.fans`) from someone having simply left mitigation
+    switched off (fix: the Ansible variable). Kept through ADR-002, which turned
+    mitigation back on but not the kill switch off.
     """
     from awair import fans
 
@@ -222,7 +224,7 @@ def test_startup_banner_says_retired_not_merely_off(monkeypatch):
     on = fans.FansConfig(enabled=True, fan_host="h", fan_ids=(1,))
 
     monkeypatch.setattr(fans, "MITIGATION_RETIRED", True)
-    assert poller._fan_mitigation_status(off) == "retired (#61)"
+    assert poller._fan_mitigation_status(off) == "disabled in code"
 
     monkeypatch.setattr(fans, "MITIGATION_RETIRED", False)
     assert poller._fan_mitigation_status(off) == "off"

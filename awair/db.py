@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS alert_events (
 CREATE TABLE IF NOT EXISTS fan_state (
     fan_id INTEGER PRIMARY KEY,
     last_action TEXT NOT NULL CHECK (last_action IN ('off', 'speed1', 'speed2', 'speed3')),
-    last_command_at TEXT NOT NULL
+    last_command_at TEXT NOT NULL,
+    run_started_at TEXT,
+    capped INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS outdoor_readings (
@@ -108,6 +110,13 @@ def _migrate(conn) -> None:
     # events at migration time, and they must land unlatched rather than
     # spuriously driving the fans on the first poll after deploy.
     _add_column(conn, "alert_events", "fans_engaged INTEGER NOT NULL DEFAULT 0")
+    # The duration cap's bookkeeping (ADR-002). `run_started_at` is nullable and
+    # starts NULL: a fan already running at migration time has no recorded
+    # start, and `run_exhausted` treats "no start" as "not yet exhausted", so
+    # the first poll after deploy adopts it into a fresh run rather than
+    # capping it instantly on a start time we never observed.
+    _add_column(conn, "fan_state", "run_started_at TEXT")
+    _add_column(conn, "fan_state", "capped INTEGER NOT NULL DEFAULT 0")
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -330,6 +339,22 @@ def latest_pm25(conn, since) -> float | None:
     return float(row[0]) if row else None
 
 
+def latest_co2(conn, since) -> float | None:
+    """Most recent co2 reading at or after `since`, or None.
+
+    Bounded by `since` for the same reason as `latest_pm25`: co2 is now the
+    only thing that turns fans *on* (ADR-002), so a stale value must not keep them
+    running through a sensor outage. None reads as 'no data' and the caller
+    declines to act rather than guessing.
+    """
+    row = conn.execute(
+        "SELECT co2 FROM readings"
+        " WHERE ts >= ? AND co2 IS NOT NULL ORDER BY ts DESC LIMIT 1",
+        (iso_z(since),),
+    ).fetchone()
+    return float(row[0]) if row else None
+
+
 def latest_score(conn, since) -> float | None:
     """Most recent Awair score at or after `since`, or None.
 
@@ -353,7 +378,8 @@ def get_fan_state(conn, fan_id: int) -> dict:
     is not blocking on first use.
     """
     row = conn.execute(
-        "SELECT last_action, last_command_at FROM fan_state WHERE fan_id = ?",
+        "SELECT last_action, last_command_at, run_started_at, capped"
+        " FROM fan_state WHERE fan_id = ?",
         (fan_id,),
     ).fetchone()
     if row is None:
@@ -361,12 +387,18 @@ def get_fan_state(conn, fan_id: int) -> dict:
             "fan_id": fan_id,
             "last_action": "off",
             "last_command_at": _NEVER,
+            "run_started_at": None,
+            "capped": False,
         }
-    last_action, last_command_at = row
+    last_action, last_command_at, run_started_at, capped = row
     return {
         "fan_id": fan_id,
         "last_action": last_action,
         "last_command_at": datetime.fromisoformat(last_command_at),
+        "run_started_at": (
+            datetime.fromisoformat(run_started_at) if run_started_at else None
+        ),
+        "capped": bool(capped),
     }
 
 
@@ -384,5 +416,34 @@ def upsert_fan_state(conn, fan_id: int, action: str, command_at) -> None:
         " last_action = excluded.last_action,"
         " last_command_at = excluded.last_command_at",
         (fan_id, action, command_at.isoformat()),
+    )
+    conn.commit()
+
+
+def set_fan_run(conn, fan_id: int, started_at, capped: bool) -> None:
+    """Persist the duration cap's bookkeeping for one fan (ADR-002).
+
+    Deliberately separate from `upsert_fan_state`: the cap has to be recorded
+    on polls where *no command is owed*. Clearing `capped` is the case that
+    forces this — it happens while the fans are already off and co2 has
+    finally recovered, so `decide()` returns None and nothing else would write.
+    Folding this into upsert_fan_state would tie it to commands actually sent
+    and the flag would never clear.
+
+    Touches only the run columns, so a failed actuate's "keep the old
+    last_action" contract is unaffected.
+    """
+    conn.execute(
+        "INSERT INTO fan_state (fan_id, last_action, last_command_at,"
+        " run_started_at, capped) VALUES (?, 'off', ?, ?, ?)"
+        " ON CONFLICT(fan_id) DO UPDATE SET"
+        " run_started_at = excluded.run_started_at,"
+        " capped = excluded.capped",
+        (
+            fan_id,
+            _NEVER.isoformat(),
+            started_at.isoformat() if started_at else None,
+            int(capped),
+        ),
     )
     conn.commit()
