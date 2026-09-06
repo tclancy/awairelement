@@ -1,6 +1,9 @@
 """Parsing device JSON and single poll iterations."""
 
 import json
+import os
+import signal
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import URLError
@@ -231,27 +234,37 @@ def test_startup_banner_says_disabled_in_code_not_merely_off(monkeypatch):
     assert poller._fan_mitigation_status(on) == "on"
 
 
-def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
-    """Drive the main() poll loop through exactly one iteration."""
+def test_main_polls_once_then_exits_cleanly_on_sigterm(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """A SIGTERM finishes the poll in flight and returns — it does not raise (#83).
+
+    This test used to break the loop by making `time.sleep` raise, which
+    asserted the exact behaviour #83 exists to remove: an exception escaping
+    `main()` IS the non-zero exit systemd reports as
+    `Failed with result 'exit-code'` on every restart. Delivering the real
+    signal and requiring a normal return is the difference between the two.
+    """
     monkeypatch.setenv("AWAIR_DB", str(tmp_path / "poller.db"))
-    monkeypatch.setenv("AWAIR_POLL_SECONDS", "1")
+    monkeypatch.setenv("AWAIR_POLL_SECONDS", "30")
     monkeypatch.setenv("AWAIR_NTFY_TOKEN", "")
 
-    fixture = FIXTURE_TEXT
-    monkeypatch.setattr(poller, "make_fetch", lambda url: lambda: fixture)
+    def fetch_then_sigterm():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return FIXTURE_TEXT
+
+    monkeypatch.setattr(poller, "make_fetch", lambda url: fetch_then_sigterm)
     monkeypatch.setattr(poller, "check_metrics", lambda *a, **k: None)
     monkeypatch.setattr(poller, "check_fans", lambda *a, **k: None)
 
-    class Stop(Exception):
-        pass
+    started = time.monotonic()
+    poller.main([])  # returns normally; must not raise
+    # The interval is 30 s. Returning promptly proves the wait was interrupted
+    # rather than slept through — the reason this is an Event, not a flag.
+    assert time.monotonic() - started < 10
 
-    def stop(_seconds):
-        raise Stop
-
-    monkeypatch.setattr(poller.time, "sleep", stop)
-    with pytest.raises(Stop):
-        poller.main([])
-    # The reading landed — proves poll_once ran with the real connection.
+    # The reading landed — proves poll_once ran with the real connection, and
+    # that the signal did not abandon the poll half-done.
     from awair import db
 
     conn = db.connect(str(tmp_path / "poller.db"))
@@ -259,3 +272,30 @@ def test_main_polls_once_and_exits_when_sleep_raises(monkeypatch, tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_main_does_not_start_a_poll_when_told_to_stop_first(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """A signal landing before the first poll exits without fetching anything."""
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "poller.db"))
+    monkeypatch.setenv("AWAIR_NTFY_TOKEN", "")
+
+    calls = []
+
+    def never_called():
+        calls.append(1)
+        return FIXTURE_TEXT
+
+    monkeypatch.setattr(poller, "make_fetch", lambda url: never_called)
+
+    real_install = poller.install_handler
+
+    def install_already_stopped():
+        stop = real_install()
+        stop.set()
+        return stop
+
+    monkeypatch.setattr(poller, "install_handler", install_already_stopped)
+    poller.main([])
+    assert calls == []
