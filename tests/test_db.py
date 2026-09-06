@@ -109,21 +109,12 @@ def test_connect_adds_fans_engaged_column_to_legacy_db(tmp_path):
 
 
 def test_open_event_starts_unlatched(conn):
+    # `fans_engaged` is retained history (ADR-002 removed the code that wrote
+    # it). Nothing sets it any more, so the schema default is now the only
+    # value a new event can have — pinned here so a migration cannot quietly
+    # start defaulting rows to 1.
     _open_voc_event(conn)
     assert db.get_open_events(conn)["voc"]["fans_engaged"] == 0
-
-
-def test_mark_fans_engaged_sets_the_latch(conn):
-    event_id = _open_voc_event(conn)
-    db.mark_fans_engaged(conn, event_id)
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
-
-
-def test_mark_fans_engaged_is_idempotent(conn):
-    event_id = _open_voc_event(conn)
-    db.mark_fans_engaged(conn, event_id)
-    db.mark_fans_engaged(conn, event_id)
-    assert db.get_open_events(conn)["voc"]["fans_engaged"] == 1
 
 
 def _open_voc_event(conn):
@@ -137,45 +128,6 @@ def _open_voc_event(conn):
         threshold=2200.0,
         notified=True,
     )
-
-
-# --- latest_score: freshness-bounded, mirrors latest_pm25 ---
-
-
-def test_latest_score_empty_is_none(conn):
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
-
-
-def test_latest_score_returns_most_recent_within_window(conn):
-    for minutes_ago, score in ((4, 84), (1, 70)):
-        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
-        conn.execute(
-            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
-            (ts, ts, score),
-        )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 70
-
-
-def test_latest_score_returns_none_when_only_stale_readings(conn):
-    # A score from an hour ago must not gate today's fans.
-    ts = db.iso_z(NOW - timedelta(hours=1))
-    conn.execute(
-        "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)", (ts, ts, 70)
-    )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) is None
-
-
-def test_latest_score_skips_nulls(conn):
-    for minutes_ago, score in ((4, 72), (1, None)):
-        ts = db.iso_z(NOW - timedelta(minutes=minutes_ago))
-        conn.execute(
-            "INSERT INTO readings (ts, received_at, score) VALUES (?, ?, ?)",
-            (ts, ts, score),
-        )
-    conn.commit()
-    assert db.latest_score(conn, since=NOW - timedelta(minutes=5)) == 72
 
 
 def test_insert_reading_stores_all_fields(conn):

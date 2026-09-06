@@ -254,16 +254,6 @@ def get_open_events(conn) -> dict:
     }
 
 
-def mark_fans_engaged(conn, event_id) -> None:
-    """Latch this event as fan-worthy: the score dipped below the gate while it
-    was open. Write-once — the score is never consulted again for this event."""
-    conn.execute(
-        "UPDATE alert_events SET fans_engaged = 1 WHERE id = ?",
-        (event_id,),
-    )
-    conn.commit()
-
-
 def open_event(
     conn, metric, tier, opened_at, value, baseline, threshold, notified
 ) -> int:
@@ -350,22 +340,6 @@ def latest_co2(conn, since) -> float | None:
     row = conn.execute(
         "SELECT co2 FROM readings"
         " WHERE ts >= ? AND co2 IS NOT NULL ORDER BY ts DESC LIMIT 1",
-        (iso_z(since),),
-    ).fetchone()
-    return float(row[0]) if row else None
-
-
-def latest_score(conn, since) -> float | None:
-    """Most recent Awair score at or after `since`, or None.
-
-    Bounded by `since` for the same reason as `latest_pm25`: the score is a
-    gate on spending fans, and a stale value must not authorize (or veto) a
-    turn-on. Returns None when the last read is older than the window; the
-    caller treats that as 'no data' and declines to engage.
-    """
-    row = conn.execute(
-        "SELECT score FROM readings"
-        " WHERE ts >= ? AND score IS NOT NULL ORDER BY ts DESC LIMIT 1",
         (iso_z(since),),
     ).fetchone()
     return float(row[0]) if row else None
