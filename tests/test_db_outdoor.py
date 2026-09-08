@@ -196,3 +196,64 @@ def test_latest_outdoor_reading_hands_back_an_ancient_row(conn):
     """
     db.insert_outdoor_reading(conn, _row(ts="2020-01-01T00:00:00+00:00", temp=1.0))
     assert db.latest_outdoor_reading(conn, ("temp",)) == {"temp": 1.0}
+
+
+def _column_order(connection, table):
+    return [r[1] for r in connection.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def test_schema_column_order_matches_a_migrated_database():
+    """A fresh install and a migrated one must agree on physical column order (#77).
+
+    `CREATE TABLE IF NOT EXISTS` leaves an existing table alone, so the columns
+    #71 added reach a live DB through `_migrate`'s ALTERs -- which can only
+    append. If SCHEMA lists them anywhere but last, the two installs diverge and
+    SCHEMA stops describing the database it claims to define.
+
+    Nothing depends on the order *today*: there is no `SELECT *` in the
+    codebase, every INSERT uses named placeholders and every SELECT names its
+    columns. That is the point -- this is cheap to keep true now and expensive
+    to discover later, and SCHEMA is read as documentation.
+
+    Built by actually running both paths rather than by parsing the SQL, so it
+    fails if `_migrate` changes too, not only if SCHEMA does.
+
+    **Scoped to the two columns #71 added, and it cannot grow itself.** The
+    "old" DB is derived from the current SCHEMA by dropping exactly those two,
+    so a *future* column added to SCHEMA with no matching `_migrate` ALTER
+    appears on both sides and survives this test -- measured, not assumed. The
+    `fresh_order[-2:]` assertion below catches the ordering half of that
+    (a new column appended after `aq_ts` fails here), but the missing-ALTER half
+    needs the drop list to track `_migrate`. Add the column to both lists when
+    you add the ALTER.
+    """
+    import sqlite3
+
+    fresh = sqlite3.connect(":memory:")
+    fresh.executescript(db.SCHEMA)
+
+    # An install predating #71, derived from SCHEMA rather than hand-written:
+    # create the current table, then drop the two columns #71 added. DROP COLUMN
+    # preserves the order of the survivors, so this is exactly the shape a
+    # pre-#71 CREATE TABLE left behind -- and it cannot drift out of date the
+    # way a pasted copy of the old DDL would.
+    migrated = sqlite3.connect(":memory:")
+    migrated.executescript(db.SCHEMA)
+    migrated.execute("ALTER TABLE outdoor_readings DROP COLUMN weather_code")
+    migrated.execute("ALTER TABLE outdoor_readings DROP COLUMN aq_ts")
+    before = _column_order(migrated, "outdoor_readings")
+    assert "weather_code" not in before, "fixture no longer models a pre-#71 DB"
+    assert "aq_ts" not in before, "fixture no longer models a pre-#71 DB"
+
+    db._migrate(migrated)
+
+    fresh_order = _column_order(fresh, "outdoor_readings")
+    migrated_order = _column_order(migrated, "outdoor_readings")
+    assert "weather_code" in migrated_order, "the migration under test did not run"
+    assert fresh_order == migrated_order
+    # The property that makes the two orders agree, named so a future column
+    # lands in the right place rather than merely keeping this test green.
+    assert fresh_order[-2:] == ["weather_code", "aq_ts"]
+
+    fresh.close()
+    migrated.close()

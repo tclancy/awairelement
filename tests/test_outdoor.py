@@ -182,10 +182,11 @@ def test_build_url_requests_source_units_and_utc():
     the hub about a number the weather card exists to show, with every other
     test still green.
 
-    `timezone=UTC` is pinned for the reason `latest_outdoor_reading`'s docstring
-    gives: `_normalize_source_time` stamps `tzinfo` on a *naive* value but stores
-    a real offset verbatim, so a non-UTC answer would sort wrongly on `ts`. This
-    parameter is the only thing preventing that, and it had no test.
+    `timezone=UTC` is pinned for the reason `_normalize_source_time`'s docstring
+    gives: it stamps `tzinfo` on a *naive* value but stores a real offset
+    verbatim, so a non-UTC answer would sort wrongly on `ts`. This parameter is
+    the only thing preventing that, and it had no test. (That paragraph lived on
+    `db.latest_outdoor_reading` until #77; this citation moved with it.)
     """
     url = _build_url("https://example.test/x", 43.1, -70.9, WEATHER_FIELDS)
     assert "timezone=UTC" in url
@@ -308,10 +309,16 @@ def test_weather_code_is_requested_from_the_source():
     written test payload carries `weather_code` whether or not the real URL
     asks Open-Meteo for it, so a mapping test alone would stay green against a
     poller that receives the field never.
+
+    Membership in `WEATHER_FIELDS` is the whole assertion (#77). The `in url`
+    check this used to also make was redundant *by composition*:
+    `test_build_url_encodes_params` asserts every member of `WEATHER_FIELDS`
+    reaches the URL, so that test plus this one already covers it. Named here
+    rather than left implicit, because the composition is what makes the
+    deletion safe -- if that loop ever stops covering all of `WEATHER_FIELDS`,
+    this coverage goes with it.
     """
     assert "weather_code" in WEATHER_FIELDS
-    url = _build_url("https://x/y", 1.0, 2.0, WEATHER_FIELDS)
-    assert "weather_code" in url
 
 
 def test_parse_reading_stores_the_weather_code():
@@ -433,3 +440,182 @@ def test_a_bad_weather_time_still_raises():
     payload = {"current": dict(WEATHER["current"], time="not-a-timestamp")}
     with pytest.raises(ValueError):
         parse_reading(payload, AIR_QUALITY, RECEIVED)
+
+
+@pytest.mark.parametrize(
+    ("date_only", "midnight_it_would_have_invented"),
+    [
+        ("2026-07-12", "2026-07-12T00:00:00+00:00"),
+        # ISO basic. `datetime.fromisoformat` has accepted this since 3.11.
+        ("20260712", "2026-07-12T00:00:00+00:00"),
+        # ISO *week* date, which does not even resolve to the date it looks
+        # like -- 2026-W28-1 is the 6th, not the 28th of anything.
+        ("2026-W28-1", "2026-07-06T00:00:00+00:00"),
+    ],
+)
+def test_a_date_only_aq_time_degrades_to_null_rather_than_midnight(
+    date_only, midnight_it_would_have_invented
+):
+    """The failure `aq_ts` exists to prevent, arriving through the parser (#77).
+
+    These three parse cleanly -- that is the whole problem. `fromisoformat`
+    defaults the clock to `00:00`, so the row would carry an observation time
+    Open-Meteo never published, and the hub would render an AQI up to a day old
+    as current. NULL is the honest answer and is already the signal the hub
+    acts on.
+
+    The second parameter is asserted, not decoration: it pins what the old
+    behaviour *was*, so a regression that reinstates midnight fails here rather
+    than merely failing an `is None`.
+    """
+    from datetime import UTC, datetime
+
+    assert (
+        datetime.fromisoformat(date_only).replace(tzinfo=UTC).isoformat()
+        == midnight_it_would_have_invented
+    ), "fixture no longer reproduces the fabricating shape it was written for"
+
+    payload = {"current": dict(AIR_QUALITY["current"], time=date_only)}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] == 32  # the AQ values themselves still landed
+
+
+def test_an_explicit_midnight_aq_time_is_kept():
+    """The reachability control on the test above, and the reason it is structural.
+
+    Midnight is a real instant that Open-Meteo really publishes once a day. A
+    guard written as "reject if the parsed value is 00:00" would pass every
+    assertion in the parametrised test above while silently dropping one poll
+    in ninety-six. The guard has to test the *string's shape*, not the parsed
+    value, and this is what separates the two implementations.
+    """
+    payload = {"current": dict(AIR_QUALITY["current"], time="2026-07-12T00:00")}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] == "2026-07-12T00:00:00+00:00"
+
+
+def test_a_space_separated_basic_time_is_kept():
+    """The false reject in the fix #77 proposed, pinned so it cannot come back.
+
+    The ticket prescribed rejecting any string carrying neither `T` nor `:`.
+    `"20260712 0400"` is a real 04:00 and carries neither, so that rule drops
+    it. `date.fromisoformat` -- which is the stdlib's own definition of
+    "date-only" -- keeps it. This test is the difference between the two rules
+    and would fail against the prescribed one.
+    """
+    payload = {"current": dict(AIR_QUALITY["current"], time="20260712 0400")}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] == "2026-07-12T04:00:00+00:00"
+
+
+def test_a_date_only_aq_time_warns_rather_than_passing_silently(caplog):
+    """Upstream drift worth seeing, so it must not share the absent case's silence.
+
+    `_normalize_aq_time` already distinguishes an *absent* AQ time (ordinary,
+    silent) from a *malformed* one (drift, warned). A date-only value is the
+    third case and belongs with the second: it means Open-Meteo changed the
+    shape of `current.time`, which nothing else would report.
+    """
+    payload = {"current": dict(AIR_QUALITY["current"], time="2026-07-12")}
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        parse_reading(WEATHER, payload, RECEIVED)
+    assert any("no time of day" in r.message for r in caplog.records)
+
+
+def test_a_non_string_aq_time_is_reported_as_unparseable_not_as_date_only(caplog):
+    """`date.fromisoformat(1752292800)` raises TypeError, and the two paths differ.
+
+    An epoch int is the most plausible real drift. It must land on the
+    `unparseable` branch -- if `_is_date_only` swallowed TypeError as "yes,
+    date-only", every non-string would be mislabelled and the existing
+    TypeError coverage would go quiet while still returning None.
+    """
+    payload = {"current": dict(AIR_QUALITY["current"], time=1752292800)}
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] is None
+    messages = [r.message for r in caplog.records]
+    assert any("unparseable" in m for m in messages)
+    assert not any("no time of day" in m for m in messages)
+
+
+def test_a_date_only_weather_time_is_deliberately_unchanged():
+    """#77 fixed `aq_ts` only, and this pins that the blast radius stopped there.
+
+    Putting the same guard on `_normalize_source_time` would fix `ts` too, and
+    that is *not* a free win: `poll_once` wraps `parse_reading` in
+    `except KeyError` alone, so a ValueError from the weather clock escapes the
+    `while` loop in `main()` and stops the poller process. Tightening the
+    weather path would convert "stores a wrong midnight" into "the outdoor
+    poller exits", which is a worse failure and a separate ticket.
+
+    So this asserts the *current* behaviour rather than the desired one, and
+    says why. If a later change makes the weather path reject date-only input,
+    this test should be deleted along with the poll-loop fix -- not before.
+    """
+    payload = {"current": dict(WEATHER["current"], time="2026-07-12")}
+    reading = parse_reading(payload, AIR_QUALITY, RECEIVED)
+    assert reading["ts"] == "2026-07-12T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("zone_only", "hour_it_would_have_invented"),
+    [
+        ("2026-07-12+05:00", "2026-07-12T05:00:00+00:00"),
+        ("2026-07-12-05:00", "2026-07-12T05:00:00+00:00"),
+        ("20260712+0500", "2026-07-12T05:00:00+00:00"),
+    ],
+)
+def test_a_date_with_only_a_zone_designator_degrades_to_null(
+    zone_only, hour_it_would_have_invented
+):
+    """The hole the first #77 fix left, found in review rather than by measurement.
+
+    `datetime.fromisoformat` takes *any single character* as the date/time
+    separator, so it reads `"2026-07-12+05:00"` as the 12th at 05:00 -- while
+    `date.fromisoformat` rejects that string outright. A guard built on
+    `date.fromisoformat` alone therefore waves it through, and the row stores an
+    observation time an hour further from the truth than the midnight case, with
+    no warning at all. Stripping the zone designator first is what closes it.
+
+    The second parameter asserts the fabricated value, so a regression that
+    reinstates it fails here on the hour rather than merely on an `is None`.
+    """
+    from datetime import UTC, datetime
+
+    assert (
+        datetime.fromisoformat(zone_only).replace(tzinfo=UTC).isoformat()
+        == hour_it_would_have_invented
+    ), "fixture no longer reproduces the fabricating shape it was written for"
+
+    payload = {"current": dict(AIR_QUALITY["current"], time=zone_only)}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] == 32
+
+
+def test_the_zone_strip_does_not_eat_a_real_offset_or_a_week_date():
+    """The two things `_ZONE_SUFFIX` must not match, pinned as behaviour.
+
+    A pattern loose enough to strip `"+05:00"` is one edit away from eating the
+    `-1` of the ISO week date `"2026-W28-1"` (which would then read as the
+    date-only `"2026-W28"` -- still rejected, so that failure is invisible here)
+    or the `0400` of `"20260712 0400"` (which would read as the date-only
+    `"20260712"` and *silently drop a real reading*). The second is the
+    dangerous one, so both directions are asserted.
+    """
+    kept = {"current": dict(AIR_QUALITY["current"], time="2026-07-12T04:00+05:00")}
+    assert (
+        parse_reading(WEATHER, kept, RECEIVED)["aq_ts"] == "2026-07-12T04:00:00+05:00"
+    )
+
+    basic = {"current": dict(AIR_QUALITY["current"], time="20260712 0400")}
+    assert (
+        parse_reading(WEATHER, basic, RECEIVED)["aq_ts"] == "2026-07-12T04:00:00+00:00"
+    )
+
+    week = {"current": dict(AIR_QUALITY["current"], time="2026-W28-1T04:00")}
+    assert (
+        parse_reading(WEATHER, week, RECEIVED)["aq_ts"] == "2026-07-06T04:00:00+00:00"
+    )
