@@ -1,0 +1,218 @@
+"""Structural guards on the dashboard's CSS and JS (#86, #87).
+
+The dashboard is the one part of this project with no runtime under test:
+`templates/dashboard.html` and `static/dashboard.js` are shipped verbatim to a
+browser, and a regression in either is invisible to every other test here.
+
+These are deliberately structural rather than cosmetic. Each one pins the
+*mechanism* a fix depends on, not the wording around it:
+
+- uPlot's own stylesheet sizes the chart root with `width: min-content`. A
+  legend locked to one line therefore makes the whole chart as wide as the
+  populated legend string, which is what pushed a 604px precipitation legend
+  out of a 334px card (#86). Both halves of that — the width pin and the
+  absence of the nowrap lock — have to hold together, so both are asserted.
+- uPlot binds its cursor to mouse events only, so every chart needs the touch
+  plugin explicitly. Adding a third chart factory and forgetting it is the
+  realistic regression, so the test counts plots rather than naming them (#87).
+- uPlot nulls its cursor index for an out-of-range left, and with sync
+  publishing on that blanks every card at once, so the touch read has to
+  clamp. That is asserted here because it is invisible in a mouse-only test:
+  a mouse cannot leave the element while still reporting moves to it.
+
+Browser-side behaviour (does the crosshair actually track a finger, does the
+card stay the same height on hover) is verified against a headless Chromium at
+several viewports; that run is captured in the PR that landed this file. What
+lives here is the part CI can hold without a browser.
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parent.parent
+DASHBOARD_HTML = REPO / "templates" / "dashboard.html"
+DASHBOARD_JS = REPO / "static" / "dashboard.js"
+UPLOT_CSS = REPO / "static" / "uplot.min.css"
+
+
+@pytest.fixture(scope="module")
+def html():
+    return DASHBOARD_HTML.read_text()
+
+
+@pytest.fixture(scope="module")
+def js():
+    return DASHBOARD_JS.read_text()
+
+
+def _rule_body(css, selector):
+    """The declarations of the first `selector { ... }` rule, or None."""
+    match = re.search(
+        r"(?:^|\})\s*" + re.escape(selector) + r"\s*\{([^}]*)\}", css, re.MULTILINE
+    )
+    return match.group(1) if match else None
+
+
+def test_uplot_still_sizes_its_root_with_min_content():
+    """The premise #86's fix rests on, checked against the vendored library.
+
+    If a future uPlot drops `width: min-content`, the `.plot .uplot` override
+    below stops being load-bearing and this whole file needs re-reading rather
+    than quietly continuing to pass.
+    """
+    body = _rule_body(UPLOT_CSS.read_text(), ".uplot")
+    assert body is not None, "no `.uplot` rule in the vendored uplot.min.css"
+    assert "width: min-content" in body, (
+        "vendored uPlot no longer sizes its root with min-content; re-derive "
+        "#86 before trusting the `.plot .uplot { width: 100% }` override"
+    )
+
+
+def test_chart_root_is_pinned_to_the_card_width(html):
+    body = _rule_body(html, ".plot .uplot")
+    assert body is not None, "`.plot .uplot` rule is gone — see #86"
+    assert "width: 100%" in body
+
+
+def test_legend_is_not_locked_to_one_line(html):
+    """`white-space: nowrap` on the legend is what caused #86.
+
+    It reads like a clipping instruction and is the opposite: it makes the
+    legend's min-content width the entire populated string, which uPlot then
+    grows the chart root to match.
+    """
+    body = _rule_body(html, ".u-legend")
+    assert body is not None, "`.u-legend` rule is gone"
+    assert "nowrap" not in body, (
+        "the one-line lock is back; it grows the chart root past the card (#86)"
+    )
+
+
+def test_legend_reserves_a_fixed_height_and_clips(html):
+    """No layout shift on hover, and an extra row can never spill the card.
+
+    The `height:` here has to be anchored rather than substring-matched:
+    `min-height: var(--legend-rows)...` contains the same text and is exactly
+    the regression, since a min-height lets the legend grow on hover again.
+    """
+    body = _rule_body(html, ".u-legend")
+    assert body is not None, "`.u-legend` rule is gone"
+    assert "overflow: hidden" in body
+    assert re.search(r"(?:^|;)\s*height:\s*calc\(var\(--legend-rows\)", body), (
+        "legend height must be a plain `height`, not a min-/max- variant"
+    )
+    root = _rule_body(html, ":root")
+    assert root is not None, "`:root` custom properties are gone"
+    assert re.search(r"--legend-rows:\s*\d+\s*;", root), (
+        "--legend-rows must be a whole number of rows; a content-derived "
+        "height re-introduces the hover shift the nowrap lock was there to stop"
+    )
+    assert re.search(r"--legend-row-height:\s*[\d.]+em\s*;", root), (
+        "the row height must scale with the font, or a browser-imposed "
+        "minimum font size clips the last row instead of growing the box"
+    )
+
+
+def test_the_five_entry_outdoor_card_reserves_an_extra_row(html):
+    """The precipitation card carries #42's pressure overlay as a 5th entry.
+
+    Measured at 375px and 390px it wraps to three rows where every other card
+    needs two, so without its own reservation `overflow: hidden` clips the
+    pressure reading away entirely — on the phone #87 exists to serve.
+    """
+    body = _rule_body(html, '.card[data-outdoor="precipitation"] .u-legend')
+    assert body is not None, "precipitation card has no legend-height override"
+    assert re.search(r"--legend-rows:\s*3\s*;", body)
+
+
+def test_plot_container_clips_its_contents(html):
+    """The outer guarantee: nothing inside a card paints outside it."""
+    body = _rule_body(html, ".plot")
+    assert body is not None
+    assert "overflow: hidden" in body
+
+
+def test_every_chart_registers_the_touch_cursor_plugin(js):
+    """Counted, not named — a new chart factory that forgets it fails here."""
+    plots = len(re.findall(r"\bnew uPlot\(", js))
+    registrations = len(re.findall(r"(?<!function )\btouchCursorPlugin\(\)", js))
+    assert plots >= 2, f"expected at least two uPlot instantiations, found {plots}"
+    assert registrations == plots, (
+        f"{plots} charts but {registrations} touchCursorPlugin() registrations — "
+        "a chart without it has no touch path to the crosshair (#87)"
+    )
+
+
+def test_touch_cursor_publishes_to_the_sync_group(js):
+    """`setCursor(opts)` moves one chart; the third argument moves all of them.
+
+    Without `_pub` the scrubbed card updates and the other five stay at "--",
+    which is a subtler version of the bug #87 is about.
+    """
+    call = re.search(r"u\.setCursor\(\s*\{[^}]*\},\s*([^)]*)\)", js)
+    assert call is not None, "touch handler no longer calls u.setCursor"
+    args = [a.strip() for a in call.group(1).split(",") if a.strip()]
+    assert args == ["true", "true"], (
+        f"expected setCursor(opts, _fire, _pub) with both true, got {args}"
+    )
+
+
+def test_touch_handlers_track_the_finger_on_this_chart(js):
+    """`touches` is every finger on the screen; `targetTouches` is ours.
+
+    With a finger already resting anywhere on the page, `e.touches[0]` is that
+    stationary finger: `start` records its coordinates, every move re-reads it,
+    dx/dy stay at zero, the axis never locks and the drag silently does
+    nothing. The same wrong-finger read turns a pinch into a scrub.
+    """
+    assert "e.touches[" not in js, "touch handlers must read e.targetTouches"
+    assert js.count("e.targetTouches[0]") == 2, (
+        "touchstart and touchmove both read the finger on this chart"
+    )
+    assert "e.changedTouches[0]" in js, (
+        "touchend has no live touches — the lifted finger is in changedTouches"
+    )
+
+
+def test_touch_listeners_stay_passive(js):
+    """`touch-action: pan-y` does the scroll arbitration, not preventDefault.
+
+    A non-passive touch listener here would let a future edit block scrolling
+    on every chart — the exact failure #36 fixed.
+    """
+    handlers = re.findall(
+        r'addEventListener\(\s*"(touch\w+)"(.*?)\{\s*passive:\s*(\w+)\s*\}',
+        js,
+        re.DOTALL,
+    )
+    assert handlers, "no touch listeners found in dashboard.js"
+    # Superset, not equality: the three below are what the crosshair needs, and
+    # a fourth (touchcancel) is hardening, not a regression.
+    assert {name for name, _, _ in handlers} >= {
+        "touchstart",
+        "touchmove",
+        "touchend",
+    }
+    for name, body, passive in handlers:
+        assert passive == "true", f"{name} listener is not passive"
+        assert "preventDefault" not in body, f"{name} calls preventDefault"
+
+
+def test_touch_reads_are_clamped_to_the_plot_area(js):
+    """An unclamped left below zero blanks every synced card at once.
+
+    Implicit touch capture keeps delivering touchmove after the finger leaves
+    the element, and the plot area starts ~65px into the card, so scrubbing
+    left toward older data crosses zero well before the finger leaves the
+    screen. uPlot then nulls the cursor index and — because the read publishes
+    to the sync group — every legend on the page snaps back to "--" and stays
+    there, since touchend only re-reads for a tap.
+    """
+    assert re.search(r"const clamp = \(", js), "the clamp helper is gone"
+    call = re.search(r"u\.setCursor\(\s*\{(.*?)\},", js, re.DOTALL)
+    assert call is not None, "touch handler no longer calls u.setCursor"
+    args = call.group(1)
+    assert "left: clamp(" in args, "left is passed to setCursor unclamped"
+    assert "top: clamp(" in args, "top is passed to setCursor unclamped"

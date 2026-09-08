@@ -122,6 +122,123 @@
     };
   }
 
+  // uPlot binds its cursor to mouse events only, and no browser synthesises
+  // mousemove during a touch drag — so on a phone there is no gesture that
+  // reads a value off a chart and the legend never populates (#87). Drive the
+  // cursor from touch directly instead of hoping for compatibility events.
+  //
+  // `.plot { touch-action: pan-y }` already hands vertical gestures to the
+  // page and horizontal ones to us, so these listeners stay passive and never
+  // preventDefault. The axis lock is still needed on top of that: a vertical
+  // page scroll that starts on a chart streams touchmove at us the whole way
+  // down the page, and without the lock the crosshair rides along with it.
+  const TOUCH_AXIS_LOCK_PX = 8;
+
+  function touchCursorPlugin() {
+    return {
+      hooks: {
+        ready: (u) => {
+          let start = null;
+          let axis = null;
+          // Captured once per gesture rather than per touchmove: reading it in
+          // the move handler forces a synchronous layout right after the
+          // previous move retransformed eight plots. Safe to cache because an
+          // x-locked gesture is one `touch-action: pan-y` will not scroll.
+          let rect = null;
+
+          // uPlot nulls the cursor index — and blanks the legend to "--" — for
+          // a left below zero or a top past the plot height, and with _pub on
+          // that blank publishes to every synced card. The plot area starts
+          // ~65px into the card, so scrubbing left toward older data crosses
+          // zero long before the finger leaves the screen. Clamp so the read
+          // saturates at the edge instead of wiping the page.
+          const clamp = (v, hi) => (v < 0 ? 0 : v > hi ? hi : v);
+
+          // (_fire, _pub) — _pub is what republishes to the `awair` sync
+          // group, so scrubbing one card moves the crosshair on all of them
+          // the way a mouse does. Omit it and the other five cards stay "--".
+          const readAt = (touch) => {
+            if (rect === null) return;
+            u.setCursor(
+              {
+                left: clamp(touch.clientX - rect.left, rect.width - 1),
+                top: clamp(touch.clientY - rect.top, rect.height - 1),
+              },
+              true,
+              true
+            );
+          };
+
+          u.over.addEventListener(
+            "touchstart",
+            (e) => {
+              // targetTouches, not touches: `touches` is every finger on the
+              // screen, so a finger already resting elsewhere would be the one
+              // we tracked and the gesture would silently never move.
+              const touch = e.targetTouches[0];
+              if (!touch) return;
+              start = { x: touch.clientX, y: touch.clientY };
+              axis = null;
+              rect = u.over.getBoundingClientRect();
+              // Deliberately no read here. A gesture that turns out to be a
+              // page scroll would otherwise still yank the crosshair to
+              // wherever the finger happened to land. Taps read on touchend.
+            },
+            { passive: true }
+          );
+
+          u.over.addEventListener(
+            "touchmove",
+            (e) => {
+              const touch = e.targetTouches[0];
+              if (!touch || start === null) return;
+              if (axis === null) {
+                const dx = Math.abs(touch.clientX - start.x);
+                const dy = Math.abs(touch.clientY - start.y);
+                if (Math.max(dx, dy) < TOUCH_AXIS_LOCK_PX) return;
+                // Locked once and kept for the rest of the gesture: a scroll
+                // that drifts sideways halfway down must not become a scrub.
+                axis = dx > dy ? "x" : "y";
+              }
+              if (axis === "x") readAt(touch);
+            },
+            { passive: true }
+          );
+
+          u.over.addEventListener(
+            "touchend",
+            (e) => {
+              const touch = e.changedTouches[0];
+              // axis === null means the finger never travelled far enough to
+              // be classified — that is a tap, and a tap is a read.
+              if (touch && start !== null && axis === null) readAt(touch);
+              start = null;
+              axis = null;
+              rect = null;
+            },
+            { passive: true }
+          );
+
+          // touchcancel is the same teardown: the OS took the gesture (a call
+          // arrived, a system edge-swipe won) and no touchend is coming.
+          u.over.addEventListener(
+            "touchcancel",
+            () => {
+              start = null;
+              axis = null;
+              rect = null;
+            },
+            { passive: true }
+          );
+
+          // Nothing clears the values afterwards, on purpose. There is no
+          // mouseleave on touch, and leaving the last-read values on screen
+          // is the whole point — clearing them puts us back at #87.
+        },
+      },
+    };
+  }
+
   // Dashed horizontal reference line at the alert ceiling for this metric.
   // Anchors the eye when uPlot autoscales Y to a peak so 1500 ppb VOC doesn't
   // read as "cleared" when it's still 15× baseline and above the ceiling (#25).
@@ -163,7 +280,11 @@
     // spikes.METRICS. Missing → no reference line for this chart.
     const ceilingRaw = card.dataset.ceiling;
     const ceiling = ceilingRaw ? Number(ceilingRaw) : null;
-    const plugins = [eventWashPlugin(metric), sunMoonMarkersPlugin()];
+    const plugins = [
+      eventWashPlugin(metric),
+      sunMoonMarkersPlugin(),
+      touchCursorPlugin(),
+    ];
     if (ceiling != null && Number.isFinite(ceiling)) {
       plugins.push(ceilingLinePlugin(ceiling));
     }
@@ -354,7 +475,7 @@
         bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
         series: seriesConfig,
         axes,
-        plugins: [sunMoonMarkersPlugin()],
+        plugins: [sunMoonMarkersPlugin(), touchCursorPlugin()],
       },
       data,
       plotEl
