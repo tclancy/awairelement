@@ -10,10 +10,14 @@
   --surface-1: #fcfcfb; --page: #f9f9f7;
   --ink-1: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
-  /* Two legend rows. One row measured 18.1px at 11px/1.5 with uPlot's
-     1em marker in the line box; 38px carries that with a little slack so a
-     font fallback cannot clip row two. */
-  --legend-height: 38px;
+  /* Rows of legend space to reserve. Expressed as a count x an em-based row
+     height rather than a px total, so a browser that overrides the legend's
+     11px (Chrome for Android's minimum-font-size, say) scales the reservation
+     with it instead of clipping. One row measured 18.1px at 11px/1.5 with
+     uPlot's 1em marker in the line box — 1.645em — and 1.7em carries that
+     with slack. */
+  --legend-rows: 2;
+  --legend-row-height: 1.7em;
   --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
@@ -97,15 +101,24 @@ main {
 /* recessive uPlot legend: small, muted, tabular values.
    The one-line lock is gone, but the reason for it was real — a populated
    legend growing taller than the idle "--" state shifts every card below it
-   on hover. Reserving two rows of space unconditionally is what keeps that
-   from happening now that wrapping is allowed: idle needs one row, every
-   populated legend measured needs two, and overflow: hidden holds the line
-   if a narrower viewport ever wants a third. Individual entries still never
-   split — uPlot's own `.u-series { white-space: nowrap }` does that. */
+   on hover. Reserving the wrapped height unconditionally is what keeps that
+   from happening now that wrapping is allowed: idle needs one row, and a
+   populated legend needs two (three on the precipitation card, below), so
+   reserve that much always. overflow: hidden holds the line if a narrower
+   viewport ever wants one more. An individual entry holds together because
+   uPlot emits no whitespace between its <th> and <td> — there is no nowrap
+   rule doing it, and below roughly 220px an entry does wrap inside itself. */
 .u-legend {
   font-size: 11px !important; color: var(--ink-muted) !important;
-  height: var(--legend-height); overflow: hidden;
+  height: calc(var(--legend-rows) * var(--legend-row-height));
+  overflow: hidden;
 }
+/* The precipitation card carries a fifth entry — #42's pressure overlay — and
+   at phone widths that wraps to three rows where every other card needs two.
+   Reserved per-card rather than raising the floor everywhere: two rows is the
+   honest reservation for the other seven, and the point of reserving at all is
+   that the height never changes, not that every card matches. */
+.card[data-outdoor="precipitation"] .u-legend { --legend-rows: 3; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }

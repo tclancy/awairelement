@@ -140,14 +140,30 @@
         ready: (u) => {
           let start = null;
           let axis = null;
+          // Captured once per gesture rather than per touchmove: reading it in
+          // the move handler forces a synchronous layout right after the
+          // previous move retransformed eight plots. Safe to cache because an
+          // x-locked gesture is one `touch-action: pan-y` will not scroll.
+          let rect = null;
+
+          // uPlot nulls the cursor index — and blanks the legend to "--" — for
+          // a left below zero or a top past the plot height, and with _pub on
+          // that blank publishes to every synced card. The plot area starts
+          // ~65px into the card, so scrubbing left toward older data crosses
+          // zero long before the finger leaves the screen. Clamp so the read
+          // saturates at the edge instead of wiping the page.
+          const clamp = (v, hi) => (v < 0 ? 0 : v > hi ? hi : v);
 
           // (_fire, _pub) — _pub is what republishes to the `awair` sync
           // group, so scrubbing one card moves the crosshair on all of them
           // the way a mouse does. Omit it and the other five cards stay "--".
           const readAt = (touch) => {
-            const rect = u.over.getBoundingClientRect();
+            if (rect === null) return;
             u.setCursor(
-              { left: touch.clientX - rect.left, top: touch.clientY - rect.top },
+              {
+                left: clamp(touch.clientX - rect.left, rect.width - 1),
+                top: clamp(touch.clientY - rect.top, rect.height - 1),
+              },
               true,
               true
             );
@@ -156,10 +172,14 @@
           u.over.addEventListener(
             "touchstart",
             (e) => {
-              const touch = e.touches[0];
+              // targetTouches, not touches: `touches` is every finger on the
+              // screen, so a finger already resting elsewhere would be the one
+              // we tracked and the gesture would silently never move.
+              const touch = e.targetTouches[0];
               if (!touch) return;
               start = { x: touch.clientX, y: touch.clientY };
               axis = null;
+              rect = u.over.getBoundingClientRect();
               // Deliberately no read here. A gesture that turns out to be a
               // page scroll would otherwise still yank the crosshair to
               // wherever the finger happened to land. Taps read on touchend.
@@ -170,7 +190,7 @@
           u.over.addEventListener(
             "touchmove",
             (e) => {
-              const touch = e.touches[0];
+              const touch = e.targetTouches[0];
               if (!touch || start === null) return;
               if (axis === null) {
                 const dx = Math.abs(touch.clientX - start.x);
@@ -194,6 +214,19 @@
               if (touch && start !== null && axis === null) readAt(touch);
               start = null;
               axis = null;
+              rect = null;
+            },
+            { passive: true }
+          );
+
+          // touchcancel is the same teardown: the OS took the gesture (a call
+          // arrived, a system edge-swipe won) and no touchend is coming.
+          u.over.addEventListener(
+            "touchcancel",
+            () => {
+              start = null;
+              axis = null;
+              rect = null;
             },
             { passive: true }
           );

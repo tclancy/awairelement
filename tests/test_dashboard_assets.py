@@ -15,6 +15,10 @@ These are deliberately structural rather than cosmetic. Each one pins the
 - uPlot binds its cursor to mouse events only, so every chart needs the touch
   plugin explicitly. Adding a third chart factory and forgetting it is the
   realistic regression, so the test counts plots rather than naming them (#87).
+- uPlot nulls its cursor index for an out-of-range left, and with sync
+  publishing on that blanks every card at once, so the touch read has to
+  clamp. That is asserted here because it is invisible in a mouse-only test:
+  a mouse cannot leave the element while still reporting moves to it.
 
 Browser-side behaviour (does the crosshair actually track a finger, does the
 card stay the same height on hover) is verified against a headless Chromium at
@@ -87,15 +91,40 @@ def test_legend_is_not_locked_to_one_line(html):
 
 
 def test_legend_reserves_a_fixed_height_and_clips(html):
-    """No layout shift on hover, and a third row can never spill the card."""
+    """No layout shift on hover, and an extra row can never spill the card.
+
+    The `height:` here has to be anchored rather than substring-matched:
+    `min-height: var(--legend-rows)...` contains the same text and is exactly
+    the regression, since a min-height lets the legend grow on hover again.
+    """
     body = _rule_body(html, ".u-legend")
+    assert body is not None, "`.u-legend` rule is gone"
     assert "overflow: hidden" in body
-    assert "height: var(--legend-height)" in body
-    root = _rule_body(html, ":root")
-    assert re.search(r"--legend-height:\s*\d+px", root), (
-        "--legend-height must be a fixed length; a content-derived height "
-        "re-introduces the hover shift the nowrap lock was there to prevent"
+    assert re.search(r"(?:^|;)\s*height:\s*calc\(var\(--legend-rows\)", body), (
+        "legend height must be a plain `height`, not a min-/max- variant"
     )
+    root = _rule_body(html, ":root")
+    assert root is not None, "`:root` custom properties are gone"
+    assert re.search(r"--legend-rows:\s*\d+\s*;", root), (
+        "--legend-rows must be a whole number of rows; a content-derived "
+        "height re-introduces the hover shift the nowrap lock was there to stop"
+    )
+    assert re.search(r"--legend-row-height:\s*[\d.]+em\s*;", root), (
+        "the row height must scale with the font, or a browser-imposed "
+        "minimum font size clips the last row instead of growing the box"
+    )
+
+
+def test_the_five_entry_outdoor_card_reserves_an_extra_row(html):
+    """The precipitation card carries #42's pressure overlay as a 5th entry.
+
+    Measured at 375px and 390px it wraps to three rows where every other card
+    needs two, so without its own reservation `overflow: hidden` clips the
+    pressure reading away entirely — on the phone #87 exists to serve.
+    """
+    body = _rule_body(html, '.card[data-outdoor="precipitation"] .u-legend')
+    assert body is not None, "precipitation card has no legend-height override"
+    assert re.search(r"--legend-rows:\s*3\s*;", body)
 
 
 def test_plot_container_clips_its_contents(html):
@@ -130,6 +159,23 @@ def test_touch_cursor_publishes_to_the_sync_group(js):
     )
 
 
+def test_touch_handlers_track_the_finger_on_this_chart(js):
+    """`touches` is every finger on the screen; `targetTouches` is ours.
+
+    With a finger already resting anywhere on the page, `e.touches[0]` is that
+    stationary finger: `start` records its coordinates, every move re-reads it,
+    dx/dy stay at zero, the axis never locks and the drag silently does
+    nothing. The same wrong-finger read turns a pinch into a scrub.
+    """
+    assert "e.touches[" not in js, "touch handlers must read e.targetTouches"
+    assert js.count("e.targetTouches[0]") == 2, (
+        "touchstart and touchmove both read the finger on this chart"
+    )
+    assert "e.changedTouches[0]" in js, (
+        "touchend has no live touches — the lifted finger is in changedTouches"
+    )
+
+
 def test_touch_listeners_stay_passive(js):
     """`touch-action: pan-y` does the scroll arbitration, not preventDefault.
 
@@ -142,7 +188,31 @@ def test_touch_listeners_stay_passive(js):
         re.DOTALL,
     )
     assert handlers, "no touch listeners found in dashboard.js"
-    assert {name for name, _, _ in handlers} == {"touchstart", "touchmove", "touchend"}
+    # Superset, not equality: the three below are what the crosshair needs, and
+    # a fourth (touchcancel) is hardening, not a regression.
+    assert {name for name, _, _ in handlers} >= {
+        "touchstart",
+        "touchmove",
+        "touchend",
+    }
     for name, body, passive in handlers:
         assert passive == "true", f"{name} listener is not passive"
         assert "preventDefault" not in body, f"{name} calls preventDefault"
+
+
+def test_touch_reads_are_clamped_to_the_plot_area(js):
+    """An unclamped left below zero blanks every synced card at once.
+
+    Implicit touch capture keeps delivering touchmove after the finger leaves
+    the element, and the plot area starts ~65px into the card, so scrubbing
+    left toward older data crosses zero well before the finger leaves the
+    screen. uPlot then nulls the cursor index and — because the read publishes
+    to the sync group — every legend on the page snaps back to "--" and stays
+    there, since touchend only re-reads for a tap.
+    """
+    assert re.search(r"const clamp = \(", js), "the clamp helper is gone"
+    call = re.search(r"u\.setCursor\(\s*\{(.*?)\},", js, re.DOTALL)
+    assert call is not None, "touch handler no longer calls u.setCursor"
+    args = call.group(1)
+    assert "left: clamp(" in args, "left is passed to setCursor unclamped"
+    assert "top: clamp(" in args, "top is passed to setCursor unclamped"
