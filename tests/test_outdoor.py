@@ -557,3 +557,65 @@ def test_a_date_only_weather_time_is_deliberately_unchanged():
     payload = {"current": dict(WEATHER["current"], time="2026-07-12")}
     reading = parse_reading(payload, AIR_QUALITY, RECEIVED)
     assert reading["ts"] == "2026-07-12T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    ("zone_only", "hour_it_would_have_invented"),
+    [
+        ("2026-07-12+05:00", "2026-07-12T05:00:00+00:00"),
+        ("2026-07-12-05:00", "2026-07-12T05:00:00+00:00"),
+        ("20260712+0500", "2026-07-12T05:00:00+00:00"),
+    ],
+)
+def test_a_date_with_only_a_zone_designator_degrades_to_null(
+    zone_only, hour_it_would_have_invented
+):
+    """The hole the first #77 fix left, found in review rather than by measurement.
+
+    `datetime.fromisoformat` takes *any single character* as the date/time
+    separator, so it reads `"2026-07-12+05:00"` as the 12th at 05:00 -- while
+    `date.fromisoformat` rejects that string outright. A guard built on
+    `date.fromisoformat` alone therefore waves it through, and the row stores an
+    observation time an hour further from the truth than the midnight case, with
+    no warning at all. Stripping the zone designator first is what closes it.
+
+    The second parameter asserts the fabricated value, so a regression that
+    reinstates it fails here on the hour rather than merely on an `is None`.
+    """
+    from datetime import UTC, datetime
+
+    assert (
+        datetime.fromisoformat(zone_only).replace(tzinfo=UTC).isoformat()
+        == hour_it_would_have_invented
+    ), "fixture no longer reproduces the fabricating shape it was written for"
+
+    payload = {"current": dict(AIR_QUALITY["current"], time=zone_only)}
+    reading = parse_reading(WEATHER, payload, RECEIVED)
+    assert reading["aq_ts"] is None
+    assert reading["us_aqi"] == 32
+
+
+def test_the_zone_strip_does_not_eat_a_real_offset_or_a_week_date():
+    """The two things `_ZONE_SUFFIX` must not match, pinned as behaviour.
+
+    A pattern loose enough to strip `"+05:00"` is one edit away from eating the
+    `-1` of the ISO week date `"2026-W28-1"` (which would then read as the
+    date-only `"2026-W28"` -- still rejected, so that failure is invisible here)
+    or the `0400` of `"20260712 0400"` (which would read as the date-only
+    `"20260712"` and *silently drop a real reading*). The second is the
+    dangerous one, so both directions are asserted.
+    """
+    kept = {"current": dict(AIR_QUALITY["current"], time="2026-07-12T04:00+05:00")}
+    assert (
+        parse_reading(WEATHER, kept, RECEIVED)["aq_ts"] == "2026-07-12T04:00:00+05:00"
+    )
+
+    basic = {"current": dict(AIR_QUALITY["current"], time="20260712 0400")}
+    assert (
+        parse_reading(WEATHER, basic, RECEIVED)["aq_ts"] == "2026-07-12T04:00:00+00:00"
+    )
+
+    week = {"current": dict(AIR_QUALITY["current"], time="2026-W28-1T04:00")}
+    assert (
+        parse_reading(WEATHER, week, RECEIVED)["aq_ts"] == "2026-07-06T04:00:00+00:00"
+    )

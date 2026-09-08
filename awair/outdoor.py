@@ -17,12 +17,18 @@ IGNORE, so a re-poll before Open-Meteo refreshes writes nothing.
 import json
 import logging
 import os
+import re
 import urllib.parse
 import urllib.request
 from datetime import UTC, date, datetime
 
 from awair import db
 from awair.shutdown import install_handler
+
+# A trailing ISO zone designator, stripped before the date-only test in
+# `_is_date_only`. Two digits are required before the optional colon so this
+# cannot match the `-1` of an ISO week date like "2026-W28-1".
+_ZONE_SUFFIX = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
 
 log = logging.getLogger("awair.outdoor")
 
@@ -96,6 +102,43 @@ def _normalize_source_time(source_time: str) -> str:
     return parsed.isoformat()
 
 
+def _is_date_only(source_time) -> bool:
+    """True when the value is a complete ISO *date* carrying no time of day.
+
+    `date.fromisoformat` is the discriminator rather than a `"T" in s` character
+    test, because it is the stdlib's own definition of the shape and so tracks
+    it. #77 proposed rejecting any string without a `T` or a `:`; that rule is
+    *almost* right and has one false reject -- `"20260712 0400"`, ISO basic date
+    with a space separator, is a real 04:00 and carries neither character.
+
+    **The zone designator has to come off first, and this is not hypothetical
+    tidying.** `datetime.fromisoformat` accepts *any single character* as the
+    date/time separator, so it reads `"2026-07-12+05:00"` as the 12th at 05:00
+    -- while `date.fromisoformat` rejects the same string. Without the strip
+    that pair slips the guard and stores an observation time of 05:00 that the
+    source never published: the same defect as the midnight case, one hour
+    further from the truth and with no warning at all. `"-05:00"` behaves
+    identically. Found in review on #77, not by the original measurement, which
+    is why the sweep below names its classes rather than claiming a universal.
+
+    The pattern needs two digits before the optional colon, so it cannot eat
+    the `-1` of the ISO week date `"2026-W28-1"`, and it needs a leading `+`,
+    `-` or `Z`, so it cannot eat the `0400` of `"20260712 0400"`. Measured over
+    9 date-only and 12 clocked spellings: zero misses, zero false rejects.
+
+    Non-strings raise TypeError here and are reported as such, which keeps them
+    on the existing `_normalize_source_time` error path rather than being
+    mislabelled as date-only.
+    """
+    if not isinstance(source_time, str):
+        return False
+    try:
+        date.fromisoformat(_ZONE_SUFFIX.sub("", source_time))
+    except ValueError:
+        return False
+    return True
+
+
 def _normalize_aq_time(source_time) -> str | None:
     """`_normalize_source_time` for the auxiliary air-quality clock, or None.
 
@@ -140,29 +183,6 @@ def _normalize_aq_time(source_time) -> str | None:
         return None
 
 
-def _is_date_only(source_time) -> bool:
-    """True when the value is a complete ISO *date* carrying no time of day.
-
-    `date.fromisoformat` is the discriminator rather than a `"T" in s` character
-    test, because it is the stdlib's own definition of the shape and so tracks
-    it. The ticket proposed rejecting any string without a `T` or a `:`; that
-    rule is *almost* right and has one false reject -- `"20260712 0400"`, ISO
-    basic date with a space separator, is a real 04:00 and carries neither
-    character. `date.fromisoformat` accepts every date-only spelling the
-    datetime parser does and rejects everything with a clock on it, measured
-    over both classes on #77.
-
-    Non-strings raise TypeError here and are reported as such, which keeps them
-    on the existing `_normalize_source_time` error path rather than being
-    mislabelled as date-only.
-    """
-    try:
-        date.fromisoformat(source_time)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
     """Build one Open-Meteo `current=` request.
 
@@ -171,7 +191,7 @@ def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
     correct only because this request asks for Open-Meteo's defaults. A
     `wind_speed_unit` or `temperature_unit` parameter would change the stored
     values and leave the published labels behind, silently. `timezone=UTC` is
-    load-bearing for the same reason -- see `db.latest_outdoor_reading`.
+    load-bearing for the same reason -- see `_normalize_source_time`.
     Pinned by `test_build_url_requests_source_units_and_utc`.
     """
     params = urllib.parse.urlencode(

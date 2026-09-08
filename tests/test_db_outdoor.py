@@ -217,6 +217,15 @@ def test_schema_column_order_matches_a_migrated_database():
 
     Built by actually running both paths rather than by parsing the SQL, so it
     fails if `_migrate` changes too, not only if SCHEMA does.
+
+    **Scoped to the two columns #71 added, and it cannot grow itself.** The
+    "old" DB is derived from the current SCHEMA by dropping exactly those two,
+    so a *future* column added to SCHEMA with no matching `_migrate` ALTER
+    appears on both sides and survives this test -- measured, not assumed. The
+    `fresh_order[-2:]` assertion below catches the ordering half of that
+    (a new column appended after `aq_ts` fails here), but the missing-ALTER half
+    needs the drop list to track `_migrate`. Add the column to both lists when
+    you add the ALTER.
     """
     import sqlite3
 
