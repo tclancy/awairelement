@@ -10,6 +10,10 @@
   --surface-1: #fcfcfb; --page: #f9f9f7;
   --ink-1: #0b0b0b; --ink-2: #52514e; --ink-muted: #898781;
   --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  /* Two legend rows. One row measured 18.1px at 11px/1.5 with uPlot's
+     1em marker in the line box; 38px carries that with a little slack so a
+     font fallback cannot clip row two. */
+  --legend-height: 38px;
   --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
@@ -77,14 +81,30 @@ main {
 /* Let vertical panning pass through the plot to the page. uPlot's cursor
    otherwise captures every touch and "wants to select the graph" instead
    of scrolling — the exact failure #36 reports. Horizontal gestures still
-   reach the crosshair. */
-.plot { min-height: 150px; touch-action: pan-y; }
-/* recessive uPlot legend: small, muted, tabular values. Locked to one
-   line — a populated legend wrapping taller than the idle "--" state
-   shifts every card below it on hover. */
+   reach the crosshair, and touchCursorPlugin in dashboard.js is what turns
+   them into a crosshair read (#87).
+   overflow: hidden is the outer guarantee for #86 — whatever uPlot sizes
+   itself to, nothing inside a card ever paints outside it. */
+.plot { min-height: 150px; touch-action: pan-y; overflow: hidden; }
+/* uplot.min.css sizes the chart root with `width: min-content`, and the
+   min-content width of a nowrap legend is the entire populated string. So
+   the old one-line lock did not clip the legend, it grew the whole chart:
+   at a 390px viewport the card is 334px and the populated legend measured
+   415px (co2), 460px (temp) and 604px (precipitation, which carries the
+   extra Pressure series), spilling over the neighbouring card (#86).
+   Pin the root to the card instead, and let the legend wrap inside it. */
+.plot .uplot { width: 100%; }
+/* recessive uPlot legend: small, muted, tabular values.
+   The one-line lock is gone, but the reason for it was real — a populated
+   legend growing taller than the idle "--" state shifts every card below it
+   on hover. Reserving two rows of space unconditionally is what keeps that
+   from happening now that wrapping is allowed: idle needs one row, every
+   populated legend measured needs two, and overflow: hidden holds the line
+   if a narrower viewport ever wants a third. Individual entries still never
+   split — uPlot's own `.u-series { white-space: nowrap }` does that. */
 .u-legend {
   font-size: 11px !important; color: var(--ink-muted) !important;
-  white-space: nowrap; overflow: hidden;
+  height: var(--legend-height); overflow: hidden;
 }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
