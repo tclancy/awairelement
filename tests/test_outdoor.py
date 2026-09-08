@@ -540,23 +540,186 @@ def test_a_non_string_aq_time_is_reported_as_unparseable_not_as_date_only(caplog
     assert not any("no time of day" in m for m in messages)
 
 
-def test_a_date_only_weather_time_is_deliberately_unchanged():
-    """#77 fixed `aq_ts` only, and this pins that the blast radius stopped there.
+@pytest.mark.parametrize(
+    ("clockless", "midnight_it_used_to_invent"),
+    [
+        ("2026-07-12", "2026-07-12T00:00:00+00:00"),
+        ("20260712", "2026-07-12T00:00:00+00:00"),
+        ("2026-W28-1", "2026-07-06T00:00:00+00:00"),
+        # Zone-only: `datetime.fromisoformat` takes any single character as the
+        # date/time separator, so these fabricate an *hour*, not a midnight.
+        ("2026-07-12+05:00", "2026-07-12T05:00:00+00:00"),
+        ("2026-07-12-05:00", "2026-07-12T05:00:00+00:00"),
+        ("20260712+0500", "2026-07-12T05:00:00+00:00"),
+    ],
+)
+def test_a_date_only_weather_time_raises_rather_than_inventing_a_clock(
+    clockless, midnight_it_used_to_invent
+):
+    """`ts` gets #77's guard too, now that `poll_once` survives the raise (#91).
 
-    Putting the same guard on `_normalize_source_time` would fix `ts` too, and
-    that is *not* a free win: `poll_once` wraps `parse_reading` in
-    `except KeyError` alone, so a ValueError from the weather clock escapes the
-    `while` loop in `main()` and stops the poller process. Tightening the
-    weather path would convert "stores a wrong midnight" into "the outdoor
-    poller exits", which is a worse failure and a separate ticket.
+    This replaces `test_a_date_only_weather_time_is_deliberately_unchanged`,
+    which pinned the *old* behaviour and said explicitly why: tightening the
+    weather clock while `poll_once` caught `KeyError` alone would have converted
+    "stores a wrong midnight" into "the poller process exits". `poll_once` now
+    catches the raise and returns `"error"`, so the constraint is gone and the
+    guard moves into `_normalize_source_time`, where it covers both clocks.
 
-    So this asserts the *current* behaviour rather than the desired one, and
-    says why. If a later change makes the weather path reject date-only input,
-    this test should be deleted along with the poll-loop fix -- not before.
+    The second parameter is asserted, not decoration: it pins the value the old
+    code stored, so a regression that reinstates the fabrication fails here on
+    the fabricated instant rather than merely on a missing raise.
+    """
+    from datetime import UTC, datetime
+
+    assert (
+        datetime.fromisoformat(clockless).replace(tzinfo=UTC).isoformat()
+        == midnight_it_used_to_invent
+    ), "fixture no longer reproduces the fabricating shape it was written for"
+
+    payload = {"current": dict(WEATHER["current"], time=clockless)}
+    with pytest.raises(ValueError):
+        parse_reading(payload, AIR_QUALITY, RECEIVED)
+
+
+def test_a_date_only_weather_time_says_so_rather_than_just_failing_to_parse(caplog):
+    """The two rejections are indistinguishable to a reader without this.
+
+    `"not-a-timestamp"` and `"2026-07-12"` both raise `ValueError` now, but only
+    one of them is upstream publishing a *shape* we refuse on purpose. The
+    message is what tells whoever reads the log at 15-minute intervals which
+    one they have.
     """
     payload = {"current": dict(WEATHER["current"], time="2026-07-12")}
-    reading = parse_reading(payload, AIR_QUALITY, RECEIVED)
-    assert reading["ts"] == "2026-07-12T00:00:00+00:00"
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        with pytest.raises(ValueError) as raised:
+            parse_reading(payload, AIR_QUALITY, RECEIVED)
+    assert "no time of day" in str(raised.value)
+    assert "2026-07-12" in str(raised.value)
+
+
+# --- poll_once survives a bad weather clock (#91) ----------------------------
+#
+# `parse_reading` raising is the correct contract and was already tested. What
+# was untested -- and is the whole of #91 -- is that `poll_once` *catches* it.
+# It caught `KeyError` alone, so an unparseable `current.time` unwound the
+# `while` loop in `main()` and the process exited; systemd restarted it and it
+# died again for as long as the source kept publishing the bad value.
+
+
+@pytest.mark.parametrize(
+    ("bad_time", "escaping_exception"),
+    [
+        # ValueError out of `datetime.fromisoformat`.
+        ("not-a-timestamp", "ValueError"),
+        ("", "ValueError"),
+        # Date-only, newly rejected by `_normalize_source_time` above.
+        ("2026-07-12", "ValueError"),
+        ("2026-07-12+05:00", "ValueError"),
+        # TypeError, NOT ValueError: a JSON `null` reaches `fromisoformat` as
+        # None. The ticket prescribed `except (KeyError, ValueError)`, which
+        # leaves this one killing the poller exactly as before.
+        (None, "TypeError"),
+        (1752300000, "TypeError"),
+    ],
+)
+def test_poll_once_survives_a_bad_weather_time(conn, bad_time, escaping_exception):
+    payload = {"current": dict(WEATHER["current"], time=bad_time)}
+
+    with pytest.raises((ValueError, TypeError)) as raised:
+        parse_reading(payload, AIR_QUALITY, RECEIVED)
+    assert type(raised.value).__name__ == escaping_exception, (
+        "fixture no longer reproduces the exception class it was written for"
+    )
+
+    assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
+        "error"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+
+
+def test_poll_once_survives_a_non_dict_current_block(conn):
+    """A separate TypeError path: `current` is a list, so `["time"]` raises.
+
+    Not reachable through the `time` parametrize above, and not a `KeyError`, so
+    the pre-#91 catch missed it too.
+    """
+    payload = {"current": []}
+    with pytest.raises(TypeError):
+        parse_reading(payload, AIR_QUALITY, RECEIVED)
+    assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
+        "error"
+    )
+
+
+def test_a_date_only_weather_time_no_longer_locks_out_the_rest_of_the_day(conn):
+    """The measured half of #91: one row per *day*, silently, at INFO.
+
+    A date-only time made `ts` midnight, and `ts` is the PRIMARY KEY under
+    `INSERT OR IGNORE`, so the first poll of the day inserted the fabricated
+    midnight row and every later poll that day returned `"duplicate"` and wrote
+    nothing -- logged at INFO, which is the level a healthy dedup uses.
+
+    Now every affected poll is an `"error"` (logged at WARNING by `main`), no
+    fabricated row is stored, and the moment upstream publishes a real clock the
+    reading lands.
+    """
+    date_only = json.dumps({"current": dict(WEATHER["current"], time="2026-07-12")})
+    statuses = [
+        poll_once(conn, lambda: date_only, lambda: AIR_QUALITY_TEXT) for _ in range(3)
+    ]
+    assert statuses == ["error", "error", "error"]
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+
+    # Upstream recovers mid-day: the real reading is not shut out by a
+    # fabricated midnight row already holding the primary key.
+    assert poll_once(conn, lambda: WEATHER_TEXT, lambda: AIR_QUALITY_TEXT) == "inserted"
+    assert conn.execute("SELECT ts FROM outdoor_readings").fetchone()[0] == (
+        "2026-07-12T04:30:00+00:00"
+    )
+
+
+def test_main_keeps_polling_through_a_bad_weather_time(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """The process-level claim in #91, pinned where it actually bit.
+
+    Every assertion above is on `poll_once`'s return value, and a `poll_once`
+    that returns `"error"` is only useful if the loop that calls it is still
+    running. Before the fix this test raised `ValueError` out of `main()` --
+    which is the non-zero exit systemd sees, and then restarts into.
+
+    The first poll publishes an unparseable clock; the second publishes a good
+    one and asks to stop. A row from the *second* poll is the proof that the
+    loop survived the first.
+    """
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "0")
+
+    bad = json.dumps({"current": dict(WEATHER["current"], time="not-a-timestamp")})
+    polls = iter([bad, WEATHER_TEXT])
+
+    def weather():
+        payload = next(polls)
+        if payload is WEATHER_TEXT:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return payload
+
+    monkeypatch.setattr(
+        outdoor,
+        "make_fetch",
+        lambda url: weather if "air-quality" not in url else (lambda: AIR_QUALITY_TEXT),
+    )
+
+    outdoor.main()  # must not raise -- that is the whole bug
+
+    assert next(polls, None) is None, "the second poll never ran"
+    conn = outdoor.db.connect(str(tmp_path / "out.db"))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize(

@@ -75,33 +75,6 @@ AIR_QUALITY_TO_COLUMN = {
 }
 
 
-def _normalize_source_time(source_time: str) -> str:
-    """Canonicalize Open-Meteo's `current.time` to a full ISO UTC string.
-
-    Open-Meteo returns `"YYYY-MM-DDTHH:MM"` when polled with `timezone=UTC` —
-    minute precision, naive. Storing that verbatim breaks lexicographic
-    `WHERE ts >= ?` filters because the short form sorts *before* the full
-    ISO strings that callers pass in via `since.isoformat()`. Normalize
-    both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
-    time comparison.
-
-    **This only stamps `tzinfo` on a *naive* value.** A source time arriving
-    with a real non-UTC offset is stored verbatim as e.g. `...+05:00`, which
-    sorts and range-filters wrongly on `ts`, while `web._iso_utc` (which does
-    call `astimezone`) would still *publish* it correctly -- so the split is
-    silent in both directions. `timezone=UTC` in `_build_url` is the only
-    thing keeping it from arising, which is why
-    `test_build_url_requests_source_units_and_utc` pins that parameter.
-    (This paragraph lived on `db.latest_outdoor_reading` until #77. It
-    describes this function's behaviour, and that one can neither cause nor
-    fix it.)
-    """
-    parsed = datetime.fromisoformat(source_time)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.isoformat()
-
-
 def _is_date_only(source_time) -> bool:
     """True when the value is a complete ISO *date* carrying no time of day.
 
@@ -139,6 +112,47 @@ def _is_date_only(source_time) -> bool:
     return True
 
 
+def _normalize_source_time(source_time: str) -> str:
+    """Canonicalize Open-Meteo's `current.time` to a full ISO UTC string.
+
+    Open-Meteo returns `"YYYY-MM-DDTHH:MM"` when polled with `timezone=UTC` —
+    minute precision, naive. Storing that verbatim breaks lexicographic
+    `WHERE ts >= ?` filters because the short form sorts *before* the full
+    ISO strings that callers pass in via `since.isoformat()`. Normalize
+    both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
+    time comparison.
+
+    **This only stamps `tzinfo` on a *naive* value.** A source time arriving
+    with a real non-UTC offset is stored verbatim as e.g. `...+05:00`, which
+    sorts and range-filters wrongly on `ts`, while `web._iso_utc` (which does
+    call `astimezone`) would still *publish* it correctly -- so the split is
+    silent in both directions. `timezone=UTC` in `_build_url` is the only
+    thing keeping it from arising, which is why
+    `test_build_url_requests_source_units_and_utc` pins that parameter.
+    (This paragraph lived on `db.latest_outdoor_reading` until #77. It
+    describes this function's behaviour, and that one can neither cause nor
+    fix it.)
+
+    **A value carrying no time of day raises `ValueError` rather than being
+    silently clocked at midnight** (#91). `datetime.fromisoformat` accepts
+    `"2026-07-12"`, `"20260712"`, the ISO week date `"2026-W28-1"` and even
+    `"2026-07-12+05:00"`, defaulting the clock to `00:00` (or, for the last,
+    reading the offset as the time) -- so without this the caller stores an
+    observation instant the source never published. #77 put that guard on the
+    auxiliary clock only, and said why: `poll_once` caught `KeyError` alone, so
+    raising here would have killed the poller process instead of the row. That
+    constraint is gone -- `poll_once` now catches `TypeError` and `ValueError`
+    too -- so the guard belongs here, where it covers both clocks rather than
+    one.
+    """
+    if _is_date_only(source_time):
+        raise ValueError(f"source time carries no time of day: {source_time!r}")
+    parsed = datetime.fromisoformat(source_time)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.isoformat()
+
+
 def _normalize_aq_time(source_time) -> str | None:
     """`_normalize_source_time` for the auxiliary air-quality clock, or None.
 
@@ -169,6 +183,12 @@ def _normalize_aq_time(source_time) -> str | None:
     # (`test_an_absent_aq_time_is_silent_but_a_malformed_one_warns`).
     if not source_time:
         return None
+    # Also behaviourally redundant since #91 -- `_normalize_source_time` raises
+    # `ValueError` on a clockless value now, and the `except` below would
+    # degrade it to NULL anyway. Kept for the same reason as the branch above:
+    # the message. "carries no time of day" is upstream publishing a shape we
+    # refuse on purpose; "unparseable" is upstream being broken, and a reader
+    # scanning a 15-minute warning cadence needs to know which.
     if _is_date_only(source_time):
         log.warning(
             "air-quality current.time carries no time of day (%r); storing NULL "
@@ -277,8 +297,20 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
             air_quality_payload,
             received_at=datetime.now(UTC).isoformat(),
         )
-    except KeyError as exc:
-        log.warning("weather payload missing required field: %s", exc)
+    except (KeyError, TypeError, ValueError) as exc:
+        # KeyError: `current` or `time` absent. ValueError: `time` unparseable,
+        # or clockless and refused by `_normalize_source_time`. TypeError: a
+        # JSON `null` time reaching `fromisoformat`, or a non-dict `current`.
+        #
+        # All three used to escape and unwind the `while` loop in `main()`, so
+        # a single bad upstream clock exited the process; systemd restarted it
+        # into the same value (#91). Returning "error" costs one poll instead,
+        # and matches the documented contract for a fetch failure or bad JSON.
+        #
+        # TypeError is not optional. #91 prescribed `(KeyError, ValueError)`,
+        # which leaves a `"time": null` payload killing the poller exactly as
+        # before -- pinned by `test_poll_once_survives_a_bad_weather_time`.
+        log.warning("unusable weather payload: %s: %s", type(exc).__name__, exc)
         return "error"
     inserted = db.insert_outdoor_reading(conn, reading)
     if not inserted:
