@@ -19,7 +19,7 @@ import logging
 import os
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from awair import db
 from awair.shutdown import install_handler
@@ -78,6 +78,17 @@ def _normalize_source_time(source_time: str) -> str:
     ISO strings that callers pass in via `since.isoformat()`. Normalize
     both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
     time comparison.
+
+    **This only stamps `tzinfo` on a *naive* value.** A source time arriving
+    with a real non-UTC offset is stored verbatim as e.g. `...+05:00`, which
+    sorts and range-filters wrongly on `ts`, while `web._iso_utc` (which does
+    call `astimezone`) would still *publish* it correctly -- so the split is
+    silent in both directions. `timezone=UTC` in `_build_url` is the only
+    thing keeping it from arising, which is why
+    `test_build_url_requests_source_units_and_utc` pins that parameter.
+    (This paragraph lived on `db.latest_outdoor_reading` until #77. It
+    describes this function's behaviour, and that one can neither cause nor
+    fix it.)
     """
     parsed = datetime.fromisoformat(source_time)
     if parsed.tzinfo is None:
@@ -97,6 +108,14 @@ def _normalize_aq_time(source_time) -> str | None:
     Normalising rather than storing verbatim matters for the same reason it
     does for `ts`: the two are meant to be *subtracted*, and Open-Meteo's
     minute-precision naive form would compare as a different kind of thing.
+
+    A **date-only** value degrades to NULL too, rather than to midnight (#77).
+    `datetime.fromisoformat` accepts `"2026-07-12"`, `"20260712"` and the ISO
+    week date `"2026-W28-1"` and silently defaults the clock to `00:00`, which
+    would store an observation time the source never published -- the exact
+    thing GLOSSARY says this column exists to prevent. An explicitly published
+    midnight (`"2026-07-12T00:00"`) is a real reading and still stored, so the
+    test is structural, not a comparison against the parsed value.
     """
     # Behaviourally redundant -- `_normalize_source_time(None)` raises TypeError
     # and `("")` raises ValueError, both caught below. It is kept for the log:
@@ -107,11 +126,41 @@ def _normalize_aq_time(source_time) -> str | None:
     # (`test_an_absent_aq_time_is_silent_but_a_malformed_one_warns`).
     if not source_time:
         return None
+    if _is_date_only(source_time):
+        log.warning(
+            "air-quality current.time carries no time of day (%r); storing NULL "
+            "rather than inventing midnight",
+            source_time,
+        )
+        return None
     try:
         return _normalize_source_time(source_time)
     except (TypeError, ValueError) as exc:
         log.warning("air-quality current.time unparseable (%r): %s", source_time, exc)
         return None
+
+
+def _is_date_only(source_time) -> bool:
+    """True when the value is a complete ISO *date* carrying no time of day.
+
+    `date.fromisoformat` is the discriminator rather than a `"T" in s` character
+    test, because it is the stdlib's own definition of the shape and so tracks
+    it. The ticket proposed rejecting any string without a `T` or a `:`; that
+    rule is *almost* right and has one false reject -- `"20260712 0400"`, ISO
+    basic date with a space separator, is a real 04:00 and carries neither
+    character. `date.fromisoformat` accepts every date-only spelling the
+    datetime parser does and rejects everything with a clock on it, measured
+    over both classes on #77.
+
+    Non-strings raise TypeError here and are reported as such, which keeps them
+    on the existing `_normalize_source_time` error path rather than being
+    mislabelled as date-only.
+    """
+    try:
+        date.fromisoformat(source_time)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:

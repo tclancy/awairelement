@@ -47,12 +47,23 @@ CREATE TABLE IF NOT EXISTS fan_state (
     capped INTEGER NOT NULL DEFAULT 0
 );
 
+-- `weather_code` and `aq_ts` are ordered last, and in this order, to match what
+-- `_migrate` ALTERs onto an existing DB (#77). A fresh install and a migrated
+-- one otherwise end up with different physical column orders and SCHEMA stops
+-- describing a live database. Harmless while every query names its columns --
+-- which `test_schema_column_order_matches_a_migrated_database` keeps true --
+-- but SCHEMA is read as documentation, so it should not be false.
+--
+-- Keep this comment *outside* the CREATE TABLE. SQLite stores the statement
+-- text verbatim and re-parses it on ALTER TABLE ... DROP COLUMN; a comment
+-- between the columns is left dangling by the drop and the ALTER fails with
+-- "incomplete input".
 CREATE TABLE IF NOT EXISTS outdoor_readings (
     ts TEXT PRIMARY KEY,
     received_at TEXT NOT NULL,
     temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
-    weather_code INTEGER,
     pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL,
+    weather_code INTEGER,
     aq_ts TEXT
 );
 """
@@ -218,14 +229,9 @@ def latest_outdoor_reading(conn, columns) -> dict | None:
     genuinely does need the normalisation -- see that docstring. Do not
     "fix" this one with a backfill.)
 
-    The invariant that does need protecting is that `ts` is always UTC.
-    `_normalize_source_time` canonicalises the spelling but only stamps
-    `tzinfo` on a naive value -- a source time arriving with a real non-UTC
-    offset would be stored verbatim as e.g. `...+05:00` and would sort and
-    range-filter wrongly, while `web._iso_utc` (which does call `astimezone`)
-    would still *publish* it correctly. That split is silent in both
-    directions. Only `timezone=UTC` in `outdoor._build_url` keeps it from
-    arising.
+    The invariant that does need protecting is that `ts` is always UTC. That
+    is a property of `outdoor._normalize_source_time`, and the reasoning moved
+    onto it in #77 -- this function can neither cause nor fix it.
 
     Note this deliberately does NOT order by `received_at`. If Open-Meteo
     republishes a stale `current.time`, the older source reading is the correct
