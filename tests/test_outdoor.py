@@ -581,7 +581,7 @@ def test_a_date_only_weather_time_raises_rather_than_inventing_a_clock(
         parse_reading(payload, AIR_QUALITY, RECEIVED)
 
 
-def test_a_date_only_weather_time_says_so_rather_than_just_failing_to_parse(caplog):
+def test_a_date_only_weather_time_says_so_rather_than_just_failing_to_parse():
     """The two rejections are indistinguishable to a reader without this.
 
     `"not-a-timestamp"` and `"2026-07-12"` both raise `ValueError` now, but only
@@ -590,9 +590,8 @@ def test_a_date_only_weather_time_says_so_rather_than_just_failing_to_parse(capl
     one they have.
     """
     payload = {"current": dict(WEATHER["current"], time="2026-07-12")}
-    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
-        with pytest.raises(ValueError) as raised:
-            parse_reading(payload, AIR_QUALITY, RECEIVED)
+    with pytest.raises(ValueError) as raised:
+        parse_reading(payload, AIR_QUALITY, RECEIVED)
     assert "no time of day" in str(raised.value)
     assert "2026-07-12" in str(raised.value)
 
@@ -649,6 +648,7 @@ def test_poll_once_survives_a_non_dict_current_block(conn):
     assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
         "error"
     )
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
 
 
 def test_a_date_only_weather_time_no_longer_locks_out_the_rest_of_the_day(conn):
@@ -781,4 +781,137 @@ def test_the_zone_strip_does_not_eat_a_real_offset_or_a_week_date():
     week = {"current": dict(AIR_QUALITY["current"], time="2026-W28-1T04:00")}
     assert (
         parse_reading(WEATHER, week, RECEIVED)["aq_ts"] == "2026-07-06T04:00:00+00:00"
+    )
+
+
+# --- the same outage class on the air-quality side (#91 review) --------------
+#
+# `#91` was written about the weather clock and its fix covered `KeyError`,
+# `TypeError` and `ValueError`. The AQ block reaches its fields through
+# `.get`, so an unreadable *shape* there raises `AttributeError` -- not in that
+# tuple, and so still a process death. Symmetric to the non-dict `current`
+# case above, which is the weather side of the identical mistake.
+
+
+@pytest.mark.parametrize(
+    ("aq_body", "shape"),
+    [
+        ("[]", "payload is a list"),
+        ('"nope"', "payload is a string"),
+        ("7", "payload is a number"),
+        ('{"current": []}', "current is a list"),
+        ('{"current": "nope"}', "current is a string"),
+    ],
+)
+def test_an_unreadable_air_quality_block_is_partial_not_a_crash(conn, aq_body, shape):
+    """The weather row survives and the poll says so, rather than the process dying.
+
+    `"partial"` rather than `"error"` because the remedy is the one the status
+    already documents: an AQ problem must not wedge the weather write. All five
+    of these raised `AttributeError` out of `poll_once` before the review fix.
+    """
+    assert poll_once(conn, lambda: WEATHER_TEXT, lambda: aq_body) == "partial", shape
+    row = conn.execute("SELECT temp, us_aqi, aq_ts FROM outdoor_readings").fetchone()
+    assert row == (22.4, None, None)
+
+
+def test_an_unreadable_air_quality_block_does_not_crash_parse_reading_either(conn):
+    """`parse_reading` has direct callers, so the guard cannot live only in `poll_once`.
+
+    Its documented policy is that a missing AQ field degrades to NULL; a
+    `current` block of the wrong *type* is the same situation arriving through
+    the shape rather than through a key, and used to raise instead.
+    """
+    reading = parse_reading(WEATHER, {"current": []}, RECEIVED)
+    assert reading["us_aqi"] is None
+    assert reading["aq_ts"] is None
+    assert reading["temp"] == 22.4
+
+
+@pytest.mark.parametrize("failing_side", ["weather", "air-quality"])
+def test_a_fetcher_returning_none_does_not_kill_the_poller(conn, failing_side):
+    """`json.loads(None)` is a TypeError, and neither `except` used to catch it.
+
+    Not a hypothetical fetcher: it is what any `make_fetch` replacement that
+    forgets a `return` produces, and both call sites were one line from the
+    clock defect #91 is about.
+    """
+    none_fetch = lambda: None  # noqa: E731 -- the shape under test is its return
+    if failing_side == "weather":
+        assert poll_once(conn, none_fetch, lambda: AIR_QUALITY_TEXT) == "error"
+        assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+    else:
+        assert poll_once(conn, lambda: WEATHER_TEXT, none_fetch) == "partial"
+        assert conn.execute("SELECT us_aqi FROM outdoor_readings").fetchone()[0] is None
+
+
+def test_an_explicitly_published_midnight_weather_time_is_kept(conn):
+    """The reachability control for the `ts` guard (#91 review).
+
+    Every other assertion on the new guard is that it *rejects*. If the guard
+    ever became value-based -- `parsed.hour == 0 and parsed.minute == 0` rather
+    than "the string carries no time of day" -- it would start refusing this,
+    a real reading Open-Meteo publishes once a day, and the rejection tests
+    would all still pass. The AQ side has the same control at
+    `test_an_explicit_midnight_aq_time_is_kept`; this makes the `ts` path's own
+    local rather than inherited through the shared normaliser.
+    """
+    payload = {"current": dict(WEATHER["current"], time="2026-07-12T00:00")}
+    assert parse_reading(payload, AIR_QUALITY, RECEIVED)["ts"] == (
+        "2026-07-12T00:00:00+00:00"
+    )
+    assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
+        "inserted"
+    )
+
+
+def test_main_logs_an_unusable_payload_at_warning_not_info(
+    monkeypatch, tmp_path, restore_signal_handlers, caplog
+):
+    """After #91 the log level is the *only* remaining signal, so it is pinned.
+
+    Before this change a bad weather clock announced itself two ways: a
+    crash-loop in the journal, or a fabricated midnight row in the database.
+    Both are now gone by design -- nothing is written and the process survives
+    -- which leaves `main`'s WARNING as the whole of what a human can notice.
+    `GLOSSARY.md`'s **outdoor poll** entry asserts that level, and two test
+    docstrings lean on it.
+
+    Measured in review: deleting `poll_once`'s `log.warning` and adding
+    `"error"` to `main`'s INFO branch each left all 354 tests green.
+    """
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "0")
+
+    bad = json.dumps({"current": dict(WEATHER["current"], time="not-a-timestamp")})
+
+    def weather():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return bad
+
+    monkeypatch.setattr(
+        outdoor,
+        "make_fetch",
+        lambda url: weather if "air-quality" not in url else (lambda: AIR_QUALITY_TEXT),
+    )
+
+    with caplog.at_level(logging.INFO, logger="awair.outdoor"):
+        outdoor.main()
+
+    # The trailing colon matters -- `main`'s own "outdoor poller stopped
+    # cleanly" line starts with "outdoor poll" too, and matching it here made
+    # the first draft of this assertion fail for the wrong reason.
+    poll_lines = [
+        r for r in caplog.records if r.getMessage().startswith("outdoor poll:")
+    ]
+    assert [(r.levelno, r.getMessage()) for r in poll_lines] == [
+        (logging.WARNING, "outdoor poll: error")
+    ]
+    # And the reason, not just the verdict -- "error" alone does not say which
+    # of the four unusable-payload shapes arrived.
+    assert any(
+        r.levelno == logging.WARNING and "unusable weather payload" in r.getMessage()
+        for r in caplog.records
     )

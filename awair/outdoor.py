@@ -203,6 +203,26 @@ def _normalize_aq_time(source_time) -> str | None:
         return None
 
 
+def _is_readable_air_quality(payload) -> bool:
+    """True when the AQ block is an object whose `current` block is one too.
+
+    Anything else -- a JSON list, string or number, or a `current` that is one
+    -- raises `AttributeError` out of `.get`. That is the same process-death
+    class as #91's weather clock (it unwinds the `while` loop in `main()` and
+    systemd restarts into the same upstream value) and the #91 fix did not
+    cover it, because `AttributeError` is neither of the two exception types
+    the weather side raises. Found in review on #91, not by its measurement.
+
+    Read as an unusable *fetch* rather than a bad row: the weather half is
+    still worth writing, which is precisely what `"partial"` means. `None`
+    -- the shape `poll_once` uses for a failed AQ fetch -- is unreadable by
+    the same token, so this one predicate covers both callers.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return isinstance(payload.get("current", {}), dict)
+
+
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
     """Build one Open-Meteo `current=` request.
 
@@ -263,7 +283,7 @@ def parse_reading(
     reading["received_at"] = received_at
     for source_field, column in WEATHER_TO_COLUMN.items():
         reading[column] = weather_current.get(source_field)
-    if air_quality_payload is not None:
+    if _is_readable_air_quality(air_quality_payload):
         aq_current = air_quality_payload.get("current", {})
         for source_field, column in AIR_QUALITY_TO_COLUMN.items():
             reading[column] = aq_current.get(source_field)
@@ -281,14 +301,26 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
     """
     try:
         weather_payload = json.loads(fetch_weather())
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        # TypeError: a fetcher returning None is `json.loads(None)`. Same
+        # escaping-and-exiting shape as the clock defect, same slot in the
+        # tuple (#91 review).
         log.warning("weather fetch failed: %s", exc)
         return "error"
     try:
         air_quality_payload = json.loads(fetch_air_quality())
+        if not _is_readable_air_quality(air_quality_payload):
+            raise TypeError(
+                f"payload is a {type(air_quality_payload).__name__}, "
+                "or its `current` block is"
+            )
         status = "ok"
-    except (OSError, ValueError, KeyError) as exc:
-        log.warning("air-quality fetch failed: %s", exc)
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        # Raising to this handler rather than branching around it is deliberate:
+        # an unreadable AQ block and a failed AQ fetch have the same remedy
+        # (drop the block, keep the weather row, report "partial"), so they
+        # should not have two code paths that can drift apart.
+        log.warning("air-quality block unusable: %s", exc)
         air_quality_payload = None
         status = "partial"
     try:
