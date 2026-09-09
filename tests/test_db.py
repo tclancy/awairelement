@@ -218,6 +218,44 @@ def test_insert_reading_dedupes_on_device_ts(conn):
     assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 1
 
 
+def test_insert_reading_does_not_report_a_null_ts_as_a_duplicate(conn):
+    """The silent half of #95, at the layer that was lying.
+
+    `readings.ts` is `TEXT NOT NULL`. Under the old `INSERT OR IGNORE` a null
+    timestamp violated that constraint, was ignored exactly as a uniqueness
+    conflict is ignored, and came back as rowcount 0 -- so this function
+    returned False and its caller logged `poll: duplicate` while storing
+    nothing and running no spike check. `ON CONFLICT(ts) DO NOTHING` names the
+    conflict it is willing to swallow, so the violation surfaces.
+    """
+    reading = dict(reading_from_fixture(), ts=None)
+    with pytest.raises(sqlite3.IntegrityError):
+        db.insert_reading(conn, reading)
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_the_dedup_index_the_conflict_target_names_actually_exists(conn):
+    """`ON CONFLICT(ts)` needs a unique index on `ts` or it is a syntax error.
+
+    Asserted rather than assumed because #95's own suggested fix said `ts`
+    "has no unique index today", which is wrong -- `idx_readings_ts` has been
+    there all along. A rename or a dropped index would otherwise break every
+    insert at runtime rather than here.
+    """
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='readings'"
+        )
+    }
+    assert "idx_readings_ts" in indexes
+    assert any(
+        row[2] == 1  # `unique`
+        for row in conn.execute("PRAGMA index_list('readings')")
+        if row[1] == "idx_readings_ts"
+    )
+
+
 def test_alert_events_schema_ready_for_slice_2(conn):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
     assert {
