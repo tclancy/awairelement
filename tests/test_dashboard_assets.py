@@ -19,6 +19,10 @@ These are deliberately structural rather than cosmetic. Each one pins the
   publishing on that blanks every card at once, so the touch read has to
   clamp. That is asserted here because it is invisible in a mouse-only test:
   a mouse cannot leave the element while still reporting moves to it.
+- `cursor.sync.key` IS the subscription — uPlot's constructor ends with
+  `syncGroup.sub(self)` — so an explicit `sync.sub(plot)` beside it registers
+  every chart twice and doubles peer cursor work (#90). Both halves are pinned
+  together: the key must be present *and* nothing may subscribe by hand.
 
 Browser-side behaviour (does the crosshair actually track a finger, does the
 card stay the same height on hover) is verified against a headless Chromium at
@@ -216,3 +220,206 @@ def test_touch_reads_are_clamped_to_the_plot_area(js):
     args = call.group(1)
     assert "left: clamp(" in args, "left is passed to setCursor unclamped"
     assert "top: clamp(" in args, "top is passed to setCursor unclamped"
+
+
+def _strip_js_comments(source):
+    """`source` with `//` and `/* */` comments removed, string literals intact.
+
+    The sync guards below assert on the *absence* of a construct, and an
+    absence assertion over raw text has the failure mode the wrong way round:
+    a developer who disables a line by commenting it out leaves the text in
+    place, so the guard fires on a file that is now correct. A gate that
+    cannot go green on correct code gets deleted, which is strictly worse than
+    one that cannot go red.
+
+    Quote-awareness is not decoration: `"http://x"` contains `//`, and a naive
+    line-comment strip would silently truncate the string and every construct
+    after it on that line. dashboard.js has no such URL today — this keeps the
+    stripper from becoming a trap for the edit that adds one.
+
+    Regex literals are handled for the same reason: `/it's/` would otherwise
+    open a string that never closes, and `/\\/\\//` would read as a line
+    comment. dashboard.js has no regex today, so this is entirely about the
+    one-line future edit that adds one. `/` is disambiguated from division by
+    the preceding significant token — the standard heuristic, and ample for a
+    hand-written file. The unterminated-quote check at the end is the backstop
+    for whatever the heuristic still gets wrong: it converts a silent
+    mis-parse into an error that names its own cause, rather than letting the
+    guards below go red citing the wrong one.
+    """
+    # A `/` starts a regex literal unless the previous significant token could
+    # end a value, in which case it is division. `)` and `}` are genuinely
+    # ambiguous in JS; treating them as value-enders is the conventional call
+    # and is right for every form this file plausibly grows.
+    value_enders = ")]}"
+    keywords = (
+        "return",
+        "typeof",
+        "case",
+        "in",
+        "of",
+        "new",
+        "delete",
+        "void",
+        "instanceof",
+        "do",
+        "else",
+        "yield",
+        "await",
+    )
+
+    def starts_regex(prev):
+        if prev is None or not (prev.isalnum() or prev in value_enders + "_$"):
+            return True
+        return bool(re.search(r"\b(?:%s)$" % "|".join(keywords), "".join(out)))
+
+    out = []
+    i, n = 0, len(source)
+    quote = None
+    prev_significant = None
+    while i < n:
+        char = source[i]
+        if quote:
+            out.append(char)
+            if char == "\\" and i + 1 < n:
+                out.append(source[i + 1])
+                i += 2
+                continue
+            if char == quote:
+                quote = None
+            i += 1
+        elif char in "\"'`":
+            quote = char
+            prev_significant = char
+            out.append(char)
+            i += 1
+        elif source.startswith("//", i):
+            while i < n and source[i] != "\n":
+                i += 1
+        elif source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+        elif char == "/" and starts_regex(prev_significant):
+            # Consume to the closing `/`. Inside a `[...]` class, `/` is literal.
+            out.append(char)
+            i += 1
+            in_class = False
+            while i < n and source[i] != "\n":
+                c = source[i]
+                out.append(c)
+                i += 1
+                if c == "\\" and i < n:
+                    out.append(source[i])
+                    i += 1
+                elif c == "[":
+                    in_class = True
+                elif c == "]":
+                    in_class = False
+                elif c == "/" and not in_class:
+                    break
+            prev_significant = "/"
+        else:
+            out.append(char)
+            if not char.isspace():
+                prev_significant = char
+            i += 1
+    assert quote is None, (
+        f"comment stripper ended inside an unterminated {quote!r} string — "
+        "dashboard.js has most likely gained a regex literal, which this "
+        "helper cannot parse. Nothing was stripped, so the sync guards below "
+        "would fail citing the wrong cause. See `_strip_js_comments` (#90)."
+    )
+    return "".join(out)
+
+
+@pytest.fixture(scope="module")
+def js_code(js):
+    """dashboard.js with comments stripped — see `_strip_js_comments`."""
+    return _strip_js_comments(js)
+
+
+def test_the_comment_stripper_keeps_strings_and_drops_comments():
+    """The helper the two sync guards rest on, checked against its own traps."""
+    stripped = _strip_js_comments(
+        'const u = "http://x//y";\n'
+        "sync.sub(a); // sync.sub(b)\n"
+        "/* sync.sub(c)\n   sync.sub(d) */\n"
+        "const t = `//not a comment`;\n"
+        "const esc = 'it\\'s // fine';\n"
+        "const apos = /it's/;\n"
+        "const slashes = s.replace(/\\/\\//g, ''); \n"
+        "const cls = /[/*]/;\n"
+        "const div = total / count; // trailing\n"
+    )
+    assert '"http://x//y"' in stripped, "a URL in a string was eaten as a comment"
+    assert "`//not a comment`" in stripped, "template literal truncated"
+    assert "'it\\'s // fine'" in stripped, "escaped quote ended the string early"
+    assert "/it's/" in stripped, "an apostrophe in a regex opened a phantom string"
+    assert "/\\/\\//g" in stripped, "a regex containing // was read as a comment"
+    assert "/[/*]/" in stripped, "`/` inside a character class ended the regex"
+    assert "total / count" in stripped, "division was mistaken for a regex literal"
+    assert "trailing" not in stripped, "a comment after division survived"
+    assert stripped.count("sync.sub(") == 1, (
+        f"expected only the live call to survive, got {stripped.count('sync.sub(')}"
+    )
+
+
+def test_every_chart_joins_the_sync_group_through_its_cursor_config(js_code):
+    """`cursor.sync.key` is the *whole* mechanism — uPlot subscribes on construct.
+
+    Counted rather than named, like the touch-plugin guard above: the realistic
+    regression is a new chart factory that renders fine and silently never joins
+    the group, so its crosshair neither follows the other cards nor leads them.
+
+    The key's *value* is pinned, not just the `sync: { key: ... }` shape. A
+    shape-only match passes on `key: null` — and `uPlot.sync(null)` returns a
+    fresh, uncached group every call, so that chart is subscribed to a private
+    group of one. It renders correctly and its crosshair silently stands alone,
+    which is this test's whole subject. A typo'd literal (`"awiar"`) does the
+    same thing. Both were green against a shape-only match.
+
+    This is also the reachability control for the absence assertion below. That
+    one asserts something is *missing* from this file, and a file that stopped
+    instantiating charts would satisfy it vacuously; pinning the positive
+    mechanism to the chart count is what keeps the pair honest.
+    """
+    plots = len(re.findall(r"\bnew uPlot\(", js_code))
+    keyed = len(re.findall(r"sync:\s*\{\s*key:\s*sync\.key\b", js_code))
+    assert plots >= 2, f"expected at least two uPlot instantiations, found {plots}"
+    assert keyed == plots, (
+        f"{plots} charts but {keyed} `cursor: {{ sync: {{ key: sync.key }} }}` "
+        "configs — a chart without one is absent from the shared sync group and "
+        "its crosshair stands alone. If you hoisted the cursor config into a "
+        "shared object or spread it in, count that instead of loosening this "
+        "(#90)"
+    )
+
+
+def test_no_chart_subscribes_to_the_sync_group_a_second_time(js_code):
+    """uPlot's constructor already ran `syncGroup.sub(self)`; a manual sub doubles it.
+
+    Verified against the vendored v1.6.32, whose constructor ends
+    `return Gi.sub(k), ...` with `Gi = uPlot.sync(cursor.sync.key)` — so passing
+    a key *is* the subscription. An explicit `sync.sub(plot)` on the next line
+    put every chart in the group's `plots[]` twice, and `pub()` walks that array,
+    so each cursor move ran `updateCursor` twice on all seven peers. Measured on
+    the live dashboard: 16 subscriptions for 8 cards and 2 pub calls per peer per
+    move, against 8 and 1 after removal — with every peer's `cursor.idx` and
+    `cursor.left` identical at both probe positions (#90).
+
+    Harmless while a mouse was the only cursor source. #87 added a touch path
+    that publishes on every `touchmove`, which is where the doubling started
+    costing something on the device least able to absorb it.
+
+    Bans *any* explicit `.sub(`, not the literal `sync.sub(`: a group reached as
+    `uPlot.sync("awair").sub(plot)` or held in another local is the same defect
+    in a different spelling, and a one-literal ban waves both through.
+    """
+    plots = len(re.findall(r"\bnew uPlot\(", js_code))
+    assert plots >= 2, f"expected at least two uPlot instantiations, found {plots}"
+    explicit = re.findall(r"\.sub\s*\(", js_code)
+    assert not explicit, (
+        f"{len(explicit)} explicit sync-group subscription(s) in dashboard.js — "
+        "`cursor.sync.key` already subscribes each chart at construction, so "
+        "this registers every plot twice and doubles peer cursor work (#90)"
+    )

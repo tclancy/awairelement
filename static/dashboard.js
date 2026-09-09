@@ -47,6 +47,13 @@
   const PRESSURE_SCALE_MAX_INHG = 31.0;
 
   const state = { range: "7d", plots: [], events: [], dailyEvents: [] };
+  // Cursor-broadcast group for the synced crosshair. Charts join it by
+  // passing `cursor: { sync: { key: sync.key } }` — uPlot's constructor ends
+  // with `syncGroup.sub(self)`, so that config IS the subscription. Do not
+  // also call `sync.sub(plot)`: it registers each chart twice, and `pub()`
+  // walks the group's array, so one cursor move ran `updateCursor` twice on
+  // every peer (#90). Nothing here unsubscribes — `destroy()` does it, which
+  // is what makes `load()`'s five-minute rebuild leak-free.
   const sync = uPlot.sync("awair");
 
   const cssVar = (name) =>
@@ -329,7 +336,6 @@
       data,
       plotEl
     );
-    sync.sub(plot);
     state.plots.push(plot);
 
     // Header: name, unit, colored dot, latest value.
@@ -480,7 +486,6 @@
       data,
       plotEl
     );
-    sync.sub(plot);
     state.plots.push(plot);
     card.querySelector(".name").textContent = meta.name;
     card.querySelector(".unit").textContent = meta.unit;
