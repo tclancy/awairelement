@@ -268,10 +268,12 @@ def _strip_js_comments(source):
         "await",
     )
 
+    keyword_tail = re.compile(rf"\b(?:{'|'.join(keywords)})$")
+
     def starts_regex(prev):
         if prev is None or not (prev.isalnum() or prev in value_enders + "_$"):
             return True
-        return bool(re.search(r"\b(?:%s)$" % "|".join(keywords), "".join(out)))
+        return bool(keyword_tail.search("".join(out)))
 
     out = []
     i, n = 0, len(source)
