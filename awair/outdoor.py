@@ -7,6 +7,9 @@ Config via environment:
   AWAIR_OUTDOOR_POLL_SECONDS        — default 900 (15 min, the native cadence)
   AWAIR_OUTDOOR_WEATHER_URL         — override for test/staging (see DEFAULT_WEATHER_URL)
   AWAIR_OUTDOOR_AIR_QUALITY_URL     — override for test/staging (see DEFAULT_AIR_QUALITY_URL)
+  AWAIR_OUTDOOR_HEALTH_POLLS        — default 4 (~1h at the default cadence); see OutdoorHealth
+  AWAIR_NTFY_URL, AWAIR_NTFY_TOPIC, AWAIR_NTFY_TOKEN
+                                    — shared with the indoor poller; a sustained failure notifies
 
 Weather refreshes every 15 min at the source; air quality (CAMS-backed) is
 hourly. Both are fetched every 15 min and merged into one row keyed on the
