@@ -303,10 +303,14 @@ def parse_reading(
 # (#91, #93, #98). The tuples are written to make that sentence TRUE rather than
 # to enumerate the shapes we happened to reproduce.
 #
-# `http.client.HTTPException` is the fetch gap #98 found: `IncompleteRead` and
+# `http.client.HTTPException` is the gap #98 found: `IncompleteRead` and
 # `BadStatusLine` are NOT `OSError` subclasses and urllib does not convert them,
 # so a truncated response from Open-Meteo escaped both fetch guards and unwound
-# `main()`, which has no `except` of its own.
+# `main()`, which has no `except` of its own. It is named here rather than in
+# POLL_FAILURES because a fetch is the only thing that can raise it -- but note
+# POLL_FAILURES is built FROM this tuple, so it carries it too. That is wider
+# than the shape demands and deliberately so: the tuples encode the contract
+# above, not a census of reproduced exceptions.
 FETCH_FAILURES = (
     OSError,
     http.client.HTTPException,

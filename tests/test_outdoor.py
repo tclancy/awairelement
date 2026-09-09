@@ -1017,16 +1017,48 @@ def test_parse_reading_refuses_a_ts_that_is_not_a_usable_string(bad_time):
         parse_reading({"current": {"time": bad_time}}, {}, received_at=RECEIVED)
 
 
-def test_a_null_ts_can_no_longer_reach_the_table_as_a_silent_duplicate(conn):
-    """End-to-end for the regression the NOT NULL migration could have caused.
+def test_a_null_source_time_is_an_error_before_it_ever_reaches_the_insert(conn):
+    """A `"time": null` payload is refused by `parse_reading`, not by the table.
 
-    Under `INSERT OR IGNORE` a null `ts` against a NOT NULL column comes back
-    rowcount 0, which `poll_once` renders as `"duplicate"` -- the one status
-    meaning nothing is wrong, and exactly #95's silent half. It must be an
-    `"error"`, and the row must not be there.
+    Named for what it actually covers. Its first draft claimed to be the
+    end-to-end guard on the `ON CONFLICT` change, and was not: `_normalize_
+    source_time` raises `TypeError` on the null, so `insert_outdoor_reading` is
+    never called and the test stayed green with `INSERT OR IGNORE` restored AND
+    with `NOT NULL` dropped from the DDL -- the two mutations it named. The
+    unit-level `test_a_null_ts_raises_instead_of_reporting_a_duplicate` is what
+    kills those. This one pins the outer layer of the same defence.
     """
     payload = {"current": dict(WEATHER["current"], time=None)}
     assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
         "error"
     )
     assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+
+
+def test_a_null_ts_that_does_reach_the_insert_is_an_error_not_a_duplicate(
+    conn, monkeypatch, caplog
+):
+    """The genuine end-to-end, with `parse_reading`'s refusal taken out of the way.
+
+    This is the shape the whole `ON CONFLICT` change exists for: if a null `ts`
+    ever reaches `insert_outdoor_reading` -- a future caller, a refactor that
+    normalizes lazily -- `INSERT OR IGNORE` would return rowcount 0 and
+    `poll_once` would report `"duplicate"`, the one status meaning nothing is
+    wrong. Since `parse_reading` legitimately refuses it first, the only honest
+    way to exercise the layer underneath is to stand `parse_reading` down.
+    """
+    from awair import db as _db
+
+    def unkeyed_row(*_args, **_kwargs):
+        row = {col: None for col in _db.OUTDOOR_COLUMNS}
+        row["received_at"] = RECEIVED
+        row["temp"] = 22.4
+        return row
+
+    monkeypatch.setattr(outdoor, "parse_reading", unkeyed_row)
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        status = poll_once(conn, lambda: WEATHER_TEXT, lambda: AIR_QUALITY_TEXT)
+    assert status == "error", "a null ts reported as a duplicate is #95's silent half"
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+    assert "IntegrityError" in caplog.text, caplog.text
+    assert conn.in_transaction is False

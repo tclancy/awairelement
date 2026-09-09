@@ -373,6 +373,12 @@ def test_the_migration_drops_unkeyed_rows_and_names_the_count(tmp_path, caplog):
         conn.close()
     assert "3" in caplog.text, caplog.text
     assert "outdoor_readings" in caplog.text
+    # The rows themselves, not only the count: their `received_at` and sensor
+    # values are real observations, and the journal is the only place left to
+    # recover them from once the table that held them is gone.
+    assert caplog.text.count("dropped unkeyed row") == 3
+    assert "2026-07-01T01:00:05+00:00" in caplog.text
+    assert "20.0" in caplog.text
 
 
 def test_a_clean_migration_says_nothing(tmp_path, caplog):
@@ -514,10 +520,15 @@ def test_the_loser_of_a_concurrent_migration_leaves_the_table_alone(tmp_path):
         return answers.pop() if answers else real(conn)
 
     rebuilds = []
+    # Captured BEFORE the patch. `db._rebuild_outdoor_readings` inside the body
+    # resolves to the patch itself, so calling it there recurses -- and the
+    # re-check mutant then dies with RecursionError rather than on the
+    # `rebuilds == []` assertion this test is entirely about. Measured.
+    real_rebuild = db._rebuild_outdoor_readings
 
     def counted_rebuild(conn):
         rebuilds.append(conn)
-        return db._rebuild_outdoor_readings(conn)
+        return real_rebuild(conn)
 
     with (
         patch.object(db, "_outdoor_ts_is_nullable", stale_then_real),
@@ -535,32 +546,136 @@ def test_the_loser_of_a_concurrent_migration_leaves_the_table_alone(tmp_path):
         loser.close()
 
 
-def test_a_failed_rebuild_leaves_the_original_table_intact(tmp_path):
-    """The rollback path. A half-migrated `outdoor_readings` is unrecoverable —
-    the rebuild drops the source table — so the whole thing is one transaction.
+def test_a_rebuild_that_fails_after_the_drop_leaves_the_original_table_intact(
+    tmp_path,
+):
+    """The rollback path, injected at the statement that actually destroys data.
 
-    Forced by pre-creating the scratch table the rebuild wants, which is also
-    the shape a *previous* crashed migration would leave behind.
+    A half-migrated `outdoor_readings` is unrecoverable, so the whole rebuild is
+    one transaction. The first draft of this test forced the failure on the
+    *first* statement inside the transaction, before anything had been dropped
+    -- which passes whether or not the transaction works. The failure has to
+    land after `DROP TABLE outdoor_readings` for the assertions below to mean
+    anything.
     """
+    from unittest.mock import patch
+
     path = tmp_path / "boom.db"
-    old = _legacy_outdoor_table(path)
-    old.execute(
+    legacy = _legacy_outdoor_table(path)
+    legacy.execute(
         "INSERT INTO outdoor_readings (ts, received_at, temp)"
         " VALUES ('2026-07-01T00:00:00+00:00', '2026-07-01T00:00:05+00:00', 19.0)"
     )
-    old.execute("CREATE TABLE outdoor_readings_rebuilt (blocked INTEGER)")
-    old.commit()
-    old.close()
+    legacy.commit()
+    legacy.close()
+
+    def drop_then_die(conn):
+        conn.execute("DROP TABLE outdoor_readings")
+        # Control: the destructive statement really did run, so a green result
+        # below cannot be a failure that fired before anything was lost.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'outdoor_readings'"
+        ).fetchone() == (0,)
+        raise sqlite3.OperationalError("disk I/O error")
 
     conn = sqlite3.connect(path)
     try:
-        with pytest.raises(sqlite3.OperationalError):
-            db._migrate_outdoor_ts_not_null(conn)
+        with patch.object(db, "_rebuild_outdoor_readings", drop_then_die):
+            with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+                db._migrate_outdoor_ts_not_null(conn)
         assert conn.in_transaction is False
         assert _ts_is_not_null(conn) is False  # untouched, not half-migrated
         assert conn.execute("SELECT ts, temp FROM outdoor_readings").fetchall() == [
             ("2026-07-01T00:00:00+00:00", 19.0)
         ]
+    finally:
+        conn.close()
+
+
+def test_a_leftover_scratch_table_does_not_wedge_connect(tmp_path):
+    """`connect()` runs per web request and on both pollers' startup.
+
+    A surviving `outdoor_readings_rebuilt` would make every one of them raise
+    forever with no self-heal, so the rebuild drops it first rather than
+    assuming it cannot be there.
+    """
+    path = tmp_path / "leftover.db"
+    legacy = _legacy_outdoor_table(path)
+    legacy.execute(
+        "INSERT INTO outdoor_readings (ts, received_at, temp)"
+        " VALUES ('2026-07-01T00:00:00+00:00', '2026-07-01T00:00:05+00:00', 19.0)"
+    )
+    legacy.execute("CREATE TABLE outdoor_readings_rebuilt (junk INTEGER)")
+    legacy.commit()
+    legacy.close()
+
+    conn = db.connect(path)
+    try:
+        assert _ts_is_not_null(conn) is True
+        assert db.latest_outdoor_reading(conn, ("temp",)) == {"temp": 19.0}
+    finally:
+        conn.close()
+
+
+def test_the_rebuild_refuses_a_column_it_would_silently_drop(tmp_path):
+    """A DROP TABLE against the only copy of the record, so an unrecognised
+    column is treated as "this is not the database this code was written for".
+
+    Refusing is recoverable; dropping the column and its data is not.
+    """
+    path = tmp_path / "surplus.db"
+    legacy = _legacy_outdoor_table(path)
+    legacy.execute("ALTER TABLE outdoor_readings ADD COLUMN legacy_note TEXT")
+    legacy.execute(
+        "INSERT INTO outdoor_readings (ts, received_at, temp, legacy_note)"
+        " VALUES ('2026-07-01T00:00:00+00:00', '2026-07-01T00:00:05+00:00',"
+        " 19.0, 'keep me')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="legacy_note"):
+            db._migrate_outdoor_ts_not_null(conn)
+        assert conn.in_transaction is False
+        assert conn.execute("SELECT legacy_note FROM outdoor_readings").fetchone() == (
+            "keep me",
+        )
+    finally:
+        conn.close()
+
+
+def test_a_migration_that_begins_in_a_transaction_does_not_raise(tmp_path):
+    """Forward safety for the migration after next.
+
+    `_migrate` issues only DDL today, which pysqlite does not implicitly BEGIN.
+    The natural shape for the next migration is a backfill `UPDATE`, which it
+    does -- and `BEGIN IMMEDIATE` inside an open transaction raises "cannot
+    start a transaction within a transaction". `connect()` runs on every web
+    request and on both pollers' startup, so that is a total outage with no
+    self-heal.
+    """
+    path = tmp_path / "intxn.db"
+    legacy = _legacy_outdoor_table(path)
+    legacy.execute(
+        "INSERT INTO outdoor_readings (ts, received_at, temp)"
+        " VALUES ('2026-07-01T00:00:00+00:00', '2026-07-01T00:00:05+00:00', 19.0)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE outdoor_readings SET temp = 20.0 WHERE ts = '2026-07-01T00:00:00+00:00'"
+    )
+    assert conn.in_transaction, "fixture does not model an open implicit transaction"
+    try:
+        db._migrate_outdoor_ts_not_null(conn)
+        assert _ts_is_not_null(conn) is True
+        # The pending UPDATE was committed rather than discarded, which is what
+        # a caller mid-migration would expect of its own prior statement.
+        assert conn.execute("SELECT temp FROM outdoor_readings").fetchone() == (20.0,)
     finally:
         conn.close()
 
@@ -577,3 +692,31 @@ def test_the_schema_probe_refuses_a_table_it_cannot_read(tmp_path):
             db._outdoor_ts_is_nullable(conn)
     finally:
         conn.close()
+
+
+def test_a_large_unkeyed_drop_is_capped_and_says_how_many_it_left_out(tmp_path, caplog):
+    """The count is expected to be zero, so the log is uncapped only in theory.
+
+    A DB that had been accumulating unkeyed rows for months could carry
+    thousands, and a migration that emits one WARNING per row would bury the
+    line that says how many there were. Capped — but the summary has to name
+    the remainder, or the cap is itself a silent loss.
+    """
+    import logging
+
+    path = tmp_path / "many.db"
+    legacy = _legacy_outdoor_table(path)
+    for _ in range(db._UNKEYED_LOG_CAP + 5):
+        legacy.execute(
+            "INSERT INTO outdoor_readings (ts, received_at, temp)"
+            " VALUES (NULL, '2026-07-01T01:00:05+00:00', 20.0)"
+        )
+    legacy.commit()
+    legacy.close()
+
+    with caplog.at_level(logging.WARNING, logger="awair.db"):
+        db.connect(path).close()
+
+    assert caplog.text.count("dropped unkeyed row") == db._UNKEYED_LOG_CAP
+    assert f"{db._UNKEYED_LOG_CAP + 5} unkeyed row(s)" in caplog.text
+    assert "5 further unkeyed row(s) not logged" in caplog.text

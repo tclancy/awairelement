@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 # naive/aware TypeError.
 _NEVER = datetime(1970, 1, 1, tzinfo=UTC)
 
+# How many dropped unkeyed rows `_migrate_outdoor_ts_not_null` spells out in the
+# journal before summarising the rest. Zero is expected (#98).
+_UNKEYED_LOG_CAP = 20
+
 # The outdoor column list, defined once because two places create this table:
 # `SCHEMA` on a fresh install, and `_migrate_outdoor_ts_not_null`'s rebuild on a
 # deployed one. Retyping it in the migration is how the two installs drift, and
@@ -202,8 +206,8 @@ def _outdoor_ts_is_nullable(conn) -> bool:
     raise sqlite3.OperationalError("outdoor_readings has no `ts` column")
 
 
-def _rebuild_outdoor_readings(conn) -> int:
-    """Retype `outdoor_readings` with a NOT NULL `ts`. Returns rows dropped.
+def _rebuild_outdoor_readings(conn) -> list:
+    """Retype `outdoor_readings` with a NOT NULL `ts`. Returns the rows dropped.
 
     SQLite has no ALTER COLUMN, so tightening a constraint means the documented
     12-step rebuild. Caller owns the transaction.
@@ -212,13 +216,34 @@ def _rebuild_outdoor_readings(conn) -> int:
     a row without one is not a reading of any particular moment. Deriving one
     from `received_at` would manufacture an observation time Open-Meteo never
     published -- precisely what `_migrate`'s `aq_ts` comment refuses to do for
-    the auxiliary clock. So they are dropped, and the count is returned so the
-    caller can say so out loud.
+    the auxiliary clock. So they are dropped, and *returned*, so the caller can
+    put them in the journal before the table that held them stops existing.
     """
     columns = ", ".join(OUTDOOR_COLUMNS)
-    (unkeyed,) = conn.execute(
-        "SELECT COUNT(*) FROM outdoor_readings WHERE ts IS NULL"
-    ).fetchone()
+    surplus = [
+        row[1]
+        for row in conn.execute("PRAGMA table_info(outdoor_readings)")
+        if row[1] not in OUTDOOR_COLUMNS
+    ]
+    if surplus:
+        # The rebuild copies the columns it knows about, so anything else goes
+        # over the side silently. No such column has ever existed here, but this
+        # is a DROP TABLE against the only copy of the record -- an unrecognised
+        # column is a sign the DB is not the one this code was written for, and
+        # refusing is recoverable where dropping is not.
+        raise sqlite3.OperationalError(
+            "refusing to rebuild outdoor_readings: it carries column(s) "
+            f"{surplus} that this version of db.py does not know about, and "
+            "the rebuild would drop them. Add them to OUTDOOR_COLUMNS first."
+        )
+    unkeyed = conn.execute(
+        f"SELECT {columns} FROM outdoor_readings WHERE ts IS NULL"
+    ).fetchall()
+    # Idempotent even though the CREATE is inside the caller's transaction and
+    # a crash therefore rolls it back: a leftover scratch table would make
+    # `connect()` raise forever, taking both pollers and every web request down
+    # with no self-heal, and one word removes the whole class.
+    conn.execute("DROP TABLE IF EXISTS outdoor_readings_rebuilt")
     conn.execute(f"CREATE TABLE outdoor_readings_rebuilt ({OUTDOOR_COLUMNS_DDL})")
     conn.execute(
         f"INSERT INTO outdoor_readings_rebuilt ({columns})"
@@ -246,6 +271,16 @@ def _migrate_outdoor_ts_not_null(conn) -> None:
     """
     if not _outdoor_ts_is_nullable(conn):
         return
+    # `_migrate` issues only DDL today, and pysqlite does not implicitly BEGIN
+    # for DDL -- so there is no open transaction here and this commit is a
+    # no-op. It is here for the migration after next: the natural shape for one
+    # is a backfill UPDATE, pysqlite *does* implicitly BEGIN for that, and
+    # `BEGIN IMMEDIATE` inside a transaction raises "cannot start a transaction
+    # within a transaction". `connect()` is called per web request as well as by
+    # both pollers, so that failure takes down every surface at once with no
+    # self-heal. The "must stay last" note above guards column order, not this.
+    if conn.in_transaction:
+        conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         if not _outdoor_ts_is_nullable(conn):
@@ -261,8 +296,20 @@ def _migrate_outdoor_ts_not_null(conn) -> None:
             "outdoor_readings: dropped %d unkeyed row(s) with a NULL ts while"
             " migrating the column to NOT NULL; a reading with no source"
             " timestamp cannot be dated and was not backfilled (#98)",
-            dropped,
+            len(dropped),
         )
+        # And the rows themselves. Their `received_at` and sensor values are
+        # real observations -- only their source clock is missing -- so the
+        # journal is the one recovery path once the table is gone. The expected
+        # count is zero and the plausible failure is a handful, so this is
+        # capped rather than paginated.
+        for row in dropped[:_UNKEYED_LOG_CAP]:
+            log.warning("outdoor_readings: dropped unkeyed row %r", row)
+        if len(dropped) > _UNKEYED_LOG_CAP:
+            log.warning(
+                "outdoor_readings: %d further unkeyed row(s) not logged",
+                len(dropped) - _UNKEYED_LOG_CAP,
+            )
 
 
 def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
@@ -293,7 +340,13 @@ def insert_outdoor_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     naming the conflict target would have converted #98's silent-garbage half
     into #95's silent-duplicate half rather than closing it. Naming `ts` keeps
     the dedup and lets a NOT NULL violation raise, where `poll_once` reports it
-    honestly as an error. Mirrors `insert_reading` after PR #97.
+    honestly as an error.
+
+    `insert_reading` (indoor) gets the same treatment in PR #97, which is open
+    and is NOT an ancestor of this branch -- so on `main` the two pollers
+    disagree until both land, with outdoor the tolerant one. #97 first, or at
+    least alongside; the shared-`AWAIR_DB` argument above runs in both
+    directions.
     """
     placeholders = ", ".join(f":{col}" for col in OUTDOOR_COLUMNS)
     try:
