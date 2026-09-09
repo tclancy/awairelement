@@ -75,33 +75,6 @@ AIR_QUALITY_TO_COLUMN = {
 }
 
 
-def _normalize_source_time(source_time: str) -> str:
-    """Canonicalize Open-Meteo's `current.time` to a full ISO UTC string.
-
-    Open-Meteo returns `"YYYY-MM-DDTHH:MM"` when polled with `timezone=UTC` —
-    minute precision, naive. Storing that verbatim breaks lexicographic
-    `WHERE ts >= ?` filters because the short form sorts *before* the full
-    ISO strings that callers pass in via `since.isoformat()`. Normalize
-    both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
-    time comparison.
-
-    **This only stamps `tzinfo` on a *naive* value.** A source time arriving
-    with a real non-UTC offset is stored verbatim as e.g. `...+05:00`, which
-    sorts and range-filters wrongly on `ts`, while `web._iso_utc` (which does
-    call `astimezone`) would still *publish* it correctly -- so the split is
-    silent in both directions. `timezone=UTC` in `_build_url` is the only
-    thing keeping it from arising, which is why
-    `test_build_url_requests_source_units_and_utc` pins that parameter.
-    (This paragraph lived on `db.latest_outdoor_reading` until #77. It
-    describes this function's behaviour, and that one can neither cause nor
-    fix it.)
-    """
-    parsed = datetime.fromisoformat(source_time)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.isoformat()
-
-
 def _is_date_only(source_time) -> bool:
     """True when the value is a complete ISO *date* carrying no time of day.
 
@@ -139,6 +112,47 @@ def _is_date_only(source_time) -> bool:
     return True
 
 
+def _normalize_source_time(source_time: str) -> str:
+    """Canonicalize Open-Meteo's `current.time` to a full ISO UTC string.
+
+    Open-Meteo returns `"YYYY-MM-DDTHH:MM"` when polled with `timezone=UTC` —
+    minute precision, naive. Storing that verbatim breaks lexicographic
+    `WHERE ts >= ?` filters because the short form sorts *before* the full
+    ISO strings that callers pass in via `since.isoformat()`. Normalize
+    both sides to `"YYYY-MM-DDTHH:MM:00+00:00"` so string comparison equals
+    time comparison.
+
+    **This only stamps `tzinfo` on a *naive* value.** A source time arriving
+    with a real non-UTC offset is stored verbatim as e.g. `...+05:00`, which
+    sorts and range-filters wrongly on `ts`, while `web._iso_utc` (which does
+    call `astimezone`) would still *publish* it correctly -- so the split is
+    silent in both directions. `timezone=UTC` in `_build_url` is the only
+    thing keeping it from arising, which is why
+    `test_build_url_requests_source_units_and_utc` pins that parameter.
+    (This paragraph lived on `db.latest_outdoor_reading` until #77. It
+    describes this function's behaviour, and that one can neither cause nor
+    fix it.)
+
+    **A value carrying no time of day raises `ValueError` rather than being
+    silently clocked at midnight** (#91). `datetime.fromisoformat` accepts
+    `"2026-07-12"`, `"20260712"`, the ISO week date `"2026-W28-1"` and even
+    `"2026-07-12+05:00"`, defaulting the clock to `00:00` (or, for the last,
+    reading the offset as the time) -- so without this the caller stores an
+    observation instant the source never published. #77 put that guard on the
+    auxiliary clock only, and said why: `poll_once` caught `KeyError` alone, so
+    raising here would have killed the poller process instead of the row. That
+    constraint is gone -- `poll_once` now catches `TypeError` and `ValueError`
+    too -- so the guard belongs here, where it covers both clocks rather than
+    one.
+    """
+    if _is_date_only(source_time):
+        raise ValueError(f"source time carries no time of day: {source_time!r}")
+    parsed = datetime.fromisoformat(source_time)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.isoformat()
+
+
 def _normalize_aq_time(source_time) -> str | None:
     """`_normalize_source_time` for the auxiliary air-quality clock, or None.
 
@@ -169,6 +183,12 @@ def _normalize_aq_time(source_time) -> str | None:
     # (`test_an_absent_aq_time_is_silent_but_a_malformed_one_warns`).
     if not source_time:
         return None
+    # Also behaviourally redundant since #91 -- `_normalize_source_time` raises
+    # `ValueError` on a clockless value now, and the `except` below would
+    # degrade it to NULL anyway. Kept for the same reason as the branch above:
+    # the message. "carries no time of day" is upstream publishing a shape we
+    # refuse on purpose; "unparseable" is upstream being broken, and a reader
+    # scanning a 15-minute warning cadence needs to know which.
     if _is_date_only(source_time):
         log.warning(
             "air-quality current.time carries no time of day (%r); storing NULL "
@@ -181,6 +201,26 @@ def _normalize_aq_time(source_time) -> str | None:
     except (TypeError, ValueError) as exc:
         log.warning("air-quality current.time unparseable (%r): %s", source_time, exc)
         return None
+
+
+def _is_readable_air_quality(payload) -> bool:
+    """True when the AQ block is an object whose `current` block is one too.
+
+    Anything else -- a JSON list, string or number, or a `current` that is one
+    -- raises `AttributeError` out of `.get`. That is the same process-death
+    class as #91's weather clock (it unwinds the `while` loop in `main()` and
+    systemd restarts into the same upstream value) and the #91 fix did not
+    cover it, because `AttributeError` is neither of the two exception types
+    the weather side raises. Found in review on #91, not by its measurement.
+
+    Read as an unusable *fetch* rather than a bad row: the weather half is
+    still worth writing, which is precisely what `"partial"` means. `None`
+    -- the shape `poll_once` uses for a failed AQ fetch -- is unreadable by
+    the same token, so this one predicate covers both callers.
+    """
+    if not isinstance(payload, dict):
+        return False
+    return isinstance(payload.get("current", {}), dict)
 
 
 def _build_url(base: str, lat: float, lon: float, fields: tuple) -> str:
@@ -243,7 +283,7 @@ def parse_reading(
     reading["received_at"] = received_at
     for source_field, column in WEATHER_TO_COLUMN.items():
         reading[column] = weather_current.get(source_field)
-    if air_quality_payload is not None:
+    if _is_readable_air_quality(air_quality_payload):
         aq_current = air_quality_payload.get("current", {})
         for source_field, column in AIR_QUALITY_TO_COLUMN.items():
             reading[column] = aq_current.get(source_field)
@@ -261,14 +301,26 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
     """
     try:
         weather_payload = json.loads(fetch_weather())
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        # TypeError: a fetcher returning None is `json.loads(None)`. Same
+        # escaping-and-exiting shape as the clock defect, same slot in the
+        # tuple (#91 review).
         log.warning("weather fetch failed: %s", exc)
         return "error"
     try:
         air_quality_payload = json.loads(fetch_air_quality())
+        if not _is_readable_air_quality(air_quality_payload):
+            raise TypeError(
+                f"payload is a {type(air_quality_payload).__name__}, "
+                "or its `current` block is"
+            )
         status = "ok"
-    except (OSError, ValueError, KeyError) as exc:
-        log.warning("air-quality fetch failed: %s", exc)
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        # Raising to this handler rather than branching around it is deliberate:
+        # an unreadable AQ block and a failed AQ fetch have the same remedy
+        # (drop the block, keep the weather row, report "partial"), so they
+        # should not have two code paths that can drift apart.
+        log.warning("air-quality block unusable: %s", exc)
         air_quality_payload = None
         status = "partial"
     try:
@@ -277,8 +329,20 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
             air_quality_payload,
             received_at=datetime.now(UTC).isoformat(),
         )
-    except KeyError as exc:
-        log.warning("weather payload missing required field: %s", exc)
+    except (KeyError, TypeError, ValueError) as exc:
+        # KeyError: `current` or `time` absent. ValueError: `time` unparseable,
+        # or clockless and refused by `_normalize_source_time`. TypeError: a
+        # JSON `null` time reaching `fromisoformat`, or a non-dict `current`.
+        #
+        # All three used to escape and unwind the `while` loop in `main()`, so
+        # a single bad upstream clock exited the process; systemd restarted it
+        # into the same value (#91). Returning "error" costs one poll instead,
+        # and matches the documented contract for a fetch failure or bad JSON.
+        #
+        # TypeError is not optional. #91 prescribed `(KeyError, ValueError)`,
+        # which leaves a `"time": null` payload killing the poller exactly as
+        # before -- pinned by `test_poll_once_survives_a_bad_weather_time`.
+        log.warning("unusable weather payload: %s: %s", type(exc).__name__, exc)
         return "error"
     inserted = db.insert_outdoor_reading(conn, reading)
     if not inserted:
