@@ -364,18 +364,27 @@ def _require_env(name: str) -> str:
     return value
 
 
-def handle_outdoor_health(conn, notifier, health, status, now) -> None:
+def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None:
     """Map an `OutdoorHealth` verdict onto an alert event + notification.
 
     Sibling of `poller.handle_device_health`, and it opens its event under
     `metric="outdoor"` rather than reusing `"device"` for a reason that is a
     correctness bug rather than tidiness: `db.get_open_events` returns at most
     one open event **per metric**, and the two pollers are separate processes
-    against one DB. Sharing the key means an outdoor recovery closes the indoor
-    poller's open `unreachable` row and pages "Awair Element recovered" while
-    the Element is still down (reproduced on #94). `web._NON_MEASUREMENT_METRICS`
-    carries `"outdoor"` for the same reason it carries `"device"` — a transport
-    fact must not reach `/api/latest` wearing a measurement's shape.
+    against one DB (two systemd units, one `AWAIR_DB`). Sharing the key means an
+    outdoor recovery closes the indoor poller's open `unreachable` row and pages
+    "Awair Element recovered" while the Element is still down (reproduced #94).
+
+    `web._NON_MEASUREMENT_METRICS` carries `"outdoor"`, but **not** for the
+    reason it carries `"device"`. That one is filtered because the hub sees the
+    same outage sooner in `received_at`; that argument does not transfer, since
+    `/api/latest` publishes the *indoor* `received_at` and a `"partial"` poll
+    writes a row anyway. The real reason is narrower: `/api/latest` is the
+    indoor contract, so an outdoor transport fact there is a category error.
+    A broken AQ endpoint is already visible to the hub on `/api/outdoor-latest`
+    as a NULL `aq_ts`, which #71 renders as "no current AQI" — so nothing is
+    lost by keeping this event off the indoor endpoint. Whether it should be
+    published on `/api/outdoor-latest` too is deliberately left open.
 
     Only `unreachable` pages at high priority. `degraded` and `stale` are
     Open-Meteo publishing badly; they are worth a notification so a sustained
@@ -383,9 +392,9 @@ def handle_outdoor_health(conn, notifier, health, status, now) -> None:
     a channel gets muted.
     """
     verdict = health.observe(status)
-    if verdict in OutdoorHealth.TIERS.values():
+    if verdict in health.TIERS.values():
         notified = notifier.send(
-            f"Outdoor poller {verdict} (~{_health_window(health)} of polls)",
+            f"Outdoor poller {verdict} (~{_health_window(health, interval)} of polls)",
             title=f"Outdoor {verdict}",
             priority="high" if verdict == "unreachable" else "default",
         )
@@ -406,19 +415,24 @@ def handle_outdoor_health(conn, notifier, health, status, now) -> None:
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
 
 
-def _health_window(health) -> str:
+def _health_window(health, interval) -> str:
     """The alert threshold as wall-clock, e.g. "1h".
 
     The poll count on its own is meaningless without the cadence beside it, and
     the cadence differs from the indoor poller's by 30x — so the message says
     the duration, as `poller.handle_device_health`'s does.
+
+    Takes `interval` rather than re-reading `AWAIR_OUTDOOR_POLL_SECONDS`: a pure
+    formatter reaching into the environment is a second source of truth for a
+    value `main()` has already resolved. Rounds rather than truncating, so a
+    window under a minute does not render as "0 min".
     """
-    seconds = health.threshold * int(
-        os.environ.get("AWAIR_OUTDOOR_POLL_SECONDS", DEFAULT_POLL_SECONDS)
-    )
-    if seconds % 3600 == 0:
+    seconds = health.threshold * interval
+    if seconds >= 3600 and seconds % 3600 == 0:
         return f"{seconds // 3600}h"
-    return f"{seconds // 60} min"
+    if seconds >= 60:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds}s"
 
 
 def main() -> None:
@@ -444,7 +458,11 @@ def main() -> None:
         token=os.environ.get("AWAIR_NTFY_TOKEN", ""),
     )
     health = OutdoorHealth(
-        threshold=int(os.environ.get("AWAIR_OUTDOOR_HEALTH_POLLS", "4"))
+        threshold=int(
+            os.environ.get(
+                "AWAIR_OUTDOOR_HEALTH_POLLS", OutdoorHealth.DEFAULT_THRESHOLD
+            )
+        )
     )
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -470,7 +488,9 @@ def main() -> None:
                 "outdoor poll: %s",
                 status,
             )
-            handle_outdoor_health(conn, notifier, health, status, datetime.now(UTC))
+            handle_outdoor_health(
+                conn, notifier, health, status, datetime.now(UTC), interval
+            )
             if stop.wait(interval):
                 break
     finally:

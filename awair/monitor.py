@@ -223,10 +223,24 @@ class OutdoorHealth:
     most likely to persist quietly — a dead *weather* endpoint is the one a
     human notices.
 
-    The three tiers are kept apart because only one of them is actionable here:
-    `unreachable` is our network or our box, while `degraded` and `stale` are
-    Open-Meteo publishing badly and nothing on this end can fix either. Folding
-    them together would page Tom for an upstream hiccup he cannot act on.
+    **The run counted is "consecutive non-inserting polls", not "consecutive
+    polls of one status", and that distinction is the whole fix.** A first draft
+    counted a separate run per status and zeroed the others on every poll, which
+    reproduces the `DeviceHealth` bug one level up: `poll_once` returns
+    `"duplicate"` before it returns `"partial"` (`outdoor.py`), so a broken AQ
+    endpoint plus a weather half that republishes a stale `current.time` emits
+    an alternating `partial`/`duplicate` stream, and under per-status runs sixty
+    consecutive useless polls — fifteen hours — alerted zero times. Caught in
+    review, and the test that was supposed to pin it asserted the same
+    expectation of the buggy tracker and the fixed one.
+
+    The tier reported is the **most recent** failing status, because that is
+    what is happening now; a mixed run is still one outage from the operator's
+    point of view. The three tiers are kept apart because only one of them is
+    actionable here: `unreachable` is our network or our box, while `degraded`
+    and `stale` are Open-Meteo publishing badly and nothing on this end can fix
+    either. Folding them together would page Tom for an upstream hiccup he
+    cannot act on.
 
     `threshold` counts polls, not wall-clock, because the poll interval is the
     unit that matters — but note the outdoor cadence is 900 s against indoor's
@@ -235,7 +249,7 @@ class OutdoorHealth:
     publish cycle: one missed publish cannot trip it, a stuck endpoint does.
     """
 
-    #: poll status -> the tier a sustained run of it opens.
+    #: poll status -> the tier a sustained run ending in it opens.
     TIERS: ClassVar[dict[str, str]] = {
         "error": "unreachable",
         "partial": "degraded",
@@ -245,9 +259,12 @@ class OutdoorHealth:
     #: The only status that counts as health. Anything else is not recovery.
     HEALTHY = "inserted"
 
-    def __init__(self, threshold=4):
+    #: ~1 hour at the default 900 s cadence. See the class docstring.
+    DEFAULT_THRESHOLD = 4
+
+    def __init__(self, threshold=DEFAULT_THRESHOLD):
         self.threshold = threshold
-        self.runs = dict.fromkeys(self.TIERS, 0)
+        self.unhealthy = 0  # consecutive non-inserting polls, of any mix
         self.alerted = None  # None | "unreachable" | "degraded" | "stale"
 
     def observe(self, status):
@@ -256,19 +273,20 @@ class OutdoorHealth:
         An unrecognised status is ignored rather than treated as health — the
         fail-open `else` is exactly the bug this class was written to avoid, so
         a fifth status added to `poll_once` later must be classified here
-        deliberately instead of silently clearing an open alert.
+        deliberately instead of silently clearing an open alert. Ignored means
+        ignored: it neither advances the run nor resets it, because an
+        unclassified status is not evidence either way.
         """
         if status == self.HEALTHY:
-            self.runs = dict.fromkeys(self.TIERS, 0)
+            self.unhealthy = 0
             if self.alerted is not None:
                 self.alerted = None
                 return "recovered"
             return None
         if status not in self.TIERS:
             return None
-        for name in self.runs:
-            self.runs[name] = self.runs[name] + 1 if name == status else 0
-        if self.runs[status] == self.threshold and self.alerted is None:
+        self.unhealthy += 1
+        if self.unhealthy >= self.threshold and self.alerted is None:
             self.alerted = self.TIERS[status]
             return self.alerted
         return None

@@ -67,21 +67,56 @@ def test_partial_is_not_health_which_is_the_whole_reason_this_class_exists():
     assert [indoor.observe("partial") for _ in range(20)] == [None] * 20
 
 
-def test_a_partial_does_not_reset_a_run_of_errors_the_way_an_insert_does():
-    """Alternating error/partial reached no threshold under `DeviceHealth`.
+def test_an_interleaved_failure_stream_alerts_rather_than_masking_itself():
+    """A mixed run of failures is one outage and must trip the threshold.
 
-    Each `"partial"` zeroed the error run, so the two failure modes interleaved
-    could persist forever without a word. Here the two runs are counted
-    independently, so neither masks the other.
+    This is the case that made the first draft wrong, and the reason the tracker
+    counts *non-inserting polls* rather than a run per status. `poll_once`
+    returns `"duplicate"` before it returns `"partial"`, so a broken AQ endpoint
+    plus a weather half republishing a stale `current.time` emits an alternating
+    stream — and a per-status counter zeroes each run with every switch. Under
+    that draft sixty consecutive useless polls, fifteen hours, alerted zero
+    times.
+
+    Asserting against `DeviceHealth` too, because the contrast is the point: the
+    indoor tracker still says nothing, which is exactly what must not happen
+    here.
     """
+    interleaved = ["error", "partial", "duplicate"] * 20
+
     indoor = DeviceHealth(threshold=3)
-    interleaved = ["error", "error", "partial", "error", "error", "partial"]
-    assert [indoor.observe(s) for s in interleaved] == [None] * 6
+    assert [indoor.observe(s) for s in interleaved] == [None] * 60
 
     outdoor = OutdoorHealth(threshold=3)
-    assert [outdoor.observe(s) for s in interleaved] == [None] * 6
-    # ...and the error run resumes from zero rather than being lost entirely.
-    assert [outdoor.observe("error") for _ in range(3)] == [None, None, "unreachable"]
+    verdicts = [outdoor.observe(s) for s in interleaved]
+    assert verdicts[:3] == [None, None, "stale"], "a mixed run must reach threshold"
+    assert verdicts.count("stale") == 1, "the latch must hold for the rest"
+
+
+def test_a_failure_run_survives_a_switch_of_failure_status():
+    """Two errors then a partial is three bad polls, not one."""
+    health = OutdoorHealth(threshold=3)
+    assert health.observe("error") is None
+    assert health.observe("error") is None
+    assert health.observe("partial") == "degraded"
+
+
+def test_the_tier_named_is_the_most_recent_failing_status():
+    """A mixed run is still one outage; report what is happening now."""
+    health = OutdoorHealth(threshold=4)
+    for status in ("error", "error", "error"):
+        assert health.observe(status) is None
+    assert health.observe("duplicate") == "stale"
+
+
+def test_only_an_insert_clears_the_run():
+    """The run resets on health and on nothing else."""
+    health = OutdoorHealth(threshold=3)
+    health.observe("error")
+    health.observe("partial")
+    assert health.observe("inserted") is None  # nothing was alerted yet
+    assert health.unhealthy == 0
+    assert [health.observe("error") for _ in range(3)] == [None, None, "unreachable"]
 
 
 def test_only_an_insert_is_recovery_and_a_partial_is_not():
@@ -102,6 +137,16 @@ def test_an_unrecognised_status_is_ignored_rather_than_read_as_health():
     The fail-open `else` is the bug this class exists to avoid, so an unknown
     status must not silently clear an open alert.
     """
+    # With nothing latched yet — the arm that matters. A first draft only
+    # checked the post-alert case, where the latch short-circuits before the
+    # status is ever looked up, so deleting the guard survived mutation.
+    fresh = OutdoorHealth(threshold=2)
+    assert fresh.observe("something-new") is None
+    assert fresh.observe("something-new") is None
+    assert fresh.unhealthy == 0, "an unclassified status advanced the run"
+    assert fresh.alerted is None
+
+    # ...and it must not clear an alert that is already open either.
     health = OutdoorHealth(threshold=1)
     assert health.observe("error") == "unreachable"
     assert health.observe("something-new") is None
@@ -124,7 +169,9 @@ def test_one_tier_alerts_at_a_time_and_does_not_realert_until_recovery():
 
 def test_below_threshold_writes_nothing_and_notifies_nothing(conn):
     notifier = _RecordingNotifier()
-    handle_outdoor_health(conn, notifier, OutdoorHealth(threshold=4), "error", _now())
+    handle_outdoor_health(
+        conn, notifier, OutdoorHealth(threshold=4), "error", _now(), 900
+    )
     assert notifier.calls == []
     assert db.get_open_events(conn) == {}
 
@@ -138,7 +185,7 @@ def test_the_event_is_keyed_outdoor_not_device(conn):
     """
     notifier = _RecordingNotifier()
     health = OutdoorHealth(threshold=1)
-    handle_outdoor_health(conn, notifier, health, "error", _now())
+    handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
     assert set(db.get_open_events(conn)) == {"outdoor"}
 
 
@@ -156,8 +203,8 @@ def test_an_outdoor_alert_leaves_an_open_indoor_event_alone(conn):
         notified=True,
     )
     health = OutdoorHealth(threshold=1)
-    handle_outdoor_health(conn, notifier, health, "error", _now())
-    handle_outdoor_health(conn, notifier, health, "inserted", _now())
+    handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
+    handle_outdoor_health(conn, notifier, health, "inserted", _now(), 900)
 
     still_open = db.get_open_events(conn)
     assert "device" in still_open, "an outdoor recovery closed the indoor event"
@@ -177,7 +224,7 @@ def test_only_the_actionable_tier_pages(conn, status, tier, priority):
     """`unreachable` is ours to fix; the other two are Open-Meteo's."""
     notifier = _RecordingNotifier()
     health = OutdoorHealth(threshold=1)
-    handle_outdoor_health(conn, notifier, health, status, _now())
+    handle_outdoor_health(conn, notifier, health, status, _now(), 900)
     assert len(notifier.calls) == 1
     assert notifier.calls[0]["priority"] == priority
     assert notifier.calls[0]["title"] == f"Outdoor {tier}"
@@ -187,8 +234,8 @@ def test_only_the_actionable_tier_pages(conn, status, tier, priority):
 def test_recovery_closes_the_row_and_says_so(conn):
     notifier = _RecordingNotifier()
     health = OutdoorHealth(threshold=1)
-    handle_outdoor_health(conn, notifier, health, "error", _now())
-    handle_outdoor_health(conn, notifier, health, "inserted", _now())
+    handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
+    handle_outdoor_health(conn, notifier, health, "inserted", _now(), 900)
     assert [c["title"] for c in notifier.calls] == [
         "Outdoor unreachable",
         "Outdoor recovered",
@@ -200,10 +247,10 @@ def test_recovery_without_a_stored_row_still_notifies(conn):
     """The tracker is the source of truth; a pruned DB must not swallow it."""
     notifier = _RecordingNotifier()
     health = OutdoorHealth(threshold=1)
-    handle_outdoor_health(conn, notifier, health, "error", _now())
+    handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
     conn.execute("DELETE FROM alert_events")
     conn.commit()
-    handle_outdoor_health(conn, notifier, health, "inserted", _now())
+    handle_outdoor_health(conn, notifier, health, "inserted", _now(), 900)
     assert notifier.calls[-1]["title"] == "Outdoor recovered"
 
 
@@ -212,23 +259,122 @@ def test_recovery_without_a_stored_row_still_notifies(conn):
 # --------------------------------------------------------------------------
 
 
-def test_the_message_states_wall_clock_not_a_poll_count(monkeypatch):
+def test_the_message_states_wall_clock_not_a_poll_count():
     """4 polls means 5 minutes indoors and an hour outdoors — say which."""
-    monkeypatch.delenv("AWAIR_OUTDOOR_POLL_SECONDS", raising=False)
-    assert _health_window(OutdoorHealth(threshold=4)) == "1h"
+    assert _health_window(OutdoorHealth(threshold=4), 900) == "1h"
 
 
-def test_the_window_follows_a_configured_interval(monkeypatch):
-    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "60")
-    assert _health_window(OutdoorHealth(threshold=5)) == "5 min"
+@pytest.mark.parametrize(
+    ("threshold", "interval", "expected"),
+    [
+        (5, 60, "5 min"),
+        (4, 100, "7 min"),  # rounds; truncation would say 6
+        (2, 10, "20s"),  # under a minute; truncation would say "0 min"
+        (2, 1800, "1h"),
+    ],
+)
+def test_the_window_renders_the_configured_cadence(threshold, interval, expected):
+    assert _health_window(OutdoorHealth(threshold=threshold), interval) == expected
 
 
-def test_the_notification_carries_the_window(conn, monkeypatch):
-    monkeypatch.delenv("AWAIR_OUTDOOR_POLL_SECONDS", raising=False)
+def test_the_notification_carries_the_window(conn):
     notifier = _RecordingNotifier()
-    handle_outdoor_health(conn, notifier, OutdoorHealth(threshold=4), "error", _now())
-    assert notifier.calls == []
     health = OutdoorHealth(threshold=4)
-    for _ in range(4):
-        handle_outdoor_health(conn, notifier, health, "error", _now())
+    for _ in range(3):
+        handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
+    assert notifier.calls == []
+    handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
     assert "~1h of polls" in notifier.calls[0]["message"]
+
+
+# --------------------------------------------------------------------------
+# The wiring
+#
+# Everything above this line exercises `OutdoorHealth` and
+# `handle_outdoor_health` directly. A review round found that every edit
+# crossing a module boundary — the call from `main()`, the threshold env var,
+# and `web._NON_MEASUREMENT_METRICS` — survived mutation: the whole feature
+# could be unwired and all 386 tests stayed green. Coverage said 99% on
+# `outdoor.py`, because `main()` is driven by three other tests, so the line
+# executed and nothing asserted on it. These close that.
+# --------------------------------------------------------------------------
+
+
+def _run_main_once(monkeypatch, tmp_path, status_payload, env=None):
+    """Drive `outdoor.main()` for exactly one poll and hand back the DB path.
+
+    SIGTERM is raised from inside the first fetch, the same seam
+    `test_main_logs_an_unusable_payload_at_warning_not_info` uses, so the loop
+    runs one iteration and stops. `Notifier` is replaced because `main()` builds
+    a live one aimed at the real ntfy host and these tests deliberately push the
+    threshold down to 1 — without the seam the first of them would post.
+    """
+    import os
+    import signal
+
+    from awair import outdoor as outdoor_module
+
+    db_path = tmp_path / "out.db"
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(db_path))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "0")
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+
+    sent = _RecordingNotifier()
+    monkeypatch.setattr(outdoor_module, "Notifier", lambda **kwargs: sent)
+
+    def weather():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return status_payload
+
+    monkeypatch.setattr(
+        outdoor_module,
+        "make_fetch",
+        lambda url: weather if "air-quality" not in url else (lambda: "{}"),
+    )
+    outdoor_module.main()
+    return db_path, sent
+
+
+def test_main_actually_calls_the_health_handler(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """Delete the call from `main()` and this is the test that goes red.
+
+    Nothing else asserts the feature is connected — the mutation round proved
+    the deletion was silent across the whole suite.
+    """
+    db_path, sent = _run_main_once(
+        monkeypatch,
+        tmp_path,
+        "not json at all",
+        env={"AWAIR_OUTDOOR_HEALTH_POLLS": "1"},
+    )
+    conn = db.connect(db_path)
+    try:
+        events = db.get_open_events(conn)
+    finally:
+        conn.close()
+    assert "outdoor" in events, "main() never reached handle_outdoor_health"
+    assert events["outdoor"]["tier"] == "unreachable"
+    assert [c["title"] for c in sent.calls] == ["Outdoor unreachable"]
+
+
+def test_main_reads_the_threshold_from_the_environment(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """The same single bad poll must stay quiet at the default threshold.
+
+    Pins `AWAIR_OUTDOOR_HEALTH_POLLS` as *read*, not merely present: hard-coding
+    `threshold=4` in `main()` also survived the mutation round, because nothing
+    distinguished the configured value from the default.
+    """
+    db_path, sent = _run_main_once(monkeypatch, tmp_path, "not json at all")
+    conn = db.connect(db_path)
+    try:
+        assert db.get_open_events(conn) == {}
+    finally:
+        conn.close()
+    assert sent.calls == []

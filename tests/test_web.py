@@ -717,6 +717,55 @@ def test_latest_omits_device_health_events(make_raw_client):
     assert [event["metric"] for event in payload["open_events"]] == ["co2"]
 
 
+def test_latest_omits_outdoor_health_events(make_raw_client):
+    """The outdoor sibling of the filter above (#94), and it needed its own test.
+
+    `_NON_MEASUREMENT_METRICS` gained `"outdoor"` with no coverage: reverting it
+    to `frozenset({"device"})` left the whole suite green, so the one line in
+    that change which alters a published contract was the one line nothing
+    checked. Parametrising the pair would couple this to the set's contents; a
+    sibling test states the two members independently.
+
+    The reason differs from `device`'s, which is why it is spelled out rather
+    than cross-referenced. A `device` event is filtered because the hub learns
+    the same thing sooner from `received_at`. That does not transfer here:
+    `/api/latest` publishes the *indoor* `received_at`, and a `"partial"` poll
+    writes a row, so the outdoor clock advances too. This one is filtered
+    because `/api/latest` is the indoor contract and an outdoor transport fact
+    on it is a category error.
+    """
+    now = datetime.now(UTC)
+
+    def seed(conn):
+        _insert_reading(
+            conn, ts=iso_z(now), received_at=now.isoformat(), score=88, temp=22.5
+        )
+        db.open_event(
+            conn,
+            metric="co2",
+            tier="ceiling",
+            opened_at=now - timedelta(minutes=30),
+            value=1400.0,
+            baseline=600.0,
+            threshold=1200.0,
+            notified=True,
+        )
+        for tier in ("unreachable", "degraded", "stale"):
+            db.open_event(
+                conn,
+                metric="outdoor",
+                tier=tier,
+                opened_at=now - timedelta(minutes=5),
+                value=None,
+                baseline=None,
+                threshold=None,
+                notified=True,
+            )
+
+    payload = make_raw_client("outdoor", seed).get("/api/latest").get_json()
+    assert [event["metric"] for event in payload["open_events"]] == ["co2"]
+
+
 def test_latest_survives_an_open_event_stamped_without_an_offset(make_raw_client):
     """The naive/aware mix that used to 500 before the sort was normalised.
 

@@ -115,11 +115,17 @@ ingestion, so a wrong URL or 401 just gets logged.)
   negative age, so a dead poller would render healthy forever. An empty
   `readings` table answers 200 with `"reading": null`, not an error, so a
   consumer can tell "up, but the poller is dead" from "unreachable".
-  `open_events` carries **spike events only** — the device-health event
-  `poller.handle_device_health` opens (`metric="device"`, no peak/baseline/
-  threshold) is filtered out, because a consumer learns the same thing earlier
-  from `received_at` going stale and publishing it would make three numeric
-  fields nullable for everyone.
+  `open_events` carries **spike events only** — both health events (no peak/
+  baseline/threshold) are filtered out, for two different reasons.
+  `metric="device"`, opened by `poller.handle_device_health`, because a consumer
+  learns the same thing earlier from `received_at` going stale, and publishing
+  it would make three numeric fields nullable for everyone. `metric="outdoor"`,
+  opened by `outdoor.handle_outdoor_health` (#94), because that argument does
+  *not* transfer — this endpoint publishes the indoor `received_at`, and a
+  partial outdoor poll writes a row anyway — but `/api/latest` is the indoor
+  contract, so an outdoor transport fact on it is a category error. A broken
+  air-quality endpoint is already visible on `/api/outdoor-latest` as a NULL
+  `aq_ts`.
 
 - **`GET /api/outdoor-latest`** — the newest outdoor reading, whole, as
   read-only JSON, for the house hub's weather card (#71). The outdoor sibling

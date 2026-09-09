@@ -139,7 +139,8 @@ main {
 #events .badge::before { content: ""; width: 8px; height: 8px; border-radius: 2px; }
 #events .badge.ceiling::before { background: var(--event-ceiling); }
 #events .badge.relative::before { background: var(--event-relative); }
-#events .badge.unreachable::before, #events .badge.stale::before { background: var(--event-device); }
+#events .badge.unreachable::before, #events .badge.stale::before,
+#events .badge.degraded::before { background: var(--event-device); }
 #events .empty { color: var(--ink-muted); padding: 10px 12px; }
 footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
 </style>
