@@ -1,9 +1,11 @@
 """Open-Meteo outdoor poller: parse, dedup, error and partial paths."""
 
+import http.client
 import json
 import logging
 import os
 import signal
+import sqlite3
 import time
 from urllib.error import URLError
 
@@ -910,8 +912,121 @@ def test_main_logs_an_unusable_payload_at_warning_not_info(
         (logging.WARNING, "outdoor poll: error")
     ]
     # And the reason, not just the verdict -- "error" alone does not say which
-    # of the four unusable-payload shapes arrived.
+    # of the unusable-payload shapes arrived. The handler covers `sqlite3.Error`
+    # since #98, so the message is no longer allowed to blame the payload
+    # unconditionally; what it must still carry is the exception class, which is
+    # what tells a reader whether to look at Open-Meteo or at their own disk.
     assert any(
-        r.levelno == logging.WARNING and "unusable weather payload" in r.getMessage()
+        r.levelno == logging.WARNING
+        and "payload or insert failed" in r.getMessage()
+        and "ValueError" in r.getMessage()
         for r in caplog.records
     )
+
+
+# --- the insert inside the guard, and the fetch gap (#98) -------------------
+
+
+def test_poll_once_survives_an_unbindable_sensor_value(conn):
+    """The shape that made the insert's position matter (#98).
+
+    `parse_reading` validates `current.time` and hands the other twelve columns
+    to the driver unchecked, so a nested object in any of them is a bind-time
+    `sqlite3.ProgrammingError`. With the insert outside the guard that escaped
+    `poll_once` and unwound `main()`, and systemd restarted the poller straight
+    back into the same upstream value -- the crash loop #91 exists to prevent,
+    arriving one layer lower down.
+    """
+    payload = {"current": dict(WEATHER["current"], temperature_2m={"nested": 1})}
+
+    # Control: the shape really does reach the driver as an error.
+    with pytest.raises(sqlite3.ProgrammingError):
+        from awair import db as _db
+
+        _db.insert_outdoor_reading(conn, parse_reading(payload, AIR_QUALITY, RECEIVED))
+
+    assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
+        "error"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+    # And the write lock is not left held -- both pollers share one AWAIR_DB.
+    assert conn.in_transaction is False
+
+
+def test_poll_once_survives_a_truncated_weather_response(conn):
+    """`IncompleteRead` is not an `OSError` and urllib does not convert it.
+
+    So before #98 a truncated response from Open-Meteo -- a real thing for an
+    HTTP fetch over a home connection -- escaped the fetch guard entirely.
+    """
+    assert not issubclass(http.client.IncompleteRead, OSError), (
+        "if this ever becomes an OSError the test no longer covers what it says"
+    )
+
+    def truncated():
+        raise http.client.IncompleteRead(b'{"cur')
+
+    assert poll_once(conn, truncated, lambda: AIR_QUALITY_TEXT) == "error"
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
+
+
+def test_poll_once_downgrades_a_truncated_air_quality_response_to_partial(conn):
+    """The AQ half of the same gap: the weather row is still worth writing."""
+
+    def truncated():
+        raise http.client.BadStatusLine("garbage")
+
+    assert poll_once(conn, lambda: WEATHER_TEXT, truncated) == "partial"
+    stored = conn.execute("SELECT temp, us_aqi FROM outdoor_readings").fetchone()
+    assert stored == (22.4, None)
+
+
+def test_a_disk_fault_costs_a_poll_rather_than_the_process(conn, monkeypatch):
+    """The half of the divergence from #91 that is NOT about payloads.
+
+    #91 ruled a `sqlite3.Error` should propagate here because it is "a local
+    fault a restart can clear". Exiting does not clear a full disk, and
+    `OutdoorHealth` escalates a sustained run of errors to "unreachable" (#94),
+    so the fault is still reported -- just not by dying.
+    """
+    from awair import db as _db
+
+    def full_disk(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(_db, "insert_outdoor_reading", full_disk)
+    assert poll_once(conn, lambda: WEATHER_TEXT, lambda: AIR_QUALITY_TEXT) == "error"
+
+
+@pytest.mark.parametrize("bad_time", [None, "", 0, 123, [], {}])
+def test_parse_reading_refuses_a_ts_that_is_not_a_usable_string(bad_time):
+    """#98 item 4, which the outdoor poller already satisfied -- now pinned.
+
+    The ticket prescribed copying PR #97's explicit `not timestamp or not
+    isinstance(timestamp, str)` check across from the indoor poller. It is a
+    no-op here: indoor's `parse_reading` stores `payload["timestamp"]` verbatim,
+    whereas this one runs every value through `_normalize_source_time`, which
+    raises `TypeError` on a non-string and `ValueError` on an unparseable one.
+    Both are in `POLL_FAILURES`, so the poll is already a logged `"error"`.
+
+    Nothing was added for this. The test exists because the behaviour was
+    incidental -- a future refactor that normalized lazily, or accepted an
+    integer epoch, would reopen the hole with every other test still green.
+    """
+    with pytest.raises((TypeError, ValueError)):
+        parse_reading({"current": {"time": bad_time}}, {}, received_at=RECEIVED)
+
+
+def test_a_null_ts_can_no_longer_reach_the_table_as_a_silent_duplicate(conn):
+    """End-to-end for the regression the NOT NULL migration could have caused.
+
+    Under `INSERT OR IGNORE` a null `ts` against a NOT NULL column comes back
+    rowcount 0, which `poll_once` renders as `"duplicate"` -- the one status
+    meaning nothing is wrong, and exactly #95's silent half. It must be an
+    `"error"`, and the row must not be there.
+    """
+    payload = {"current": dict(WEATHER["current"], time=None)}
+    assert poll_once(conn, lambda: json.dumps(payload), lambda: AIR_QUALITY_TEXT) == (
+        "error"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0

@@ -1,17 +1,57 @@
 """SQLite connection, PRAGMAs, and idempotent schema bootstrap.
 
-Schema changes: bump PRAGMA user_version and add a guarded migration in
-connect() — never edit the CREATE statements for deployed columns.
+Schema changes: add a guarded migration in `_migrate()` — never edit the CREATE
+statements for deployed columns, because `CREATE TABLE IF NOT EXISTS` leaves a
+live table untouched and the edit would then describe a database that does not
+exist.
+
+Migrations guard on the *schema itself* (`PRAGMA table_info`), not on a version
+counter. `PRAGMA user_version` is still 0 on the homelab after four schema
+changes, so a counter here would have to be back-filled by guessing which
+migrations a live DB had already had — and the schema can simply be asked.
 """
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # UTC-aware sentinel for fan_state rows we've never written — must be tz-aware
 # so callers can subtract it from `datetime.now(timezone.utc)` without a
 # naive/aware TypeError.
 _NEVER = datetime(1970, 1, 1, tzinfo=UTC)
+
+# The outdoor column list, defined once because two places create this table:
+# `SCHEMA` on a fresh install, and `_migrate_outdoor_ts_not_null`'s rebuild on a
+# deployed one. Retyping it in the migration is how the two installs drift, and
+# `test_a_migrated_table_has_the_same_column_order_as_a_fresh_one` would only
+# catch that after the fact -- one definition means the drift cannot be typed.
+#
+# `ts TEXT NOT NULL PRIMARY KEY` (#98). The NOT NULL is not redundant: SQLite
+# keeps a longstanding compatibility bug where a non-INTEGER PRIMARY KEY on a
+# rowid table gets no implicit NOT NULL, so two null-`ts` rows both insert and
+# the table accumulates rows no dedup and no `ORDER BY ts` can key on.
+#
+# `weather_code` and `aq_ts` are ordered last, and in this order, to match what
+# `_migrate` ALTERs onto an existing DB (#77). A fresh install and a migrated
+# one otherwise end up with different physical column orders and SCHEMA stops
+# describing a live database. Harmless while every query names its columns --
+# which `test_schema_column_order_matches_a_migrated_database` keeps true --
+# but SCHEMA is read as documentation, so it should not be false.
+#
+# Keep prose *outside* this string. SQLite stores the statement text verbatim
+# and re-parses it on ALTER TABLE ... DROP COLUMN; a comment between the columns
+# is left dangling by the drop and the ALTER fails with "incomplete input".
+OUTDOOR_COLUMNS_DDL = """
+    ts TEXT NOT NULL PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
+    pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL,
+    weather_code INTEGER,
+    aq_ts TEXT
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
@@ -46,27 +86,13 @@ CREATE TABLE IF NOT EXISTS fan_state (
     run_started_at TEXT,
     capped INTEGER NOT NULL DEFAULT 0
 );
-
--- `weather_code` and `aq_ts` are ordered last, and in this order, to match what
--- `_migrate` ALTERs onto an existing DB (#77). A fresh install and a migrated
--- one otherwise end up with different physical column orders and SCHEMA stops
--- describing a live database. Harmless while every query names its columns --
--- which `test_schema_column_order_matches_a_migrated_database` keeps true --
--- but SCHEMA is read as documentation, so it should not be false.
---
--- Keep this comment *outside* the CREATE TABLE. SQLite stores the statement
--- text verbatim and re-parses it on ALTER TABLE ... DROP COLUMN; a comment
--- between the columns is left dangling by the drop and the ALTER fails with
--- "incomplete input".
-CREATE TABLE IF NOT EXISTS outdoor_readings (
-    ts TEXT PRIMARY KEY,
-    received_at TEXT NOT NULL,
-    temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
-    pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL,
-    weather_code INTEGER,
-    aq_ts TEXT
-);
 """
+# Concatenated rather than interpolated: `str.format` and f-strings both treat
+# `{` as a placeholder, and SQL is full of braceable syntax (a future CHECK or a
+# JSON default would silently become a KeyError at import time).
+SCHEMA += (
+    "\nCREATE TABLE IF NOT EXISTS outdoor_readings (" + OUTDOOR_COLUMNS_DDL + ");\n"
+)
 
 OUTDOOR_COLUMNS = (
     "ts",
@@ -147,6 +173,10 @@ def _migrate(conn) -> None:
     # capping it instantly on a start time we never observed.
     _add_column(conn, "fan_state", "run_started_at TEXT")
     _add_column(conn, "fan_state", "capped INTEGER NOT NULL DEFAULT 0")
+    # Last, and it must stay last: the rebuild copies the columns named in
+    # OUTDOOR_COLUMNS, so it has to run after the ALTERs that add them. On a
+    # pre-#71 DB the reverse order fails on "no such column: weather_code".
+    _migrate_outdoor_ts_not_null(conn)
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -162,6 +192,77 @@ def _add_column(conn, table: str, column_def: str) -> None:
     except sqlite3.OperationalError as exc:
         if "duplicate column" not in str(exc).lower():
             raise
+
+
+def _outdoor_ts_is_nullable(conn) -> bool:
+    """Ask the live schema, rather than a version counter, what shape it is in."""
+    for row in conn.execute("PRAGMA table_info(outdoor_readings)"):
+        if row[1] == "ts":
+            return not row[3]
+    raise sqlite3.OperationalError("outdoor_readings has no `ts` column")
+
+
+def _rebuild_outdoor_readings(conn) -> int:
+    """Retype `outdoor_readings` with a NOT NULL `ts`. Returns rows dropped.
+
+    SQLite has no ALTER COLUMN, so tightening a constraint means the documented
+    12-step rebuild. Caller owns the transaction.
+
+    Unkeyed rows cannot come across: `ts` is the dedup key and the sort key, and
+    a row without one is not a reading of any particular moment. Deriving one
+    from `received_at` would manufacture an observation time Open-Meteo never
+    published -- precisely what `_migrate`'s `aq_ts` comment refuses to do for
+    the auxiliary clock. So they are dropped, and the count is returned so the
+    caller can say so out loud.
+    """
+    columns = ", ".join(OUTDOOR_COLUMNS)
+    (unkeyed,) = conn.execute(
+        "SELECT COUNT(*) FROM outdoor_readings WHERE ts IS NULL"
+    ).fetchone()
+    conn.execute(f"CREATE TABLE outdoor_readings_rebuilt ({OUTDOOR_COLUMNS_DDL})")
+    conn.execute(
+        f"INSERT INTO outdoor_readings_rebuilt ({columns})"
+        f" SELECT {columns} FROM outdoor_readings WHERE ts IS NOT NULL"
+    )
+    conn.execute("DROP TABLE outdoor_readings")
+    conn.execute("ALTER TABLE outdoor_readings_rebuilt RENAME TO outdoor_readings")
+    return unkeyed
+
+
+def _migrate_outdoor_ts_not_null(conn) -> None:
+    """Close the nullable-PRIMARY-KEY hole on a deployed DB (#98).
+
+    The deployed table is `ts TEXT PRIMARY KEY`, which SQLite does *not* make
+    NOT NULL, so it accepts unlimited null-`ts` rows -- each one invisible to
+    the dedup that column exists for and sorting first under every `ORDER BY
+    ts`.
+
+    `BEGIN IMMEDIATE` plus a re-check inside it, because poller and web both
+    call `connect()` after restart.sh and a check-then-rebuild would let both
+    processes rebuild. Taking the write lock up front makes the loser wait
+    (`busy_timeout` is already 5s) and then find the work done. This is the same
+    race `_add_column` tolerates by swallowing "duplicate column"; a rebuild has
+    no equivalent idempotent verb, so it needs the lock.
+    """
+    if not _outdoor_ts_is_nullable(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _outdoor_ts_is_nullable(conn):
+            conn.rollback()  # the other process rebuilt while we waited
+            return
+        dropped = _rebuild_outdoor_readings(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if dropped:
+        log.warning(
+            "outdoor_readings: dropped %d unkeyed row(s) with a NULL ts while"
+            " migrating the column to NOT NULL; a reading with no source"
+            " timestamp cannot be dated and was not backfilled (#98)",
+            dropped,
+        )
 
 
 def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
@@ -180,16 +281,36 @@ def insert_outdoor_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     """Insert one outdoor reading. False if this source-time is already stored.
 
     `ts` is Open-Meteo's `current.time` — the source publish time, not our
-    poll wall-clock. INSERT OR IGNORE makes the poll loop idempotent: if
+    poll wall-clock. The conflict clause makes the poll loop idempotent: if
     the upstream hasn't refreshed since the previous poll (the weather
     endpoint publishes every 15 min), the second write is a no-op.
+
+    `ON CONFLICT(ts) DO NOTHING` rather than `INSERT OR IGNORE`, and the
+    difference is load-bearing now that `ts` is NOT NULL (#98). `OR IGNORE`
+    ignores *every* constraint violation, so a null `ts` would come back as
+    rowcount 0 and this function would report it as a duplicate -- the one
+    status that means "nothing is wrong". Tightening the column without also
+    naming the conflict target would have converted #98's silent-garbage half
+    into #95's silent-duplicate half rather than closing it. Naming `ts` keeps
+    the dedup and lets a NOT NULL violation raise, where `poll_once` reports it
+    honestly as an error. Mirrors `insert_reading` after PR #97.
     """
     placeholders = ", ".join(f":{col}" for col in OUTDOOR_COLUMNS)
-    cursor = conn.execute(
-        f"INSERT OR IGNORE INTO outdoor_readings ({', '.join(OUTDOOR_COLUMNS)})"
-        f" VALUES ({placeholders})",
-        reading,
-    )
+    try:
+        cursor = conn.execute(
+            f"INSERT INTO outdoor_readings ({', '.join(OUTDOOR_COLUMNS)})"
+            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            reading,
+        )
+    except sqlite3.Error:
+        # sqlite3 opens an implicit transaction before an INSERT and a raising
+        # statement does not resolve it, so without this the connection sits
+        # holding the write lock until some later poll commits. Both pollers
+        # share one AWAIR_DB, so an outdoor payload fault would stall the
+        # *indoor* writer too -- verified: a second connection gets "database
+        # is locked" until the rollback lands.
+        conn.rollback()
+        raise
     conn.commit()
     return cursor.rowcount == 1
 
