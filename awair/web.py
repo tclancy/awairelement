@@ -57,7 +57,7 @@ OUTDOOR_LATEST_FIELDS = (
 # measurement's shape. Excluded deliberately (#70): the hub already learns the
 # same thing, earlier and more reliably, from `received_at` going stale, since
 # an unreachable device writes no readings at all. See README.
-_NON_MEASUREMENT_METRICS = frozenset({"device"})
+_NON_MEASUREMENT_METRICS = frozenset({"device", "outdoor"})
 
 # The open-event fields `/api/latest` publishes, in the order #70 lists them.
 # Also a whitelist rather than a passthrough — `db.get_open_events` carries
