@@ -113,11 +113,52 @@ READING_COLUMNS = (
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
+    """Read-write connection that bootstraps the schema.
+
+    For a process that owns the database: the pollers, and the web app *once*
+    at startup. Not for a per-request caller -- see `connect_readonly` (#73).
+    """
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
     _migrate(conn)
+    return conn
+
+
+def connect_readonly(path: str | Path) -> sqlite3.Connection:
+    """Query-only connection: no schema bootstrap, and SQLite enforces it.
+
+    `connect()` replays the whole DDL path on every call -- 5 SCHEMA statements
+    plus 6 `ALTER TABLE`s whose "duplicate column" errors `_add_column`
+    swallows. That is correct for a process that starts once and owns the file,
+    and wrong for `web.py`, which called it per request (#73).
+
+    **`mode=ro` rather than merely declining to call `_migrate`.** The point is
+    a guarantee a future edit cannot quietly revoke: SQLite refuses the write
+    itself, so a read path that grows an `INSERT` fails loudly here instead of
+    racing the poller. Every `db` function `web.py` reaches is already
+    query-only.
+
+    Two consequences, both deliberate:
+
+    * **It cannot create the file.** A missing database raises
+      `OperationalError` instead of being silently created empty, so the web
+      app bootstraps once at startup (`create_app`) to keep a fresh install
+      serving. A database deleted out from under a running process now fails
+      the request rather than resurrecting as an empty one -- which is the
+      better of the two, since the silent version hides the data loss.
+    * **`journal_mode` is not set.** It is a write, and it is already WAL:
+      whoever bootstrapped the file set it, and the pragma persists in the file
+      header. Setting it from here would defeat `mode=ro`.
+
+    `busy_timeout` is connection-local and safe on a read-only handle. WAL
+    readers still need the `-shm` file, which the writer owns and this process
+    shares.
+    """
+    uri = f"{Path(path).absolute().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

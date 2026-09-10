@@ -187,8 +187,16 @@ def create_app(db_path=None):
     )
     app.config["TEMPERATURE_UNIT"] = units.get_temperature_unit()
 
+    # Bootstrap once, here, rather than on every request (#73). Gunicorn runs
+    # two workers so this happens twice at startup, which is the same race
+    # `db._add_column` already tolerates between the web app and the pollers --
+    # and twice at startup is not 288 times a day, which is what `/api/latest`
+    # made it once a machine started polling on a timer.
+    db.connect(app.config["AWAIR_DB"]).close()
+
     def connect():
-        return db.connect(app.config["AWAIR_DB"])
+        """Read-only, per request. Every view below is query-only."""
+        return db.connect_readonly(app.config["AWAIR_DB"])
 
     def temp_unit():
         return app.config["TEMPERATURE_UNIT"]
