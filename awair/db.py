@@ -115,12 +115,22 @@ READING_COLUMNS = (
 
 BUSY_TIMEOUT_MS = 5000
 
+# Longest single sleep between retries. Bounds the doubling; see the comment at
+# the `time.sleep` below for why this and the clamp travel together.
+_MAX_RETRY_SLEEP = 0.05
+
 # Primary result codes that mean "someone else holds the lock, try again".
 # Compared against the low byte of `sqlite_errorcode` so the extended forms --
-# SQLITE_BUSY_SNAPSHOT, SQLITE_BUSY_RECOVERY, SQLITE_LOCKED_SHAREDCACHE -- are
-# covered without naming each one. Matching on the code rather than on the
-# message means this does not quietly stop working when SQLite rewords
-# "database is locked".
+# SQLITE_BUSY_SNAPSHOT (517), SQLITE_BUSY_RECOVERY (261),
+# SQLITE_LOCKED_SHAREDCACHE (262) and SQLITE_BUSY_TIMEOUT (773) -- are covered
+# without naming each one. Matching on the code rather than on the message
+# means this does not quietly stop working when SQLite rewords "database is
+# locked".
+#
+# SQLITE_PROTOCOL (15) is deliberately NOT here despite being WAL-index
+# contention. SQLite retries it internally and gives up only after concluding
+# another process is misbehaving, which is not a condition more waiting fixes.
+# The set is enumerated in this comment, so an omission needs a reason.
 _RETRYABLE_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 
 
@@ -135,13 +145,17 @@ def _set_journal_mode_wal(conn, timeout_ms: int = BUSY_TIMEOUT_MS) -> None:
     does not change that (#102).
 
     Measured on sqlite 3.49.1 at 3-way concurrency. The failure rate is
-    load-dependent and no count of it is reproducible -- six independent runs
-    of 30 trials on one idle Mac spanned **7 to 23 failing trials**, and the
-    `raceable` fixture in `tests/test_db_wal_race.py` records a per-trial
-    probability that falls to 0.00 on a single core. Only one side of the
-    comparison is a constant, and it is the side that matters: **0 failing
-    trials with this retry**, in every run, at 3, 8, 16 and 32 workers.
-    Quote the zero; do not quote a rate for the failing shape.
+    load-dependent and no count of it is reproducible: independent runs of 30
+    trials spanned **6 to 23 failing trials** across two sessions on one idle
+    Mac, and `tests/test_db_wal_race.py`'s `raceable` docstring records
+    separately measured per-trial probabilities falling to 0.00 on a single
+    core. Only one side of the comparison is a constant, and it is the side
+    that matters: **0 failing trials with this retry**, in every run, at 3, 8,
+    16 and 32 workers, threads and processes alike. Quote the zero; do not
+    quote a rate for the failing shape.
+
+    `conn` is intentionally unannotated: the tests pass doubles that implement
+    only `execute`, and the retry needs nothing else from it.
 
     That window is only open on a genuinely fresh database. `journal_mode`
     persists in the file header, so once any process has made the transition
@@ -180,23 +194,52 @@ def _set_journal_mode_wal(conn, timeout_ms: int = BUSY_TIMEOUT_MS) -> None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise
-            # Clamped to what is left. Sleeping the full `delay` and re-checking
-            # afterwards would overshoot the budget by up to one delay -- 74 ms
-            # against a 50 ms budget, measured -- which makes the docstring's
-            # "the budget is `busy_timeout`'s" false by up to 50 ms.
+            # These two lines are each other's only backstop, so change neither
+            # alone. The `min(delay, remaining)` clamp bounds a single sleep by
+            # what is left of the budget; the `0.05` cap bounds the doubling.
+            # Drop the cap and the schedule runs 1, 2, 4 ... 2048 ms -- 4095 ms
+            # cumulative -- and then starts one 4096 ms sleep with 905 ms of a
+            # 5000 ms budget remaining, which the clamp is what truncates. Drop
+            # both and the budget silently becomes ~8.2 s.
+            #
+            # Do not justify the clamp with an overshoot figure. An earlier
+            # revision claimed "74 ms against a 50 ms budget, measured"; it does
+            # not reproduce. At n=40 per arm the clamp's median saving is ~1 ms
+            # at a 50 ms budget and ~20 ms at 5000 ms, both swamped by
+            # `time.sleep`'s own overshoot -- and against the cap it can save at
+            # most 50 ms of 5000 either way. The clamp earns its place by
+            # bounding the *uncapped* shape above, not by a rate.
             time.sleep(min(delay, remaining))
-            delay = min(delay * 2, 0.05)
+            delay = min(delay * 2, _MAX_RETRY_SLEEP)
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
-    # busy_timeout first: it covers the schema bootstrap and migration below,
-    # which are ordinary writes and do honour the busy handler. It does not
-    # cover the journal-mode transition -- see `_set_journal_mode_wal`.
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-    _set_journal_mode_wal(conn)
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    try:
+        # busy_timeout first: it covers the schema bootstrap and migration
+        # below, which are ordinary writes and do honour the busy handler. It
+        # does not cover the journal-mode transition -- see
+        # `_set_journal_mode_wal`.
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        _set_journal_mode_wal(conn)
+        conn.executescript(SCHEMA)
+        _migrate(conn)
+    except BaseException:
+        # Close on every failing path, not just the interesting one. The leak
+        # predates #102 -- any of these four could always raise -- but #102
+        # widens the window on one of them from instantaneous to the whole
+        # retry budget, and a leaked handle surfaces as a `ResourceWarning`
+        # attributed to whatever test the GC happens to run in.
+        #
+        # It stops being merely untidy once #73/PR #103 lands:
+        # `web._bootstrap_schema` *swallows* `sqlite3.Error`, so a bootstrap
+        # that gives up leaves an open handle per gunicorn worker instead of
+        # taking the process down with it.
+        #
+        # `BaseException`, not `Exception`: a `KeyboardInterrupt` landing in
+        # `time.sleep` inside the retry is a live path here.
+        conn.close()
+        raise
     return conn
 
 

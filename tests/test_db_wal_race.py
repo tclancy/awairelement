@@ -36,12 +36,17 @@ import pytest
 
 from awair import db
 
-# Enough trials that a regression is not a coin flip. Sized off the LOW end of
-# the observed per-trial failure rate, not the mean: six runs of 30 on an idle
-# Mac put it between 0.23 and 0.77, so at 0.23 a regression survives 25 trials
-# with probability 0.77**25 = 0.15%. Using the mean (~0.47, the figure the
-# `raceable` fixture records) would quote 0.00001% and size the gate off a
-# number a busier machine does not deliver.
+# Enough trials that a regression is not a coin flip. Stated as a BOUND rather
+# than as an observed rate, because the observed rate is not a property of this
+# code: two measurement sessions on the same idle Mac returned 7-23 and 6-17
+# failing trials per 30, i.e. per-trial rates of 0.23-0.77 and 0.20-0.57. Any
+# range written here is out of date on a busier box.
+#
+# The bound: at 25 trials a regression survives with probability under 1% for
+# any per-trial rate above 0.17 (0.83**25 = 0.86%), and the lowest rate ever
+# measured on a machine that races at all is 0.20. Sizing off the *mean* would
+# have quoted 0.00001% and bought nothing a busy machine delivers.
+#
 # `test_the_race_harness_can_still_fail` is what keeps that arithmetic honest
 # -- it asserts the harness really does provoke the failure, so a green run
 # here cannot be a harness that stopped racing.
@@ -283,6 +288,46 @@ def test_busy_timeout_is_set_before_the_journal_mode_transition(tmp_path, monkey
     assert executed.index("EXECUTESCRIPT") > executed.index(first_journal)
 
 
+def test_connect_closes_its_connection_when_the_transition_gives_up(
+    tmp_path, monkeypatch
+):
+    """A `connect()` that raises must not leave the handle open.
+
+    Latent before #102 -- any of the four statements in `connect()` could
+    always raise -- but #102 widens the window on one of them from
+    instantaneous to the whole retry budget. It stops being merely untidy once
+    #73/PR #103 lands: `web._bootstrap_schema` swallows `sqlite3.Error`, so a
+    bootstrap that gives up leaks one handle per gunicorn worker instead of
+    taking the process down with it.
+
+    Asserted on the connection object rather than by chasing a
+    `ResourceWarning`, which the GC attributes to whichever test happens to be
+    running when it fires -- exactly the misattribution `tests/conftest.py`'s
+    `conn` fixture exists to prevent.
+    """
+    opened = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    monkeypatch.setattr(
+        db, "_set_journal_mode_wal", lambda conn, **kw: (_ for _ in ()).throw(_Busy())
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        db.connect(tmp_path / "gives-up.db")
+
+    assert len(opened) == 1, f"expected one connection, saw {len(opened)}"
+    with pytest.raises(sqlite3.ProgrammingError):
+        # A closed connection refuses to be used again; an open one would
+        # happily answer this and the leak would go unnoticed.
+        opened[0].execute("SELECT 1")
+
+
 def test_connect_leaves_the_database_in_wal_with_a_busy_timeout(tmp_path):
     """The end state, independent of how it was reached."""
     conn = db.connect(tmp_path / "state.db")
@@ -295,12 +340,14 @@ class _Busy(sqlite3.OperationalError):
     """SQLITE_BUSY that reports its own result code.
 
     Subclassed rather than constructed, because `sqlite_errorcode` is set by
-    the C layer and is **0** on an `OperationalError("database is locked")`
-    built by hand. A double with code 0 is classified non-retryable, so a test
-    using one would pass whether or not the production predicate reads the code
-    -- the fixture would not be the production state it claims to be. The real
-    failure was measured at code 5 / `SQLITE_BUSY` in every one of 30 race
-    trials, which is what this mirrors.
+    the C layer and is **absent entirely** -- not 0 -- on an
+    `OperationalError("database is locked")` built by hand. The production
+    predicate reads it with `getattr(..., 0)`, so a hand-built double is
+    classified non-retryable and a test using one would pass whether or not
+    that predicate looks at the code at all. The real failure was measured at
+    code 5 / `SQLITE_BUSY` in every one of 30 race trials, which is what this
+    mirrors. (`test_an_error_carrying_no_sqlite_errorcode_is_not_retried`
+    covers the absent case deliberately; this class is the present one.)
     """
 
     sqlite_errorcode = sqlite3.SQLITE_BUSY
@@ -308,6 +355,22 @@ class _Busy(sqlite3.OperationalError):
 
     def __init__(self):
         super().__init__("database is locked")
+
+
+class _Locked(sqlite3.OperationalError):
+    """SQLITE_LOCKED -- the other half of `_RETRYABLE_SQLITE_CODES`.
+
+    Without this double, deleting `sqlite3.SQLITE_LOCKED` from the production
+    frozenset is a mutation that survives the whole suite: every other lock
+    fixture here carries code 5, so nothing exercises the code-6 branch and
+    half the predicate is unguarded.
+    """
+
+    sqlite_errorcode = sqlite3.SQLITE_LOCKED
+    sqlite_errorname = "SQLITE_LOCKED"
+
+    def __init__(self):
+        super().__init__("database table is locked")
 
 
 class _CantOpen(sqlite3.OperationalError):
@@ -320,9 +383,10 @@ class _CantOpen(sqlite3.OperationalError):
         super().__init__("unable to open database file")
 
 
-# Well above the ~7 attempts the real 50 ms budget produces, and low enough
-# that a loop which ignores its deadline trips it in seconds rather than
-# hanging the suite. See `_FailingConn.execute`.
+# Well above what any test here drives the loop to -- 4 to 5 attempts at the
+# real 50 ms budget (measured, n=40), ~15 on the virtual clock at 400 ms -- and
+# low enough that a loop which ignores its deadline trips it in seconds rather
+# than hanging the suite. See `_FailingConn.execute`.
 _HARD_CAP = 50
 
 
@@ -386,19 +450,95 @@ def test_the_retry_is_bounded_and_gives_up():
     including the race test, which a loop that never gives up passes especially
     well.
 
-    `time.sleep` is deliberately *not* stubbed out. Stubbing it turns the loop
-    into a spin that burns the 50 ms budget over ~a million attempts, so the
-    `_HARD_CAP` backstop would fire on correct code and this test would go red
-    on a tree with nothing wrong with it. Real sleeps put the attempt count at
-    ~7, well inside the cap.
+    `time.sleep` is deliberately *not* stubbed out here. Stubbing it away turns
+    the loop into a spin that burns the 50 ms budget over ~a million attempts,
+    so the `_HARD_CAP` backstop would fire on correct code and this test would
+    go red on a tree with nothing wrong with it. Real sleeps put the attempt
+    count at 4 to 5, well inside the cap.
+
+    The bound is scaled to the budget rather than fixed. An earlier revision
+    asserted `elapsed < 5` against a 50 ms budget -- 100x slack, which is
+    enough to swallow a loop that has stopped respecting its deadline
+    altogether. The slack that remains is for `time.sleep` overshoot, measured
+    on this box at a median ~10 ms and a max ~68 ms per call.
     """
+    budget_s = 0.05
     conn = _FailingConn(failures=10**9, error=_Busy())
     started = time.monotonic()
     with pytest.raises(sqlite3.OperationalError):
-        db._set_journal_mode_wal(conn, timeout_ms=50)
+        db._set_journal_mode_wal(conn, timeout_ms=budget_s * 1000)
     elapsed = time.monotonic() - started
-    assert elapsed < 5, f"the retry loop ignored its 50 ms budget ({elapsed:.2f}s)"
+    assert elapsed < budget_s + 0.5, (
+        f"the retry loop ignored its {budget_s * 1000:.0f} ms budget ({elapsed:.3f}s)"
+    )
     assert conn.attempts > 1, "it gave up without retrying at all"
+
+
+def test_no_single_sleep_outruns_the_cap_or_the_budget(monkeypatch):
+    """The clamp and the backoff cap, gated -- on a virtual clock.
+
+    `min(delay, remaining)` and `min(delay * 2, _MAX_RETRY_SLEEP)` are each
+    other's only backstop, and all three mutations of that pair survived the
+    rest of this file: dropping the clamp, dropping the cap, and dropping both
+    -- which turns a 5000 ms budget into ~8.2 s. Nothing else here can see it,
+    because `test_the_retry_is_bounded_and_gives_up` runs at a 50 ms budget,
+    where the doubling never reaches the 50 ms cap and so never binds.
+
+    Time is faked rather than slept so the assertions are exact and the test is
+    instant. That is safe *here*, unlike in the test above, because nothing is
+    being inferred from wall-clock duration -- the sleep values themselves are
+    the thing under test, and the fake clock advances by exactly what the loop
+    asks for. 400 ms is chosen because it is the smallest round budget at which
+    the doubling overruns the cap, so an uncapped schedule is visible.
+    """
+    budget_s = 0.4
+    clock = {"now": 1000.0}
+    slept: list[float] = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+
+    conn = _FailingConn(failures=10**9, error=_Busy())
+    with pytest.raises(sqlite3.OperationalError):
+        db._set_journal_mode_wal(conn, timeout_ms=budget_s * 1000)
+
+    assert slept, "it gave up without sleeping at all"
+    assert max(slept) <= db._MAX_RETRY_SLEEP, (
+        f"a single retry slept {max(slept) * 1000:.0f} ms against a "
+        f"{db._MAX_RETRY_SLEEP * 1000:.0f} ms cap -- the backoff is unbounded, "
+        "so a long budget becomes a much longer one"
+    )
+    # 1 microsecond of slack for float accumulation over ~15 additions -- a
+    # correct schedule lands on the budget exactly and sums to 400.0000000001
+    # ms. The regressions this guards against overshoot by up to one uncapped
+    # sleep (50 ms here, 4096 ms with the cap gone too), so the epsilon is four
+    # orders of magnitude below anything it must catch.
+    assert sum(slept) <= budget_s + 1e-6, (
+        f"the retry schedule slept {sum(slept) * 1000:.3f} ms against a "
+        f"{budget_s * 1000:.0f} ms budget -- the final sleep is not clamped to "
+        "what remains, so `connect()` outlives the timeout its caller set"
+    )
+
+
+def test_a_sqlite_locked_transition_is_also_retried():
+    """The code-6 half of `_RETRYABLE_SQLITE_CODES`, which nothing else covers.
+
+    Every other lock fixture in this file carries code 5, so deleting
+    `sqlite3.SQLITE_LOCKED` from the production frozenset was a mutation that
+    survived the entire suite -- half the predicate, unguarded. Distinct from
+    `test_an_extended_busy_code_is_still_retried`, which proves the `& 0xFF`
+    mask; this proves the *set* has two members.
+    """
+    conn = _FailingConn(failures=2, error=_Locked())
+    db._set_journal_mode_wal(conn, timeout_ms=5000)
+    assert conn.attempts == 3, (
+        f"a SQLITE_LOCKED transition took {conn.attempts} attempts; expected "
+        "2 retries then success"
+    )
 
 
 def test_a_non_lock_error_is_not_retried():
