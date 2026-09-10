@@ -4,6 +4,7 @@ Run via: uv run --frozen gunicorn -b 0.0.0.0:8097 'awair.web:create_app()'
 """
 
 import os
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
@@ -176,6 +177,36 @@ def _outdoor_range_params():
     return _since_for(spec), spec["bucket_seconds"]
 
 
+def _bootstrap_schema(db_path, logger) -> None:
+    """Run the schema bootstrap once, at app construction rather than per request.
+
+    `connect_readonly` cannot create the database, so something has to, and a
+    fresh install may bring the web unit up before either poller has ever run.
+    The parent directory is created for the same reason the pollers create it
+    (`poller.main`, `outdoor.main`) -- on a new box `~/data/awairelement/` does
+    not exist yet.
+
+    Gunicorn runs two workers, so this happens twice at startup. That is the
+    same duplicate-column race `db._add_column` already tolerates against the
+    pollers, and twice at startup is not once per request (#73).
+
+    **A failure here is logged and swallowed, deliberately.** Raising would
+    abort the gunicorn worker, and `awairelement-web.service` is
+    `Restart=always`, so an unopenable path -- an unmounted volume, a
+    permissions change -- would become a crash loop. Before #73 that same path
+    left `/` rendering and 500ed only the `/api/*` routes, and this keeps it
+    that way. Nothing is concealed: each request still fails loudly on its own
+    `connect_readonly`.
+    """
+    try:
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        db.connect(db_path).close()
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("schema bootstrap failed for %s: %s", db_path, exc)
+
+
 def create_app(db_path=None):
     app = Flask(
         __name__,
@@ -187,12 +218,7 @@ def create_app(db_path=None):
     )
     app.config["TEMPERATURE_UNIT"] = units.get_temperature_unit()
 
-    # Bootstrap once, here, rather than on every request (#73). Gunicorn runs
-    # two workers so this happens twice at startup, which is the same race
-    # `db._add_column` already tolerates between the web app and the pollers --
-    # and twice at startup is not 288 times a day, which is what `/api/latest`
-    # made it once a machine started polling on a timer.
-    db.connect(app.config["AWAIR_DB"]).close()
+    _bootstrap_schema(app.config["AWAIR_DB"], app.logger)
 
     def connect():
         """Read-only, per request. Every view below is query-only."""
