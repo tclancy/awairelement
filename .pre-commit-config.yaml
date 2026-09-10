@@ -2,8 +2,28 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Vendored minified assets are third-party bytes, not ours. Rewriting
+      # them makes the working copy differ from what upstream ships, so every
+      # later uPlot bump carries a spurious whitespace diff on top of the real
+      # one, forever (#104).
+      #
+      # The pattern says "a file under static/ whose name contains `.min.`",
+      # which is the naming convention these assets already follow. It is
+      # deliberately not a literal filename -- `static/` held two vendored
+      # `.min` assets while #104 named only one, and a guard naming one file is
+      # one file wide. It is deliberately not an extension list either: the
+      # ordinary next uPlot bump brings `.min.js.map` beside the bundle, and an
+      # `(css|js)$` list silently stops covering it. `.*` spans `/`, so a later
+      # `static/vendor/` layout is covered without a second edit.
+      #
+      # The anchor is load-bearing. Both hooks below normalise whitespace over
+      # the same bytes, so a second literal here is a second thing to keep in
+      # step; `tests/test_precommit_vendored_excludes.py` asserts the two
+      # resolve to the same pattern either way.
       - id: trailing-whitespace
+        exclude: &vendored_minified ^static/.*\.min\.
       - id: end-of-file-fixer
+        exclude: *vendored_minified
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
