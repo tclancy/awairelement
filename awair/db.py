@@ -5,6 +5,7 @@ connect() — never edit the CREATE statements for deployed columns.
 """
 
 import sqlite3
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -112,10 +113,88 @@ READING_COLUMNS = (
 )
 
 
+BUSY_TIMEOUT_MS = 5000
+
+# Primary result codes that mean "someone else holds the lock, try again".
+# Compared against the low byte of `sqlite_errorcode` so the extended forms --
+# SQLITE_BUSY_SNAPSHOT, SQLITE_BUSY_RECOVERY, SQLITE_LOCKED_SHAREDCACHE -- are
+# covered without naming each one. Matching on the code rather than on the
+# message means this does not quietly stop working when SQLite rewords
+# "database is locked".
+_RETRYABLE_SQLITE_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+
+def _set_journal_mode_wal(conn, timeout_ms: int = BUSY_TIMEOUT_MS) -> None:
+    """Put the database into WAL, retrying while another process is doing it.
+
+    A journal-mode transition needs a brief exclusive lock and **does not
+    invoke the busy handler** -- it fails fast with `database is locked`
+    instead of waiting out `busy_timeout` the way an ordinary write does. So on
+    a database that is not yet in WAL, three processes calling `connect()` at
+    once leave one winner and two crashes, and setting `busy_timeout` first
+    does not change that (#102).
+
+    Measured on sqlite 3.49.1 at 3-way concurrency. The failure rate is
+    load-dependent and no count of it is reproducible -- six independent runs
+    of 30 trials on one idle Mac spanned **7 to 23 failing trials**, and the
+    `raceable` fixture in `tests/test_db_wal_race.py` records a per-trial
+    probability that falls to 0.00 on a single core. Only one side of the
+    comparison is a constant, and it is the side that matters: **0 failing
+    trials with this retry**, in every run, at 3, 8, 16 and 32 workers.
+    Quote the zero; do not quote a rate for the failing shape.
+
+    That window is only open on a genuinely fresh database. `journal_mode`
+    persists in the file header, so once any process has made the transition
+    every later call is a no-op read that cannot contend -- which is why the
+    homelab, in WAL since its first deploy, has never seen this. It is a fresh
+    install, or a restore from scratch, where `restart.sh` starts the two
+    pollers and the web app together.
+
+    Only a lock code is retried. An `OperationalError` that means something
+    else -- an unreadable file, a disk error -- is re-raised on the first
+    attempt rather than spending the whole budget on a condition no amount of
+    waiting fixes.
+
+    The budget is `busy_timeout`'s, deliberately: a caller already accepts
+    waiting that long for contention, and this is the one kind of contention
+    that would otherwise skip the wait. Bounded, not indefinite -- a database
+    locked by something that is never going to let go raises rather than
+    hanging a unit forever, and systemd restarting it is the better outcome.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    delay = 0.001
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            # `getattr`, not attribute access: `sqlite_errorcode` is set by the
+            # C layer and is **absent** -- not 0 -- on an OperationalError
+            # raised anywhere else, so a bare `exc.sqlite_errorcode` would
+            # turn one into an AttributeError and bury the original as its
+            # __context__. Defaulting to 0 classifies it non-retryable, which
+            # is the right answer for an error SQLite did not raise.
+            code = getattr(exc, "sqlite_errorcode", 0)
+            if code & 0xFF not in _RETRYABLE_SQLITE_CODES:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            # Clamped to what is left. Sleeping the full `delay` and re-checking
+            # afterwards would overshoot the budget by up to one delay -- 74 ms
+            # against a 50 ms budget, measured -- which makes the docstring's
+            # "the budget is `busy_timeout`'s" false by up to 50 ms.
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.05)
+
+
 def connect(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    # busy_timeout first: it covers the schema bootstrap and migration below,
+    # which are ordinary writes and do honour the busy handler. It does not
+    # cover the journal-mode transition -- see `_set_journal_mode_wal`.
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    _set_journal_mode_wal(conn)
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
