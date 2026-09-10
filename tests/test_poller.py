@@ -1,8 +1,10 @@
 """Parsing device JSON and single poll iterations."""
 
+import http.client
 import json
 import os
 import signal
+import sqlite3
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +13,13 @@ from urllib.error import URLError
 import pytest
 
 from awair import poller
-from awair.poller import handle_device_health, make_fetch, parse_reading, poll_once
+from awair.monitor import DeviceHealth
+from awair.poller import (
+    handle_device_health,
+    make_fetch,
+    parse_reading,
+    poll_once,
+)
 
 FIXTURE_TEXT = (Path(__file__).parent / "fixtures" / "air_data_latest.json").read_text()
 FIXTURE = json.loads(FIXTURE_TEXT)
@@ -74,6 +82,201 @@ def test_poll_once_reports_fetch_error_without_inserting(conn):
 
 def test_poll_once_reports_bad_json_as_error(conn):
     assert poll_once(conn, fetch=lambda: "<html>not json</html>") == "error"
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+# Four payload shapes the device could publish that `parse_reading` indexes
+# into as if it were a dict. Every one of them raised TypeError past
+# `poll_once`'s old `(OSError, ValueError, KeyError)` and unwound `main()` --
+# reproduced on this branch before the fix, not inferred (#95).
+NON_OBJECT_PAYLOADS = [
+    pytest.param("[]", id="json-list"),
+    pytest.param('"hello"', id="json-string"),
+    pytest.param("42", id="json-number"),
+    pytest.param(None, id="fetcher-returned-none"),
+]
+
+
+@pytest.mark.parametrize("body", NON_OBJECT_PAYLOADS)
+def test_poll_once_survives_a_payload_that_is_not_an_object(conn, body):
+    """A bad upstream payload costs one poll, never the service.
+
+    `parse_reading` subscripts the payload, so a list, a string or a number
+    raises TypeError rather than KeyError; `json.loads(None)` raises TypeError
+    too, which is the shape any `make_fetch` replacement missing a `return`
+    produces. `main()` has no try around `poll_once`, so before #95 all four
+    exited the process and systemd restarted straight back into the same
+    value.
+    """
+    assert poll_once(conn, fetch=lambda: body) == "error"
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_parse_reading_rejects_a_null_device_timestamp():
+    """A null `ts` is a bad reading, not a reading with a blank field.
+
+    `readings.ts` is `TEXT NOT NULL` and the old `INSERT OR IGNORE` ignored
+    that violation exactly as it ignored a uniqueness one -- so handing SQLite
+    a null reported `"duplicate"` and stored nothing. Rejecting it here is
+    what turns a silent discard into a logged `"error"`.
+    """
+    payload = dict(FIXTURE, timestamp=None)
+    with pytest.raises(ValueError):
+        parse_reading(payload, received_at=RECEIVED)
+
+
+@pytest.mark.parametrize("bad_ts", [None, "", 0])
+def test_poll_once_reports_a_bad_timestamp_as_error_not_duplicate(conn, bad_ts):
+    """The distinction the whole issue turns on.
+
+    `"duplicate"` means the device republished a reading we already hold, and
+    it is the one status that is *fine*. Reporting a rejected payload as a
+    duplicate made "the device is quiet" and "ingestion has been dead for a
+    week" the same line in the log.
+    """
+    fetch = lambda: json.dumps(dict(FIXTURE, timestamp=bad_ts))  # noqa: E731
+    assert poll_once(conn, fetch=fetch) == "error"
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_a_bad_timestamp_does_not_look_like_a_quiet_device_to_alerting(conn):
+    """Why this is a bug and not a tidiness complaint (#95).
+
+    `check_metrics` only runs on `"inserted"`, so for as long as the device
+    publishes a bad timestamp no CO2/VOC/PM2.5 spike can open an event or fire
+    an ntfy. The issue said the DeviceHealth path does not cover this at all;
+    it does, but only in the sustained case -- ten consecutive errors raise
+    `"unreachable"`, where before the fix the same polls counted as duplicates
+    and raised `"stale"`. **Interleaved** with good readings it never fires,
+    because any insert resets the counter, and that is the genuinely silent
+    shape: half the readings vanish and nothing anywhere says so.
+
+    Both halves are pinned. The fix does not change DeviceHealth's arithmetic
+    -- it changes which bucket a bad payload lands in, from `"duplicate"`
+    ("the device is wedged") to `"error"` ("the fetch produced nothing
+    usable"), which is the honest one.
+    """
+    bad = lambda: json.dumps(dict(FIXTURE, timestamp=None))  # noqa: E731
+    health = DeviceHealth()
+    sustained = [health.observe(poll_once(conn, fetch=bad)) for _ in range(12)]
+    assert "unreachable" in sustained, sustained
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_an_intermittent_bad_timestamp_is_the_silent_shape(conn):
+    """The case DeviceHealth genuinely cannot see, before OR after the fix.
+
+    Alternating good and bad payloads keeps both counters below the alert
+    threshold forever, so no event opens either way. What the fix buys here is
+    not an alert -- it is that every discarded poll now reports `"error"` and
+    logs the reason, where before it reported `"duplicate"` and looked exactly
+    like a device that had nothing new to say.
+
+    The no-alert half of that is true before AND after the fix, so asserting
+    only it would leave this test passing on a full revert. The status
+    sequence is the binding assertion.
+    """
+
+    def bad():
+        return json.dumps(dict(FIXTURE, timestamp=None))
+
+    def good(minute):
+        return lambda: json.dumps(
+            dict(FIXTURE, timestamp=f"2026-09-09T10:{minute:02d}:00Z")
+        )
+
+    health = DeviceHealth()
+    statuses, verdicts = [], []
+    for i in range(60):
+        fetch = bad if i % 2 else good(i)
+        status = poll_once(conn, fetch=fetch)
+        statuses.append(status)
+        verdicts.append(health.observe(status))
+
+    # The half that binds: pre-fix every odd poll came back "duplicate".
+    assert statuses[1::2] == ["error"] * 30, statuses
+    assert statuses[0::2] == ["inserted"] * 30, statuses
+    assert [v for v in verdicts if v] == [], (
+        "no alert fires -- this is the silent shape"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 30
+
+
+# A sensor field the device publishes as a nested object or array. `ts` is
+# validated but these 14 are handed to the driver unchecked, so they bind-fail
+# as sqlite3.ProgrammingError -- which is why POLL_FAILURES names sqlite3.Error
+# and not sqlite3.IntegrityError. This is the natural caller; the monkeypatched
+# test below is the unnatural one.
+NON_SCALAR_SENSOR_FIELDS = [
+    pytest.param({"co2": {"value": 900}}, id="co2-is-an-object"),
+    pytest.param({"co2": [900]}, id="co2-is-a-list"),
+    pytest.param({"score": {"nested": {"deep": 1}}}, id="score-is-nested"),
+]
+
+
+@pytest.mark.parametrize("override", NON_SCALAR_SENSOR_FIELDS)
+def test_poll_once_survives_a_non_scalar_sensor_field(conn, override):
+    """The contract is "one poll, never the service" -- for every payload.
+
+    `parse_reading` gates `ts` and then does `payload.get(field)` for all 14
+    sensor fields with no shape check, so a nested object reaches
+    `conn.execute` and raises `sqlite3.ProgrammingError` at bind time. That is
+    a real shape from a firmware change, and it is the reason `POLL_FAILURES`
+    widened to `sqlite3.Error` rather than stopping at `IntegrityError`.
+    """
+    body = json.dumps(dict(FIXTURE, **override))
+    assert poll_once(conn, fetch=lambda: body) == "error"
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_a_failed_insert_does_not_leave_the_write_lock_held(conn):
+    """Costing one poll is the point; costing the write lock is a worse bug.
+
+    sqlite3 opens an implicit transaction before an INSERT, and a statement
+    that raises does not resolve it -- so without the rollback in
+    `insert_reading` the connection holds the write lock until some later poll
+    commits, which if the device is stuck on a bad value is never.
+    """
+    body = json.dumps(dict(FIXTURE, co2={"value": 900}))
+    assert poll_once(conn, fetch=lambda: body) == "error"
+    assert not conn.in_transaction
+
+    # And the next good poll still works, rather than meeting its own lock.
+    assert poll_once(conn, fetch=lambda: FIXTURE_TEXT) == "inserted"
+
+
+def test_poll_once_survives_a_truncated_response_from_the_device(conn):
+    """IncompleteRead is not an OSError, so it escaped the fetch guard.
+
+    `http.client` exceptions inherit from `Exception`, not `OSError`, and
+    urllib does not convert what `getresponse()`/`read()` raise -- so a
+    truncated response over a flaky LAN exited the process.
+    """
+
+    def truncated():
+        raise http.client.IncompleteRead(b'{"timestamp"')
+
+    assert poll_once(conn, fetch=truncated) == "error"
+    assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
+
+
+def test_poll_once_reports_a_db_error_from_the_insert_as_error(conn, monkeypatch):
+    """The belt to `parse_reading`'s braces, pinned rather than assumed.
+
+    `db.insert_reading` can raise now that it names its conflict target instead
+    of swallowing every constraint violation. Nothing reaches THIS branch today
+    -- `parse_reading` rejects the only bad `ts` shape and `received_at` is our
+    own clock -- so it is asserted with a monkeypatched insert. A later schema
+    NOT NULL, or a `parse_reading` that stops validating, would otherwise turn
+    a discarded poll back into a dead process, which is the bug #95 exists to
+    fix.
+    """
+
+    def raising_insert(*_args, **_kwargs):
+        raise sqlite3.IntegrityError("NOT NULL constraint failed: readings.ts")
+
+    monkeypatch.setattr(poller.db, "insert_reading", raising_insert)
+    assert poll_once(conn, fetch=lambda: FIXTURE_TEXT) == "error"
     assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 0
 
 
@@ -269,6 +472,56 @@ def test_main_polls_once_then_exits_cleanly_on_sigterm(
 
     conn = db.connect(str(tmp_path / "poller.db"))
     try:
+        assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_main_survives_a_payload_that_used_to_kill_the_process(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """`poll_once` returning "error" is worthless if the loop above it unwound.
+
+    This is the assertion #95 asks for by name, and it is the one the
+    unit-level tests cannot make: before the fix a non-object payload raised
+    TypeError straight out of `poll_once`, past a `main()` that has no
+    `except` of its own, and
+    exited the process -- systemd then restarted into the same value. Here the
+    first poll is a bare JSON list and the second is a real reading, and
+    `main()` has to reach the second.
+    """
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "poller.db"))
+    # 0, not the 30 the sibling SIGTERM test uses. That one signals on the
+    # FIRST fetch so `stop.wait(interval)` returns immediately; this one has to
+    # reach a second poll, so a 30 s interval is 30 s of real sleep in a suite
+    # whose total work is about two.
+    monkeypatch.setenv("AWAIR_POLL_SECONDS", "0")
+    monkeypatch.setenv("AWAIR_NTFY_TOKEN", "")
+
+    started = time.monotonic()
+    bodies = iter(["[]", FIXTURE_TEXT])
+
+    def fetch():
+        body = next(bodies)
+        if body is FIXTURE_TEXT:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return body
+
+    monkeypatch.setattr(poller, "make_fetch", lambda url: fetch)
+    monkeypatch.setattr(poller, "check_metrics", lambda *a, **k: None)
+    monkeypatch.setattr(poller, "check_fans", lambda *a, **k: None)
+
+    poller.main([])  # must return normally, not raise
+
+    # Guards against the interval creeping back: this test is bounded by the
+    # two fetches, not by a wait.
+    assert time.monotonic() - started < 10
+
+    from awair import db
+
+    conn = db.connect(str(tmp_path / "poller.db"))
+    try:
+        # The SECOND poll is what proves the loop survived the first.
         assert conn.execute("SELECT COUNT(*) FROM readings").fetchone()[0] == 1
     finally:
         conn.close()
