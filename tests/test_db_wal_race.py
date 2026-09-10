@@ -12,10 +12,11 @@ Two consequences shape every test here:
 - **`busy_timeout` does not help, in either order.** Setting it first is
   correct for the schema bootstrap that follows, but the transition itself
   fails fast regardless. Measured at 3-way concurrency on sqlite 3.49.1, the
-  pragmas in either order fail a **variable** fraction of trials -- six
-  independent runs of 30 on one idle Mac spanned 7 to 23 -- and the retry
-  fails **0**, in every run, at 3, 8, 16 and 32 workers. Only the zero is a
-  constant; see `_set_journal_mode_wal` on why not to quote the other side.
+  pragmas in either order fail a **variable** fraction of trials -- two
+  measurement sessions on the same idle Mac spanned 6 to 23 per 30 -- and the
+  retry fails **0**, in every run, at 3, 8, 16 and 32 workers, threads and
+  processes alike. Only the zero is a constant; see `_set_journal_mode_wal`
+  and the `RACE_TRIALS` note on why not to quote the other side.
   So a test that only asserts `busy_timeout` is set proves nothing about #102.
 - **The window closes permanently once anyone wins.** `journal_mode` lives in
   the file header, so the second call on a given database is a no-op read that
