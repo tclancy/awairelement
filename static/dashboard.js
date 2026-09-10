@@ -7,7 +7,8 @@
   // the server so a single TEMPERATURE_UNIT env var flips both API values
   // and the display label together.
   const TEMP_UNIT = document.body.dataset.tempUnitSymbol || "°C";
-  const METRICS = {
+  const NON_METRIC_LABELS = { device: "Device", outdoor: "Outdoor" };
+const METRICS = {
     co2:   { name: "CO₂",      unit: "ppm",     digits: 0 },
     voc:   { name: "TVOC",     unit: "ppb",     digits: 0 },
     pm25:  { name: "PM2.5",    unit: "µg/m³",   digits: 1 },
@@ -362,7 +363,10 @@
           ? new Date(ev.closed_at * 1000).toLocaleString()
           : "open";
         const meta = METRICS[ev.metric];
-        const label = meta ? meta.name : "Device";
+        // `/api/events` applies no metric filter, so both health events reach
+        // this table. Falling through to "Device" labelled an outdoor poller
+        // outage as the indoor Element (#94).
+        const label = meta ? meta.name : NON_METRIC_LABELS[ev.metric] || "Device";
         const peak = ev.peak_value == null ? "–" : ev.peak_value;
         return `<tr>
           <td>${label}</td>

@@ -112,7 +112,7 @@ CREATE UNIQUE INDEX ON readings (ts);   -- device ts; dedupes double-polls
 CREATE TABLE alert_events (
     id INTEGER PRIMARY KEY,
     metric TEXT NOT NULL,               -- co2 | voc | pm25 | device
-    tier TEXT NOT NULL,                 -- relative | ceiling | unreachable | stale
+    tier TEXT NOT NULL,                 -- relative | ceiling | unreachable | stale | degraded
     opened_at TIMESTAMP NOT NULL,
     closed_at TIMESTAMP,                -- NULL while open
     peak_value REAL, baseline REAL, threshold REAL,

@@ -7,6 +7,9 @@ Config via environment:
   AWAIR_OUTDOOR_POLL_SECONDS        — default 900 (15 min, the native cadence)
   AWAIR_OUTDOOR_WEATHER_URL         — override for test/staging (see DEFAULT_WEATHER_URL)
   AWAIR_OUTDOOR_AIR_QUALITY_URL     — override for test/staging (see DEFAULT_AIR_QUALITY_URL)
+  AWAIR_OUTDOOR_HEALTH_POLLS        — default 4 (~1h at the default cadence); see OutdoorHealth
+  AWAIR_NTFY_URL, AWAIR_NTFY_TOPIC, AWAIR_NTFY_TOKEN
+                                    — shared with the indoor poller; a sustained failure notifies
 
 Weather refreshes every 15 min at the source; air quality (CAMS-backed) is
 hourly. Both are fetched every 15 min and merged into one row keyed on the
@@ -23,6 +26,8 @@ import urllib.request
 from datetime import UTC, date, datetime
 
 from awair import db
+from awair.alerts import Notifier
+from awair.monitor import OutdoorHealth
 from awair.shutdown import install_handler
 
 # A trailing ISO zone designator, stripped before the date-only test in
@@ -359,6 +364,77 @@ def _require_env(name: str) -> str:
     return value
 
 
+def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None:
+    """Map an `OutdoorHealth` verdict onto an alert event + notification.
+
+    Sibling of `poller.handle_device_health`, and it opens its event under
+    `metric="outdoor"` rather than reusing `"device"` for a reason that is a
+    correctness bug rather than tidiness: `db.get_open_events` returns at most
+    one open event **per metric**, and the two pollers are separate processes
+    against one DB (two systemd units, one `AWAIR_DB`). Sharing the key means an
+    outdoor recovery closes the indoor poller's open `unreachable` row and pages
+    "Awair Element recovered" while the Element is still down (reproduced #94).
+
+    `web._NON_MEASUREMENT_METRICS` carries `"outdoor"`, but **not** for the
+    reason it carries `"device"`. That one is filtered because the hub sees the
+    same outage sooner in `received_at`; that argument does not transfer, since
+    `/api/latest` publishes the *indoor* `received_at` and a `"partial"` poll
+    writes a row anyway. The real reason is narrower: `/api/latest` is the
+    indoor contract, so an outdoor transport fact there is a category error.
+    A broken AQ endpoint is already visible to the hub on `/api/outdoor-latest`
+    as a NULL `aq_ts`, which #71 renders as "no current AQI" — so nothing is
+    lost by keeping this event off the indoor endpoint. Whether it should be
+    published on `/api/outdoor-latest` too is deliberately left open.
+
+    Only `unreachable` pages at high priority. `degraded` and `stale` are
+    Open-Meteo publishing badly; they are worth a notification so a sustained
+    outage is not silent, but waking someone for a fault they cannot fix is how
+    a channel gets muted.
+    """
+    verdict = health.observe(status)
+    if verdict in health.TIERS.values():
+        notified = notifier.send(
+            f"Outdoor poller {verdict} (~{_health_window(health, interval)} of polls)",
+            title=f"Outdoor {verdict}",
+            priority="high" if verdict == "unreachable" else "default",
+        )
+        db.open_event(
+            conn,
+            metric="outdoor",
+            tier=verdict,
+            opened_at=now,
+            value=None,
+            baseline=None,
+            threshold=None,
+            notified=notified,
+        )
+    elif verdict == "recovered":
+        event = db.get_open_events(conn).get("outdoor")
+        notified = notifier.send("Outdoor poller recovered", title="Outdoor recovered")
+        if event:
+            db.close_event(conn, event["id"], closed_at=now, notified=notified)
+
+
+def _health_window(health, interval) -> str:
+    """The alert threshold as wall-clock, e.g. "1h".
+
+    The poll count on its own is meaningless without the cadence beside it, and
+    the cadence differs from the indoor poller's by 30x — so the message says
+    the duration, as `poller.handle_device_health`'s does.
+
+    Takes `interval` rather than re-reading `AWAIR_OUTDOOR_POLL_SECONDS`: a pure
+    formatter reaching into the environment is a second source of truth for a
+    value `main()` has already resolved. Rounds rather than truncating, so a
+    window under a minute does not render as "0 min".
+    """
+    seconds = health.threshold * interval
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{round(seconds / 60)} min"
+    return f"{seconds}s"
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -372,6 +448,21 @@ def main() -> None:
     weather_base = os.environ.get("AWAIR_OUTDOOR_WEATHER_URL", DEFAULT_WEATHER_URL)
     air_quality_base = os.environ.get(
         "AWAIR_OUTDOOR_AIR_QUALITY_URL", DEFAULT_AIR_QUALITY_URL
+    )
+
+    notifier = Notifier(
+        base_url=os.environ.get(
+            "AWAIR_NTFY_URL", "https://notifications.tomclancy.info"
+        ),
+        topic=os.environ.get("AWAIR_NTFY_TOPIC", "awair"),
+        token=os.environ.get("AWAIR_NTFY_TOKEN", ""),
+    )
+    health = OutdoorHealth(
+        threshold=int(
+            os.environ.get(
+                "AWAIR_OUTDOOR_HEALTH_POLLS", OutdoorHealth.DEFAULT_THRESHOLD
+            )
+        )
     )
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
@@ -396,6 +487,9 @@ def main() -> None:
                 else logging.WARNING,
                 "outdoor poll: %s",
                 status,
+            )
+            handle_outdoor_health(
+                conn, notifier, health, status, datetime.now(UTC), interval
             )
             if stop.wait(interval):
                 break
