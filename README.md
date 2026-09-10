@@ -285,6 +285,7 @@ an in-memory SQLite fixture. See `tests/`.
 ```
 awair/
 ├── db.py        # connection PRAGMAs + idempotent schema bootstrap
+│                # (`connect`) and the query-only `connect_readonly` the web app uses
 ├── poller.py    # the 30s loop: fetch → store → detect → alert
 ├── spikes.py    # baseline math + hysteresis (pure functions)
 ├── monitor.py   # device health checks (unreachable, stale)
