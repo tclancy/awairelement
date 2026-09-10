@@ -13,14 +13,17 @@ Config via environment:
 
 Weather refreshes every 15 min at the source; air quality (CAMS-backed) is
 hourly. Both are fetched every 15 min and merged into one row keyed on the
-weather endpoint's `current.time` — inserts are idempotent via INSERT OR
-IGNORE, so a re-poll before Open-Meteo refreshes writes nothing.
+weather endpoint's `current.time` — inserts are idempotent via
+`ON CONFLICT(ts) DO NOTHING`, so a re-poll before Open-Meteo refreshes writes
+nothing.
 """
 
+import http.client
 import json
 import logging
 import os
 import re
+import sqlite3
 import urllib.parse
 import urllib.request
 from datetime import UTC, date, datetime
@@ -296,6 +299,45 @@ def parse_reading(
     return reading
 
 
+# What a bad upstream payload is allowed to cost: one poll, never the service
+# (#91, #93, #98). The tuples are written to make that sentence TRUE rather than
+# to enumerate the shapes we happened to reproduce.
+#
+# `http.client.HTTPException` is the gap #98 found: `IncompleteRead` and
+# `BadStatusLine` are NOT `OSError` subclasses and urllib does not convert them,
+# so a truncated response from Open-Meteo escaped both fetch guards and unwound
+# `main()`, which has no `except` of its own. It is named here rather than in
+# POLL_FAILURES because a fetch is the only thing that can raise it -- but note
+# POLL_FAILURES is built FROM this tuple, so it carries it too. That is wider
+# than the shape demands and deliberately so: the tuples encode the contract
+# above, not a census of reproduced exceptions.
+FETCH_FAILURES = (
+    OSError,
+    http.client.HTTPException,
+    KeyError,
+    TypeError,
+    ValueError,
+)
+
+# The insert now sits inside the guard, so the insert's own failures belong in
+# the tuple: `parse_reading` validates the two fields it requires and hands the
+# other twelve to the driver unchecked, making a nested object or array in any
+# of them a `sqlite3.ProgrammingError` at bind time.
+#
+# This DIVERGES from the ruling #91/PR #93 made here -- that a `sqlite3.Error`
+# is "a local fault a restart can clear" and should propagate -- and adopts PR
+# #97's counter-argument for the indoor poller, which #98 was filed to carry
+# across. That reasoning holds for `OperationalError` and not for
+# `ProgrammingError`, which is an *upstream payload* fault that has merely
+# travelled as far as the bind: a restart puts the poller straight back into the
+# same value, which is the crash loop #91 exists to prevent. Nor does exiting
+# clear a full disk. What the divergence costs is that a local fault is now a
+# logged "error" rather than a dead unit -- and `OutdoorHealth` escalates a
+# sustained run of those to "unreachable" (#94), so it is still reported, just
+# not by dying.
+POLL_FAILURES = (*FETCH_FAILURES, sqlite3.Error)
+
+
 def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
     """One poll iteration.
 
@@ -303,10 +345,15 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
     'partial' = weather succeeded but air quality failed; the row is
     still inserted with AQ columns NULL because trend data on the
     weather side is more valuable than "all or nothing" here.
+
+    The insert sits INSIDE the guard, unlike before #98. `insert_outdoor_reading`
+    can raise -- a bind-time `ProgrammingError` from an unchecked optional
+    column, an `OperationalError` from a full disk -- and an exception from
+    there would unwind `main()` exactly as the parse failures used to.
     """
     try:
         weather_payload = json.loads(fetch_weather())
-    except (OSError, TypeError, ValueError, KeyError) as exc:
+    except FETCH_FAILURES as exc:
         # TypeError: a fetcher returning None is `json.loads(None)`. Same
         # escaping-and-exiting shape as the clock defect, same slot in the
         # tuple (#91 review).
@@ -320,7 +367,7 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
                 "or its `current` block is"
             )
         status = "ok"
-    except (OSError, TypeError, ValueError, KeyError) as exc:
+    except FETCH_FAILURES as exc:
         # Raising to this handler rather than branching around it is deliberate:
         # an unreadable AQ block and a failed AQ fetch have the same remedy
         # (drop the block, keep the weather row, report "partial"), so they
@@ -334,7 +381,8 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
             air_quality_payload,
             received_at=datetime.now(UTC).isoformat(),
         )
-    except (KeyError, TypeError, ValueError) as exc:
+        inserted = db.insert_outdoor_reading(conn, reading)
+    except POLL_FAILURES as exc:
         # KeyError: `current` or `time` absent. ValueError: `time` unparseable,
         # or clockless and refused by `_normalize_source_time`. TypeError: a
         # JSON `null` time reaching `fromisoformat`, or a non-dict `current`.
@@ -347,9 +395,13 @@ def poll_once(conn, fetch_weather, fetch_air_quality) -> str:
         # TypeError is not optional. #91 prescribed `(KeyError, ValueError)`,
         # which leaves a `"time": null` payload killing the poller exactly as
         # before -- pinned by `test_poll_once_survives_a_bad_weather_time`.
-        log.warning("unusable weather payload: %s: %s", type(exc).__name__, exc)
+        #
+        # The message says "payload or insert", not "weather payload": since
+        # #98 this handler also covers `sqlite3.Error`, and a log line naming
+        # the payload for a disk-full `OperationalError` sends whoever reads it
+        # to Open-Meteo for a fault on their own box.
+        log.warning("payload or insert failed: %s: %s", type(exc).__name__, exc)
         return "error"
-    inserted = db.insert_outdoor_reading(conn, reading)
     if not inserted:
         return "duplicate"
     return "inserted" if status == "ok" else "partial"
