@@ -165,13 +165,32 @@ def _add_column(conn, table: str, column_def: str) -> None:
 
 
 def insert_reading(conn: sqlite3.Connection, reading: dict) -> bool:
-    """Insert one reading. False if the device timestamp is already stored."""
+    """Insert one reading. False if the device timestamp is already stored.
+
+    `ON CONFLICT(ts) DO NOTHING` rather than `INSERT OR IGNORE`, and the
+    difference is the whole of #95's silent half. `OR IGNORE` ignores *every*
+    constraint violation, so a null `ts` against a `TEXT NOT NULL` column came
+    back as rowcount 0 and this function reported it as a duplicate -- the one
+    status that means "nothing is wrong". Naming the conflict target keeps the
+    dedup this exists for (`idx_readings_ts` is a real unique index; the
+    ticket's claim that `ts` had none is wrong) and lets a NOT NULL violation
+    raise, where `poll_once` reports it honestly as an error.
+    """
     placeholders = ", ".join(f":{col}" for col in READING_COLUMNS)
-    cursor = conn.execute(
-        f"INSERT OR IGNORE INTO readings ({', '.join(READING_COLUMNS)})"
-        f" VALUES ({placeholders})",
-        reading,
-    )
+    try:
+        cursor = conn.execute(
+            f"INSERT INTO readings ({', '.join(READING_COLUMNS)})"
+            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            reading,
+        )
+    except sqlite3.Error:
+        # sqlite3 opens an implicit transaction before an INSERT and a raising
+        # statement does not resolve it, so without this the connection sits
+        # holding the write lock until some later poll commits -- and if the
+        # device is stuck on a bad value, that is never. Costing one poll is
+        # the whole point; costing the write lock is a worse bug.
+        conn.rollback()
+        raise
     conn.commit()
     return cursor.rowcount == 1
 
