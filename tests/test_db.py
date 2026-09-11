@@ -517,9 +517,14 @@ def test_fan_events_since_excludes_rows_before_the_window(conn):
 def test_fan_events_since_orders_a_single_polls_two_fans_deterministically(conn):
     """Both fans are commanded from one `now`, so `at` ties are the normal case.
 
-    `ORDER BY at` alone leaves the tie to SQLite; the insertion order is the
-    only thing that distinguishes fan 1's command from fan 2's, so the read
-    has to break the tie on `id`.
+    This pins the **API contract** — a tie comes back in insertion order — and
+    deliberately not the `ORDER BY at, id` clause that currently delivers it.
+    Dropping `, id` is a mutant this test cannot kill, and that is a property of
+    SQLite rather than a hole here: equal keys already come back in rowid order,
+    from a table scan and from the `idx_fan_events_at` index alike, because an
+    index entry carries the rowid as its last column. The clause pins a
+    guarantee SQLite does not document; this test pins the behaviour callers
+    depend on, so a future reader that sorts some other way fails here.
     """
     for fan_id in (1, 2):
         db.record_fan_event(
