@@ -1004,3 +1004,191 @@ def test_candidacy_is_logged_once_per_poll_not_once_per_fan(conn, monkeypatch, c
     caplog.set_level("INFO", logger="awair.fans")
     check_fans(conn, FakeNotifier(), cfg, NOW)
     assert len([r for r in caplog.records if "fan-on candidacy" in r.message]) == 1
+
+
+# --- fan_events: the durable actuation history (#84) ---
+
+
+def _history(conn):
+    """Every fan event this test has produced, oldest first."""
+    return db.fan_events_since(conn, NOW - timedelta(days=1))
+
+
+def test_a_commanded_fan_records_one_history_row_per_fan(conn, monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert [(r["fan_id"], r["action"], r["ok"]) for r in _history(conn)] == [
+        (1, "speed1", True),
+        (2, "speed1", True),
+    ]
+    assert all(r["at"] == NOW for r in _history(conn))
+
+
+def test_a_refused_command_is_recorded_as_a_failure(conn, monkeypatch):
+    """The one divergence between the rules and reality that nothing else keeps.
+
+    `_command_fan` deliberately leaves `fan_state.last_action` on the *old*
+    value when the NodeMCU refuses, so the state table's honest answer is "this
+    fan is off" — indistinguishable from a poll where the rules never asked for
+    anything. The history row is the only place the attempt survives.
+    """
+
+    def broken(url, timeout):
+        raise OSError("boom")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
+    assert [(r["action"], r["ok"]) for r in _history(conn)] == [("speed1", False)]
+
+
+def test_a_poll_that_commands_nothing_records_nothing(conn, monkeypatch):
+    """A row per *actuation attempt*, not per poll — 2,880/day of "no change"
+    is the design the issue rejects."""
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+    check_fans(conn, FakeNotifier(), cfg, NOW + timedelta(seconds=30))
+
+    assert _history(conn) == []
+
+
+def test_a_rate_limited_poll_records_nothing(conn, monkeypatch):
+    """Dropped-by-the-rate-limit is a *non-event*: no command reached the fan.
+
+    The rate limit is one of the divergences the issue names, and it shows up
+    as the *absence* of a row where the replay would have had one — not as a
+    row with `ok=0`, which means the NodeMCU refused a command we did send.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="off", command_at=NOW - timedelta(seconds=30)
+    )
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert _history(conn) == []
+
+
+def test_the_reason_separates_a_capped_off_from_a_recovery_off(conn, monkeypatch):
+    """`reason` verbatim is what makes "did the cap ever fire?" a query.
+
+    Both rows below are `action="off"` for fan 1. Only the reason distinguishes
+    the cap from the air clearing, and the issue's ask is that it does so
+    without re-deriving anything from co2 history.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    # A run that has already outlasted the cap, with co2 still high.
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(hours=2)
+    )
+    db.set_fan_run(conn, 1, started_at=NOW - fans.FAN_MAX_RUN, capped=False)
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    later = NOW + timedelta(hours=1)
+    conn.execute("DELETE FROM readings")
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW, ts=later)
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=later - timedelta(hours=1)
+    )
+    check_fans(conn, FakeNotifier(), cfg, later)
+
+    reasons = [r["reason"] for r in _history(conn)]
+    assert reasons[0] == "run hit the 90 min cap"
+    assert reasons[1] == f"co2 {CO2_LOW:g} below {fans.CO2_FAN_OFF:g}"
+
+
+def test_a_pm25_safety_off_is_recorded_with_its_reason(conn, monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(minutes=5)
+    )
+    dirty = fans.PM25_SUPPRESS_THRESHOLD + 40
+    _seed_reading(conn, pm25=dirty, co2=CO2_HIGH)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    (row,) = _history(conn)
+    assert row["action"] == "off"
+    assert row["reason"] == f"pm25 {dirty:g} suppresses fans"
+
+
+def test_a_release_is_recorded_with_the_release_reason(conn, monkeypatch):
+    """A release is a real actuation and belongs in the history.
+
+    Without it, a poller disabled mid-run leaves an `on` in the history whose
+    `off` never arrives, and every duty cycle computed over that window runs to
+    the end of the record.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    db.upsert_fan_state(
+        conn, fan_id=1, action="speed1", command_at=NOW - timedelta(minutes=5)
+    )
+    cfg = FansConfig(enabled=False, fan_host="host.local", fan_ids=(1,))
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert [(r["action"], r["reason"]) for r in _history(conn)] == [
+        ("off", fans.RELEASE_REASON)
+    ]
+
+
+def test_the_manual_fan_test_is_recorded(conn, monkeypatch):
+    """`--test` spins both fans, and the poller turns them off again afterwards.
+
+    That `off` goes through `_command_fan` and is recorded. If the test's own
+    `speed1` were not, the history would carry an `off` with no `on` before it,
+    and the run it closes would be attributed to whatever came earlier.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
+    fans.run_fan_test(conn, FakeNotifier(), cfg, NOW)
+
+    assert [(r["fan_id"], r["action"], r["reason"]) for r in _history(conn)] == [
+        (1, "speed1", "manual fan test"),
+        (2, "speed1", "manual fan test"),
+    ]
+
+
+def test_a_fan_test_the_nodemcu_refuses_is_recorded_as_a_failure(conn, monkeypatch):
+    def broken(url, timeout):
+        raise OSError("boom")
+
+    monkeypatch.setattr("urllib.request.urlopen", broken)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    fans.run_fan_test(conn, FakeNotifier(), cfg, NOW)
+
+    assert [(r["action"], r["ok"]) for r in _history(conn)] == [("speed1", False)]
+    # Unchanged contract: a refused test does not advance the state table.
+    assert db.get_fan_state(conn, 1)["last_action"] == "off"
+
+
+def test_a_full_run_is_reconstructible_from_history_alone(conn, monkeypatch):
+    """The end the issue is actually after: a duty cycle nothing has to re-simulate.
+
+    On → off for one fan, with the elapsed time between the two rows readable
+    without consulting `readings` or replaying the rules.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+    check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    later = NOW + timedelta(minutes=40)
+    conn.execute("DELETE FROM readings")
+    _seed_reading(conn, pm25=5.0, co2=CO2_LOW, ts=later)
+    check_fans(conn, FakeNotifier(), cfg, later)
+
+    on, off = _history(conn)
+    assert on["action"] == "speed1"
+    assert off["action"] == "off"
+    assert off["at"] - on["at"] == timedelta(minutes=40)

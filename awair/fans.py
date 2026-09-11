@@ -329,6 +329,13 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
     works is what you do before flipping mitigation on. Successful commands are
     recorded so a running poller resumes from physical truth (and turns the
     fans back off once no event calls for them).
+
+    Bypasses `_command_fan` — and so must write the history row itself (#84).
+    The fans physically spin here, and a running poller turns them off again on
+    its next poll through `_command_fan`, which *does* record. Leaving the test
+    out would put an `off` in the history with no `on` before it, and every
+    duty cycle derived from that window would attribute the run to whatever
+    came earlier.
     """
     for fan_id in config.fan_ids:
         decision = MitigationDecision(
@@ -336,6 +343,14 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
         )
         ok = actuate(decision, config, opener)
         log.info("fan test: fan %d -> speed1 actuate=%s", fan_id, ok)
+        db.record_fan_event(
+            conn,
+            at=now,
+            fan_id=fan_id,
+            action=decision.action,
+            reason=decision.reason,
+            ok=ok,
+        )
         if ok:
             db.upsert_fan_state(conn, fan_id=fan_id, action="speed1", command_at=now)
     notifier.send("Fan test")
@@ -405,6 +420,20 @@ def _command_fan(conn, notifier, config: FansConfig, fan_id, action, reason, now
         fan_id=fan_id,
         action=decision.action if ok else state["last_action"],
         command_at=now,
+    )
+    # The durable history, written after the actuation resolves so `ok` records
+    # what happened rather than what was intended (#84). Deliberately *after*
+    # upsert_fan_state: that write is the control path, this one is
+    # observability, and nothing downstream reads the history to decide
+    # anything. A refused command lands here as ok=0 and nowhere else --
+    # `last_action` above keeps the old value on failure, by design.
+    db.record_fan_event(
+        conn,
+        at=now,
+        fan_id=fan_id,
+        action=decision.action,
+        reason=decision.reason,
+        ok=ok,
     )
     if ok:
         notifier.send(
