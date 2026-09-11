@@ -929,19 +929,34 @@ def record_fan_event(conn, at, fan_id: int, action: str, reason: str, ok: bool) 
     * **Poller downtime** is a gap between rows, which a replay treats as time
       the rules were running.
 
-    Not wrapped in a `try`: every failure mode here is one `upsert_fan_state`
-    has already hit a line earlier in `_command_fan` -- the same connection,
+    Not wrapped in a `try`, and **every caller must write `fan_state` first**
+    for that to be safe. The reasoning is that a failure here is one
+    `upsert_fan_state` has already hit a line earlier -- the same connection,
     the same commit path, and a CHECK constraint whose domain is a copy of
-    `fan_state.last_action`'s. Swallowing would buy no availability the caller
-    does not already lack, and would hide a broken database from a poller whose
-    loop deliberately has no `except` of its own.
+    `fan_state.last_action`'s -- so swallowing would buy no availability the
+    caller does not already lack, and would hide a broken database from a
+    poller whose loop deliberately has no `except` of its own. Called *before*
+    the state write, that reasoning is simply false, and an observability write
+    can then strand a physically-running fan; see `fans.run_fan_test`.
 
-    No pruning, and the issue's estimate of the steady state is right but not
-    the bound: ~28 rows per eight weeks while the NodeMCU answers. A NodeMCU
-    that stops answering is retried once per `RATE_LIMIT` forever, which is
-    2,880 rows/day across two fans -- still only a few MB a month, so the
-    conclusion holds, but the growth is driven by hardware failure rather than
-    by air quality.
+    No pruning. The issue's ~28 rows per eight weeks is the steady state and is
+    right; the bound is higher, and it has two different shapes because the
+    pm25 safety-off bypasses the rate limit:
+
+    * **Drive path, dead NodeMCU, co2 high.** `last_action` keeps its old value
+      on a failed actuate, so the command is re-issued once per `RATE_LIMIT`
+      forever: 2,880 rows/day across two fans.
+    * **pm25 suppressor, dead NodeMCU, fans believed on.** `decide` bypasses
+      the rate limit for a safety-off, so this is once per *poll*: 5,760
+      rows/day at the 30 s cadence.
+
+    Under 20 MB a month at the worse of those, so the no-pruning conclusion
+    holds -- but the growth driver is hardware failure, not air quality, and a
+    consumer counting vetoes or actuations **must collapse contiguous runs of
+    `ok = 0` rows carrying the same reason**. A single pm25 veto against a dead
+    NodeMCU writes thousands of identical rows, and the naive
+    `COUNT(*) WHERE reason LIKE 'pm25 %'` is exactly the query this table was
+    built to make possible.
     """
     conn.execute(
         "INSERT INTO fan_events (at, fan_id, action, reason, ok)"

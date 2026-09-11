@@ -7,6 +7,7 @@ are unchanged from the versions written against the spike-event trigger.
 """
 
 import pathlib
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -1192,3 +1193,51 @@ def test_a_full_run_is_reconstructible_from_history_alone(conn, monkeypatch):
     assert on["action"] == "speed1"
     assert off["action"] == "off"
     assert off["at"] - on["at"] == timedelta(minutes=40)
+
+
+def _exploding_recorder(*args, **kwargs):
+    """A history write that fails the way a busy database would."""
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_a_failed_history_write_cannot_strand_a_fan_started_by_the_test(
+    conn, monkeypatch
+):
+    """`run_fan_test` must write `fan_state` BEFORE the history row.
+
+    `record_fan_event` is deliberately not wrapped in a `try`, on the reasoning
+    that it can only fail where `upsert_fan_state` just did. Written in the
+    other order that reasoning is false, and the consequence is not a lost log
+    line: the exception unwinds `poller.main()`, which has no `except`, with
+    fan 1 physically spinning and no `fan_state` row at all. `release_fans`
+    then has nothing to release and every later `_command_fan` no-ops against a
+    `last_action` of "off" — the stranded fan #61 exists to prevent.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    monkeypatch.setattr(db, "record_fan_event", _exploding_recorder)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1, 2))
+
+    with pytest.raises(sqlite3.OperationalError):
+        fans.run_fan_test(conn, FakeNotifier(), cfg, NOW)
+
+    # The fan that spun is recorded as running, so the poller can let go of it.
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"
+
+
+def test_a_failed_history_write_cannot_strand_a_fan_the_poller_commanded(
+    conn, monkeypatch
+):
+    """The same invariant on the drive path, which already had the order right.
+
+    Pinned rather than assumed: this is the ordering `record_fan_event`'s
+    "no try needed" docstring depends on, and nothing else asserts it.
+    """
+    monkeypatch.setattr("urllib.request.urlopen", fake_url_opener([]))
+    monkeypatch.setattr(db, "record_fan_event", _exploding_recorder)
+    cfg = FansConfig(enabled=True, fan_host="host.local", fan_ids=(1,))
+    _seed_reading(conn, pm25=5.0, co2=CO2_HIGH)
+
+    with pytest.raises(sqlite3.OperationalError):
+        check_fans(conn, FakeNotifier(), cfg, NOW)
+
+    assert db.get_fan_state(conn, 1)["last_action"] == "speed1"

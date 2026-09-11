@@ -540,11 +540,17 @@ def test_fan_events_since_orders_a_single_polls_two_fans_deterministically(conn)
 
 
 def test_fan_events_rejects_an_out_of_domain_action(conn):
-    """Same CHECK `fan_state` already carries, so it adds no new failure mode.
+    """Same CHECK `fan_state` already carries, so the history cannot drift into
+    a vocabulary the state table would refuse.
 
-    Any action this rejects is one `upsert_fan_state` would have rejected a
-    line earlier in `_command_fan`; the constraint is here so the history
-    cannot drift into a vocabulary the state table would refuse.
+    Not quite "no new failure mode", which is what this said first. On a
+    *successful* actuate `upsert_fan_state` writes the same action a line
+    earlier and rejects it first; on a **failed** one it writes the old
+    `last_action`, which is always in domain, so this is the only constraint in
+    the path. Unreachable while `FAN_SPEED` is a hardcoded constant — but
+    ADR-002 made five sibling constants env-tunable, and if that one ever
+    joins them a typo moves from "retries forever in silence" to "crashes the
+    poller here", which is the better of the two.
     """
     with pytest.raises(sqlite3.IntegrityError):
         db.record_fan_event(
@@ -581,3 +587,71 @@ def test_connect_creates_fan_events_on_a_database_that_predates_it(tmp_path):
         ]
     finally:
         conn.close()
+
+
+def test_the_fan_events_time_index_exists(conn):
+    """`fan_events_since` filters and sorts on `at`, and the table grows.
+
+    Same shape as `test_the_dedup_index_the_conflict_target_names_actually_exists`
+    for `readings`: the index is part of the read's contract, not incidental, so
+    deleting the CREATE INDEX line should fail a test rather than quietly turn
+    every window query into a full scan.
+    """
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE type = 'index' AND tbl_name = 'fan_events'"
+        )
+    }
+    assert "idx_fan_events_at" in indexes
+
+
+def test_fan_events_since_includes_a_row_exactly_on_the_boundary(conn):
+    """ "at or after `since`" is what the docstring promises; `>` would pass
+    every other windowing test in this file, none of which sits a row on the
+    boundary."""
+    db.record_fan_event(
+        conn, at=NOW, fan_id=1, action="speed1", reason="on the line", ok=True
+    )
+    assert [r["reason"] for r in db.fan_events_since(conn, NOW)] == ["on the line"]
+
+
+def test_a_fan_event_survives_the_writing_process(tmp_path):
+    """Append-only is a durability claim, and reading back on the same
+    connection cannot test one — uncommitted rows are visible to their own
+    writer. A second, independent connection is what makes the commit load
+    bearing."""
+    path = tmp_path / "durable.db"
+    writer = db.connect(path)
+    try:
+        db.record_fan_event(
+            conn=writer, at=NOW, fan_id=1, action="speed1", reason="committed", ok=True
+        )
+    finally:
+        writer.close()
+
+    reader = db.connect_readonly(path)
+    try:
+        rows = db.fan_events_since(reader, NOW - timedelta(minutes=1))
+    finally:
+        reader.close()
+    assert [r["reason"] for r in rows] == ["committed"]
+
+
+def test_fan_events_store_the_same_timestamp_spelling_as_fan_state(conn):
+    """Two timestamp families live in this database and they do not interleave.
+
+    `readings.ts` is the device's clock in `iso_z` (`...T12:00:00.000Z`);
+    `fan_state`, `alert_events` and now `fan_events` are our clock in
+    `datetime.isoformat()` (`...T12:00:00+00:00`). `fromisoformat` parses both,
+    so a round-trip through `fan_events_since` cannot tell them apart — but
+    `at` is compared as a *string* in the WHERE clause, and two spellings in
+    one column sort into each other.
+    """
+    db.record_fan_event(
+        conn, at=NOW, fan_id=1, action="off", reason="spelling", ok=True
+    )
+    (stored,) = conn.execute("SELECT at FROM fan_events").fetchone()
+    assert stored == NOW.isoformat()
+    assert stored != db.iso_z(NOW)

@@ -336,6 +336,16 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
     out would put an `off` in the history with no `on` before it, and every
     duty cycle derived from that window would attribute the run to whatever
     came earlier.
+
+    The history write goes **after** `upsert_fan_state`, matching
+    `_command_fan`, and the order is load-bearing rather than cosmetic. Neither
+    write is wrapped in a `try`, on the reasoning that a history write can only
+    fail where the state write just did — and that reasoning is only true when
+    the state write went first. Reversed, a `SQLITE_BUSY` past the busy timeout
+    here would unwind `poller.main()` with fan 1 physically spinning and *no*
+    `fan_state` row, which is the stranded fan `release_fans` exists to
+    prevent: nothing to release, and every later `_command_fan` no-ops against
+    a `last_action` of "off".
     """
     for fan_id in config.fan_ids:
         decision = MitigationDecision(
@@ -343,6 +353,8 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
         )
         ok = actuate(decision, config, opener)
         log.info("fan test: fan %d -> speed1 actuate=%s", fan_id, ok)
+        if ok:
+            db.upsert_fan_state(conn, fan_id=fan_id, action="speed1", command_at=now)
         db.record_fan_event(
             conn,
             at=now,
@@ -351,8 +363,6 @@ def run_fan_test(conn, notifier, config: FansConfig, now, opener=None) -> None:
             reason=decision.reason,
             ok=ok,
         )
-        if ok:
-            db.upsert_fan_state(conn, fan_id=fan_id, action="speed1", command_at=now)
     notifier.send("Fan test")
 
 
