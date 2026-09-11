@@ -7,6 +7,7 @@ database that will not write, and a poll that has never succeeded at all.
 """
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -281,21 +282,29 @@ def test_a_database_failure_during_the_store_is_reported_not_raised(conn, monkey
     def boom(*args, **kwargs):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(db, "upsert_weather_alerts", boom)
+    monkeypatch.setattr(db, "commit_weather_alert_poll", boom)
     assert poll_once(conn, _fetcher(_payload(_feature()))) == "error"
     assert db.weather_alert_poll_state(conn)["last_success_at"] is None
 
 
-def test_a_database_failure_stamping_the_clock_is_reported_not_raised(
+def test_a_failed_poll_that_cannot_even_stamp_its_attempt_still_returns(
     conn, monkeypatch
 ):
-    """The last write a poll makes is still a write, and it can still fail."""
+    """Two writes deep and it must still not raise.
+
+    The fetch fails, so the poll tries to stamp only the attempt clock -- and
+    that write fails too. Losing the attempt stamp is survivable; an
+    `sqlite3.Error` escaping here unwinds the `while` loop in `outdoor.main()`,
+    which is not. Same process-death shape as #91, reached from the storage
+    side.
+    """
 
     def boom(*args, **kwargs):
         raise sqlite3.OperationalError("disk I/O error")
 
     monkeypatch.setattr(db, "record_weather_alert_poll", boom)
-    assert poll_once(conn, _fetcher(_payload())) == "error"
+    assert poll_once(conn, _failing_fetcher()) == "error"
+    assert db.weather_alert_poll_state(conn)["last_success_at"] is None
 
 
 # --- the durable record ----------------------------------------------------
@@ -337,3 +346,124 @@ def test_two_concurrent_alerts_both_survive(conn):
     # Ordered by onset, so the Flood Watch (07:00) comes first — stable and
     # chronological, deliberately not ranked by severity. Ranking is the hub's.
     assert [a["event"] for a in feed["alerts"]] == ["Flood Watch", "Tornado Warning"]
+
+
+# --- the two faults that used to empty a live feed (found in review) --------
+#
+# Both were reproduced against the pre-fix code. Neither of the two
+# database-failure tests above could see them: one raises before touching the
+# database and the other uses an empty payload, so no fixture there ever holds
+# a live alert across a failure. These do.
+
+
+def test_a_clock_write_that_fails_mid_poll_rolls_the_row_stamps_back(conn, monkeypatch):
+    """The worst reading of the contract, and it reproduced.
+
+    `weather_alerts_seen_at` selects on the row stamps agreeing with the
+    success clock, so committing the stamps and then failing to commit the
+    clock de-selects every live alert. Before `commit_weather_alert_poll` made
+    the two atomic this published `{"alerts": [], "last_success_at": T,
+    "last_attempt_at": T}` — the clocks did not even diverge, so a consumer had
+    no signal that anything was wrong while a tornado warning was active.
+    """
+    poll_once(conn, _fetcher(_payload(_feature())))
+    before = conn.execute("SELECT id, last_seen_at FROM weather_alerts").fetchall()
+    good = db.weather_alert_poll_state(conn)["last_success_at"]
+
+    real = db._stamp_weather_alert_poll
+
+    def flaky(connection, attempted_at, succeeded_at):
+        if succeeded_at is not None:  # only the in-transaction success write
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(connection, attempted_at, succeeded_at)
+
+    monkeypatch.setattr(db, "_stamp_weather_alert_poll", flaky)
+    assert poll_once(conn, _fetcher(_payload(_feature()))) == "error"
+    monkeypatch.undo()
+
+    assert conn.execute("SELECT id, last_seen_at FROM weather_alerts").fetchall() == (
+        before
+    ), "the row stamps must roll back with the clock"
+    feed = active_alerts(conn, NOW)
+    assert [a["event"] for a in feed["alerts"]] == ["Tornado Warning"]
+    assert feed["last_success_at"] == good
+    assert feed["last_attempt_at"] > good, "and the consumer can see it going stale"
+
+
+def test_a_feature_with_a_nested_property_cannot_empty_the_live_feed(conn, caplog):
+    """The same emptying, reached through a partial `executemany`.
+
+    Only `id` and `event` are checked for presence, so a feature whose
+    `severity` is an object used to pass the parse and fail at *bind* time —
+    after the batch had already written the earlier rows, in an unresolved
+    implicit transaction that the next commit swept in. Now it is refused at
+    parse time, on the documented "one unreadable feature fails the poll" path.
+    """
+    poll_once(conn, _fetcher(_payload(_feature("urn:live"))))
+    good = db.weather_alert_poll_state(conn)["last_success_at"]
+
+    poisoned = _payload(
+        _feature("urn:live"), _feature("urn:bad", severity={"nested": "object"})
+    )
+    with caplog.at_level(logging.WARNING, logger="awair.weather_alerts"):
+        assert poll_once(conn, _fetcher(poisoned)) == "error"
+
+    # The log names the *feed*, not SQLite. Without the value-type check in
+    # `_feature_to_alert` the transaction still rolls back and the feed is
+    # still intact -- so this line is the only thing that tells the two apart,
+    # and it is the difference between "NWS sent us something odd" and "our
+    # database is broken" for whoever reads the journal at 3am.
+    assert "severity" in caplog.text and "not text" in caplog.text
+    assert "binding parameter" not in caplog.text
+
+    feed = active_alerts(conn, NOW)
+    assert [a["id"] for a in feed["alerts"]] == ["urn:live"]
+    assert feed["last_success_at"] == good
+    assert conn.execute("SELECT COUNT(*) FROM weather_alerts").fetchone()[0] == 1
+
+
+def test_an_alert_stamped_ahead_of_the_success_clock_is_still_published(conn):
+    """`>=` rather than `=`, and the two differ only in how an impossible state fails.
+
+    `commit_weather_alert_poll` makes a stamp ahead of the clock unreachable.
+    If one ever is reachable again, `=` answers with an empty feed while alerts
+    are live and `>=` answers with the alerts. Only one of those is an
+    all-clear about a tornado.
+    """
+    poll_once(conn, _fetcher(_payload(_feature())))
+    conn.execute("UPDATE weather_alerts SET last_seen_at = '2099-01-01T00:00:00+00:00'")
+    conn.commit()
+    assert [a["event"] for a in active_alerts(conn, NOW)["alerts"]] == [
+        "Tornado Warning"
+    ]
+
+
+def test_an_alert_ending_exactly_now_has_stopped_applying(conn):
+    """The boundary on a safety filter, pinned rather than left to taste."""
+    poll_once(conn, _fetcher(_payload(_feature(ends="2026-09-11T13:00:00+00:00"))))
+    ends_at = datetime(2026, 9, 11, 13, 0, tzinfo=UTC)
+    assert len(active_alerts(conn, ends_at - timedelta(seconds=1))["alerts"]) == 1
+    assert active_alerts(conn, ends_at)["alerts"] == []
+
+
+def test_an_unreadable_ends_falls_through_to_a_good_expires(conn):
+    """A garbled `ends` used to pin the alert active forever.
+
+    Returning None on the first unreadable field skipped `expires` entirely,
+    so an alert we *could* have expired on its second clock never expired at
+    all. Falling through uses the field we can read.
+    """
+    poll_once(
+        conn,
+        _fetcher(
+            _payload(_feature(ends="soonish", expires="2026-09-11T09:00:00-04:00"))
+        ),
+    )
+    after_expires = datetime(2026, 9, 11, 13, 30, tzinfo=UTC)
+    assert active_alerts(conn, after_expires)["alerts"] == []
+    # ...and it is still active before that clock, so the filter is not just
+    # dropping everything with an unreadable field.
+    assert (
+        len(active_alerts(conn, datetime(2026, 9, 11, 12, 30, tzinfo=UTC))["alerts"])
+        == 1
+    )

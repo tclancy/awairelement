@@ -868,3 +868,80 @@ def test_the_poll_state_table_holds_exactly_one_row(conn):
     assert conn.execute("SELECT COUNT(*) FROM weather_alert_poll").fetchone()[0] == 1
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO weather_alert_poll (id) VALUES (2)")
+
+
+def test_a_row_stamped_exactly_at_local_midnight_is_inside_the_window(conn):
+    """`ts >= since`, not `>`, and this row exists in production every day.
+
+    Open-Meteo stamps on the quarter hour and ET local midnight is exactly
+    04:00 or 05:00 UTC, so the window's first row lands *on* the boundary
+    daily. `>` would silently drop 1/96 of every day's rain and snow with
+    nothing failing.
+    """
+    since = datetime.fromisoformat("2026-07-12T04:00:00+00:00")
+    db.insert_outdoor_reading(
+        conn, _row(ts="2026-07-12T04:00:00+00:00", precipitation=0.7)
+    )
+    aggregate = db.outdoor_day_aggregate(conn, since)
+    assert aggregate["row_count"] == 1
+    assert aggregate["values"]["precipitation_total"] == pytest.approx(0.7)
+
+
+def test_committing_an_alert_poll_inside_an_open_transaction_does_not_raise(tmp_path):
+    """Forward safety, the same shape `_migrate_outdoor_ts_not_null` carries.
+
+    `commit_weather_alert_poll` opens `BEGIN IMMEDIATE`, and pysqlite
+    implicitly BEGINs for any DML a caller ran first -- `BEGIN` inside a
+    transaction raises "cannot start a transaction within a transaction". The
+    poller's connection is its own today, so nothing exercises this in
+    production; it costs two lines and the failure it prevents is an alert poll
+    that raises on every iteration.
+    """
+    conn = db.connect(tmp_path / "intxn-alerts.db")
+    try:
+        conn.execute("INSERT INTO outdoor_readings (ts, received_at) VALUES ('x', 'y')")
+        assert conn.in_transaction, "fixture does not model an open transaction"
+        db.commit_weather_alert_poll(
+            conn,
+            [
+                {
+                    "id": "urn:a",
+                    "event": "Tornado Warning",
+                    "severity": None,
+                    "certainty": None,
+                    "urgency": None,
+                    "headline": None,
+                    "onset": None,
+                    "ends": None,
+                    "expires": None,
+                }
+            ],
+            "2026-09-11T12:00:00+00:00",
+        )
+        assert db.weather_alert_poll_state(conn)["last_success_at"] is not None
+        # The caller's own prior statement was committed rather than discarded.
+        assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_a_failed_clock_stamp_releases_the_write_lock(conn):
+    """`insert_reading` carries this guard and says why; so does this write.
+
+    sqlite3 opens an implicit transaction before a DML statement and a raising
+    statement does not resolve it, so without the rollback the connection sits
+    holding the write lock until some later poll commits. Both pollers share
+    one `AWAIR_DB`, so an alert-clock fault would stall the *indoor* writer.
+
+    **The failure has to be a real statement failure, not a monkeypatched
+    one.** The first version of this test patched `_stamp_weather_alert_poll`
+    to raise before touching the database, so no implicit transaction was ever
+    opened and `in_transaction` was False with or without the rollback -- the
+    fixture could not express the state it was asserting about, and a mutant
+    deleting the whole `try`/`rollback` survived it. An unbindable
+    `attempted_at` fails inside `execute`, which pysqlite has confirmed leaves
+    `in_transaction` True.
+    """
+    with pytest.raises(sqlite3.Error):
+        db.record_weather_alert_poll(conn, {"not": "a timestamp"})
+    assert conn.in_transaction is False

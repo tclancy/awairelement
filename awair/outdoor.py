@@ -46,17 +46,20 @@ FETCH_TIMEOUT_SECONDS = 10
 DEFAULT_POLL_SECONDS = 900
 
 # What Open-Meteo's `current` block says its own window is, in seconds. Every
-# accumulating field in that block -- `precipitation`, `snowfall` -- is a
-# backward-looking sum over exactly this many seconds, and the source publishes
-# the figure back to us as `current.interval` (measured 900 on 2026-09-11).
+# accumulating field in that block -- `precipitation`, `snowfall` -- sums over
+# exactly this many seconds, and the source publishes the figure back to us as
+# `current.interval` (measured 900 against the live API on 2026-09-11).
 #
 # It is load-bearing for `/api/outdoor-today`, and silently so. Consecutive
 # `ts` values are 900 s apart and `ts` is the primary key, so summing rows adds
 # disjoint, contiguous windows and a re-poll cannot double-count one. Were this
-# to become 3600 upstream, each row would cover the preceding *hour*, four rows
-# would overlap three times over, and a day's rain total would over-report by
-# about 4x -- with every individual value still correct and nothing failing.
-# Hence the warning below rather than a comment nobody reads.
+# to become 3600 upstream, each row would cover an *hour*, four rows would
+# overlap three times over, and a day's rain total would over-report by about
+# 4x -- with every individual value still correct and nothing failing. Hence
+# the warning below rather than a comment nobody reads.
+#
+# The window's *width* is what matters; which side of `ts` it falls on does
+# not, and is deliberately not claimed here -- see `db.outdoor_day_aggregate`.
 SOURCE_INTERVAL_SECONDS = 900
 DEFAULT_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 DEFAULT_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"

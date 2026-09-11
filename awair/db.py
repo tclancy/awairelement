@@ -664,18 +664,34 @@ def outdoor_day_aggregate(conn, since) -> dict:
     is a real sum over a strict subset of a full day's rows. Without the second
     number a consumer cannot tell that from a complete one.
 
+    The two dicts use different key spaces on purpose: `values` is keyed on the
+    *published* name (`snowfall_total`, `temp_min`) and `contributing_rows` on
+    the *source column* (`snowfall`, `temp`). One column can back two published
+    fields -- `temp_min` and `temp_max` are one `COUNT(temp)` -- so a
+    per-published-name count would be the same number twice.
+
     SQL aggregates ignore NULLs, so a column with no values at all comes back
     NULL rather than 0.0 -- which is the honest answer and is deliberately not
     coalesced. `COUNT(*)` is the one that still counts those rows.
 
     **Why summing rows is sound at all**: Open-Meteo's `current.precipitation`
-    and `current.snowfall` are backward-looking sums over the block's own
-    `interval`, which is 900 s -- equal to the source's publish cadence, so
-    consecutive `ts` values cover disjoint, contiguous windows. `ts` is the
-    primary key and inserts are `ON CONFLICT(ts) DO NOTHING`, so a re-poll
-    cannot double-count one window however often we ask. See
-    `outdoor.SOURCE_INTERVAL_SECONDS` for the guard on that assumption; if
-    `interval` ever became 3600 these sums would over-report by 4x, silently.
+    and `current.snowfall` each accumulate over the block's own `interval`,
+    which is 900 s -- equal to the source's publish cadence, so consecutive
+    `ts` values cover disjoint, contiguous windows. `ts` is the primary key and
+    inserts are `ON CONFLICT(ts) DO NOTHING`, so a re-poll cannot double-count
+    one window however often we ask.
+
+    Note what that argument does *and does not* rest on. It needs the windows
+    to be disjoint, contiguous and `interval`-wide; it does **not** need to
+    know which side of `ts` each window falls on, and this codebase does not
+    claim to. Open-Meteo's docs describe the hourly field as "sum of the
+    preceding hour" while its own `daily` aggregate lines up with the
+    forward reading, and the question was left open rather than settled from a
+    dry week's data. The only consequence is at the midnight boundary, where at
+    most one 900 s bucket is attributed to one day or the other; nothing else
+    here depends on it. What the sums genuinely cannot survive is the *width*
+    changing -- see `outdoor.SOURCE_INTERVAL_SECONDS`; at `interval: 3600` they
+    would over-report by 4x, silently.
     """
     selects = ", ".join(f"{fn}({col})" for _, fn, col in OUTDOOR_DAY_AGGREGATES)
     columns = tuple(dict.fromkeys(col for _, _, col in OUTDOOR_DAY_AGGREGATES))
@@ -1099,8 +1115,8 @@ _WEATHER_ALERT_UPDATES = ", ".join(
 )
 
 
-def upsert_weather_alerts(conn, alerts, seen_at) -> None:
-    """Record each alert NWS reports active, stamping `last_seen_at = seen_at`.
+def _upsert_weather_alerts(conn, alerts, seen_at) -> None:
+    """The alert upsert, WITHOUT a commit. Callers own the transaction.
 
     Upsert rather than replace, and `first_seen_at` is deliberately absent from
     the UPDATE clause: an alert that persists across many polls keeps the
@@ -1111,8 +1127,7 @@ def upsert_weather_alerts(conn, alerts, seen_at) -> None:
     **Nothing here deletes.** Which alerts are *currently* active is answered
     by `last_seen_at` against the last successful poll (see
     `weather_alerts_seen_at`), so a fetch failure leaves the table alone and
-    cannot manufacture an all-clear. The history is kept for the same reason
-    `alert_events` rows are.
+    cannot manufacture an all-clear.
     """
     placeholders = ", ".join(f":{col}" for col in WEATHER_ALERT_COLUMNS)
     conn.executemany(
@@ -1123,7 +1138,6 @@ def upsert_weather_alerts(conn, alerts, seen_at) -> None:
         " last_seen_at = excluded.last_seen_at",
         [alert | {"seen_at": seen_at} for alert in alerts],
     )
-    conn.commit()
 
 
 def fan_events_since(conn, since) -> list:
@@ -1151,13 +1165,8 @@ def fan_events_since(conn, since) -> list:
     ]
 
 
-def record_weather_alert_poll(conn, attempted_at, succeeded_at=None) -> None:
-    """Stamp the alert poll's clocks. `succeeded_at` stays put on a failure.
-
-    Two clocks, because they answer different questions and only one of them
-    can be inferred from the other's absence. `last_attempt_at` says the poller
-    is alive and trying; `last_success_at` says when we last actually heard
-    from NWS, and is the one an all-clear has to be measured against.
+def _stamp_weather_alert_poll(conn, attempted_at, succeeded_at) -> None:
+    """The poll-clock write, WITHOUT a commit. Callers own the transaction.
 
     A failed attempt passes `succeeded_at=None` and the COALESCE keeps the
     previous success -- writing NULL there would turn every transient failure
@@ -1170,11 +1179,71 @@ def record_weather_alert_poll(conn, attempted_at, succeeded_at=None) -> None:
         " last_success_at = COALESCE(excluded.last_success_at, last_success_at)",
         (attempted_at, succeeded_at),
     )
+
+
+def commit_weather_alert_poll(conn, alerts, attempted_at) -> None:
+    """Store one *successful* poll's alerts and its success clock **atomically**.
+
+    These two writes cannot be separate transactions, and this is not
+    tidiness -- it is the difference between the contract holding and not.
+    `weather_alerts_seen_at` selects on `last_seen_at = last_success_at`, so
+    the row stamps and the success clock are two halves of one fact. Commit the
+    stamps and then fail to commit the clock and every live alert is
+    de-selected: the endpoint answers `"alerts": []` while a tornado warning is
+    active, which is the single failure this whole module is shaped to prevent.
+
+    Both halves were reproduced against the pre-fix code before this existed:
+
+    - an `sqlite3.Error` from the clock write, after the stamps had committed,
+      published `{"alerts": [], "last_success_at": T, "last_attempt_at": T}` --
+      the clocks did not even diverge, so the consumer had no signal at all;
+    - a two-feature payload whose second feature failed to *bind* left the
+      first row upserted in an unresolved implicit transaction, which the
+      clock write's own commit then swept in -- same empty feed, repeating
+      every poll for as long as the bad feature stayed in the feed.
+
+    `BEGIN IMMEDIATE` (and the preceding resolve of any open implicit
+    transaction) follows `_migrate_outdoor_ts_not_null`: pysqlite implicitly
+    BEGINs for a DML statement, and `BEGIN` inside a transaction raises.
+    Raising is left to the caller -- `weather_alerts.poll_once` turns it into a
+    reported failure, and a failure that rolled both halves back is one the
+    next poll simply repeats.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _upsert_weather_alerts(conn, alerts, attempted_at)
+        _stamp_weather_alert_poll(conn, attempted_at, attempted_at)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def record_weather_alert_poll(conn, attempted_at, succeeded_at=None) -> None:
+    """Stamp the poll clocks on their own. `succeeded_at` stays put by default.
+
+    Two clocks, because they answer different questions and only one of them
+    can be inferred from the other's absence. `last_attempt_at` says the poller
+    is alive and trying; `last_success_at` says when we last actually heard
+    from NWS, and is the one an all-clear has to be measured against.
+
+    **A successful poll does not come through here** -- it goes through
+    `commit_weather_alert_poll`, which writes this clock in the same
+    transaction as the row stamps it has to agree with. This one exists for the
+    *failed* attempt, where there are no stamps to agree with.
+    """
+    try:
+        _stamp_weather_alert_poll(conn, attempted_at, succeeded_at)
+    except sqlite3.Error:
+        conn.rollback()
+        raise
     conn.commit()
 
 
 def weather_alert_poll_state(conn) -> dict:
-    """Both alert-poll clocks. Missing row reads as never attempted, not as an error.
+    """Both alert-poll clocks. A missing row reads as never attempted, not an error.
 
     A fresh install has no row until the first poll, and the endpoint has to
     answer before then -- with "we have never successfully asked", which is
@@ -1191,12 +1260,21 @@ def weather_alert_poll_state(conn) -> dict:
 def weather_alerts_seen_at(conn, seen_at) -> list[dict]:
     """Stored alerts whose `last_seen_at` equals `seen_at`, oldest onset first.
 
-    Equality against one instant rather than a range: every alert in a
-    successful poll is stamped with that poll's clock, so this returns the
-    exact set NWS reported and nothing that has since been cancelled. `seen_at`
-    is meant to be `weather_alert_poll_state()["last_success_at"]`; passing
-    NULL returns nothing, which is the correct read of "we have never had a
-    successful poll" only because the caller publishes the clocks beside it.
+    A cancelled alert is excluded because its stamp is *behind* the last
+    successful poll's clock, which is the whole mechanism: every alert in a
+    successful poll is stamped with that poll's clock, so this returns the set
+    NWS last reported and nothing it has since withdrawn. `seen_at` is meant to
+    be `weather_alert_poll_state()["last_success_at"]`; passing NULL returns
+    nothing, which is the correct read of "we have never had a successful poll"
+    only because the caller publishes the clocks beside it.
+
+    **`>=` rather than `=`, deliberately.** `commit_weather_alert_poll` makes
+    the stamps and the clock atomic, so a stamp ahead of the clock should not
+    be reachable -- but if one ever is, `=` silently publishes an *empty* feed
+    while alerts are live, and `>=` publishes them. The two differ only in
+    which way an impossible state fails, and only one of those directions is
+    an all-clear about a tornado. Costs nothing otherwise: a stamp ahead of the
+    clock cannot be a withdrawal.
 
     Ordered by `onset` (NULLs first, SQLite's default) then `id`, so the order
     is stable and chronological. It is deliberately NOT ordered by severity:
@@ -1205,7 +1283,7 @@ def weather_alerts_seen_at(conn, seen_at) -> list[dict]:
     """
     rows = conn.execute(
         f"SELECT {', '.join(WEATHER_ALERT_COLUMNS)}, first_seen_at, last_seen_at"
-        " FROM weather_alerts WHERE last_seen_at = ? ORDER BY onset, id",
+        " FROM weather_alerts WHERE last_seen_at >= ? ORDER BY onset, id",
         (seen_at,),
     )
     fields = (*WEATHER_ALERT_COLUMNS, "first_seen_at", "last_seen_at")

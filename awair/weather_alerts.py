@@ -116,6 +116,15 @@ def _feature_to_alert(feature) -> dict:
     for field in REQUIRED_PROPERTIES:
         if not alert[field]:
             raise ValueError(f"alert feature carries no {field}")
+    for field, value in alert.items():
+        # Every CAP field we store is a string or null. A nested object or
+        # array here is not a storable value -- it reaches the driver unchecked
+        # and fails at *bind* time, inside a batch that has already written
+        # earlier rows. Refusing at parse time keeps that on the documented
+        # "one unreadable feature fails the poll" path, where the log says what
+        # is wrong with the feed rather than what is wrong with SQLite.
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"alert `{field}` is a {type(value).__name__}, not text")
     return alert
 
 
@@ -137,22 +146,24 @@ def parse_alerts(payload) -> list[dict]:
     return [_feature_to_alert(feature) for feature in features]
 
 
-def _record(conn, attempted_at: str, succeeded: bool) -> str:
-    """Stamp the poll clocks and return the poll's status.
+def _failed_attempt(conn, attempted_at: str) -> str:
+    """Stamp the attempt clock, report "error", and never raise.
 
-    The write is guarded rather than trusted: `record_weather_alert_poll` is
-    the last thing a poll does, and an `sqlite3.Error` escaping from here would
-    unwind the `while` loop in `outdoor.main()` — the process-death shape #91
-    exists to prevent, reached from a different direction.
+    The write is guarded rather than trusted: an `sqlite3.Error` escaping from
+    here would unwind the `while` loop in `outdoor.main()` — the process-death
+    shape #91 exists to prevent, reached from a different direction. Losing the
+    attempt stamp is survivable; losing the poller is not.
+
+    Only failures come through here. A *successful* poll writes its clock
+    inside `db.commit_weather_alert_poll`, in the same transaction as the row
+    stamps that clock has to agree with — see that function for what splitting
+    the two was reproduced doing.
     """
     try:
-        db.record_weather_alert_poll(
-            conn, attempted_at, attempted_at if succeeded else None
-        )
+        db.record_weather_alert_poll(conn, attempted_at)
     except sqlite3.Error as exc:
-        log.warning("recording the alert poll clock failed: %s", exc)
-        return "error"
-    return "ok" if succeeded else "error"
+        log.warning("recording the failed alert poll's clock failed: %s", exc)
+    return "error"
 
 
 def poll_once(conn, fetch) -> str:
@@ -167,14 +178,14 @@ def poll_once(conn, fetch) -> str:
         alerts = parse_alerts(json.loads(fetch()))
     except POLL_FAILURES as exc:
         log.warning("NWS alert fetch unusable: %s: %s", type(exc).__name__, exc)
-        return _record(conn, attempted_at, succeeded=False)
+        return _failed_attempt(conn, attempted_at)
     try:
-        db.upsert_weather_alerts(conn, alerts, attempted_at)
+        db.commit_weather_alert_poll(conn, alerts, attempted_at)
     except sqlite3.Error as exc:
         log.warning("storing %d NWS alert(s) failed: %s", len(alerts), exc)
-        return _record(conn, attempted_at, succeeded=False)
+        return _failed_attempt(conn, attempted_at)
     log.info("NWS alerts: %d active", len(alerts))
-    return _record(conn, attempted_at, succeeded=True)
+    return "ok"
 
 
 def _expiry(alert) -> datetime | None:
@@ -182,9 +193,14 @@ def _expiry(alert) -> datetime | None:
 
     `ends` first, `expires` second: NWS uses `expires` for the *message's* own
     validity and `ends` for the event's, and they differ on a long warning that
-    is reissued. An unparseable or absent value yields None, which the caller
-    reads as "keeps applying" — the safe direction, since the alternative is
-    dropping a live warning over a date we could not read.
+    is reissued. Absent *and* unreadable both fall through to the next field,
+    and running out of fields yields None, which the caller reads as "keeps
+    applying" — the safe direction, since the alternative is dropping a live
+    warning over a date we could not read.
+
+    The fall-through on an unreadable value matters on its own: a garbled
+    `ends` beside a perfectly good `expires` used to pin the alert as active
+    forever rather than expiring it on the field we could read.
     """
     for field in ("ends", "expires"):
         value = alert.get(field)
@@ -194,7 +210,7 @@ def _expiry(alert) -> datetime | None:
             parsed = datetime.fromisoformat(value)
         except (TypeError, ValueError):
             log.warning("alert %s has an unreadable %s (%r)", alert["id"], field, value)
-            return None
+            continue
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     return None
 

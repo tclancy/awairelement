@@ -1267,8 +1267,7 @@ def _seed_alert(conn, seen_at, **overrides):
         "expires": None,
         **overrides,
     }
-    db.upsert_weather_alerts(conn, [alert], seen_at)
-    db.record_weather_alert_poll(conn, seen_at, seen_at)
+    db.commit_weather_alert_poll(conn, [alert], seen_at)
 
 
 def test_weather_alerts_is_null_before_any_successful_poll(make_raw_client):
@@ -1372,3 +1371,49 @@ def test_a_stale_poll_still_publishes_its_alerts_with_both_clocks(make_raw_clien
     assert [a["event"] for a in payload["alerts"]] == ["Tornado Warning"]
     assert payload["last_success_at"] == "2026-09-11T12:00:00Z"
     assert payload["last_attempt_at"] == "2026-09-11T13:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("stored", "why"),
+    [
+        ("sometime tuesday", "an unparseable string (ValueError)"),
+        ("9999-12-31T23:59:59-12:00", "an offset out of datetime's range (Overflow)"),
+    ],
+)
+def test_no_stored_clock_shape_can_500_the_alert_feed(make_raw_client, stored, why):
+    """Two shapes, two exception classes, one required outcome.
+
+    The first version of this test used only the unparseable string, so the
+    `OverflowError` arm went unexercised — and it was genuinely missing from
+    the tuple, which meant one hostile `expires` took the whole feed down for
+    as long as NWS kept publishing that alert, tornado warnings on the same
+    poll included. `astimezone` raises `OverflowError`, not `ValueError`, when
+    the offset carries the result out of `datetime`'s range.
+    """
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00", ends=stored)
+
+    response = make_raw_client(f"alerts-clock-{hash(stored) & 0xFFFF}", seed).get(
+        "/api/weather-alerts"
+    )
+    assert response.status_code == 200, why
+    (alert,) = response.get_json()["alerts"]
+    assert alert["ends"] == stored, "published verbatim rather than dropped"
+    assert alert["event"] == "Tornado Warning"
+
+
+def test_a_non_string_clock_cannot_reach_the_endpoint_but_is_handled_anyway():
+    """Why `TypeError` is in `_alert_clock`'s tuple despite being unreachable.
+
+    Measured, not assumed: `weather_alerts.ends` is TEXT, so SQLite's type
+    affinity converts a stored `12345` to the string `"12345"` on the way back
+    out — every value the endpoint ever sees is `str` or `None`, and `None`
+    returns early. So the `TypeError` arm cannot fire from the route, a mutant
+    dropping it survives the suite, and that mutant is *equivalent* rather than
+    a test gap. It stays because the function is a boundary helper and the
+    guarantee comes from a column type two modules away.
+    """
+    assert web._alert_clock(12345) == 12345
+    assert web._alert_clock(None) is None
+    assert web._alert_clock("2026-09-11T08:00:00-04:00") == "2026-09-11T12:00:00Z"

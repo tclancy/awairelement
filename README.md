@@ -208,12 +208,17 @@ ingestion, so a wrong URL or 401 just gets logged.)
   `null`, never `0`.
 
   Summing rows is sound only because Open-Meteo's `current.precipitation` and
-  `current.snowfall` are backward-looking sums over the block's own `interval`
-  — 900 s, equal to the publish cadence — and `ts` is the primary key, so a
-  re-poll cannot double-count a window. `outdoor.SOURCE_INTERVAL_SECONDS`
-  carries that assumption and the poller logs a warning if the source ever
-  stops matching it; at `interval: 3600` these totals would over-report by
-  about 4x with every individual value still correct.
+  `current.snowfall` each accumulate over the block's own `interval` — 900 s,
+  equal to the publish cadence, so consecutive rows cover disjoint contiguous
+  windows — and because `ts` is the primary key, so a re-poll cannot
+  double-count a window. That argument needs the window's **width**; it does
+  not need to know which side of `ts` the window falls on, and this codebase
+  does not claim to know. The only consequence is at the midnight boundary,
+  where at most one 900 s bucket is attributed to one day or the other.
+  `outdoor.SOURCE_INTERVAL_SECONDS` carries the width assumption and the poller
+  logs a warning if the source ever stops matching it; at `interval: 3600`
+  these totals would over-report by about 4x with every individual value still
+  correct.
 
 - **`GET /api/weather-alerts`** — active National Weather Service alerts for
   the parcel (#79). Tornado and hurricane warnings are two of the three

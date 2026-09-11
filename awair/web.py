@@ -137,10 +137,18 @@ def _alert_clock(value):
     the honest answer is "here is the alert, and here is its `ends` exactly as
     published". Losing a tornado warning over its end time is the wrong trade
     in the one direction this endpoint cares about.
+
+    `OverflowError` is in the tuple because `astimezone` raises it, not
+    `ValueError`, when the offset carries the result out of `datetime`'s range
+    -- `"9999-12-31T23:59:59-12:00"` is the reproducer, and it 500s the whole
+    feed for as long as NWS keeps publishing that alert. Two accessor styles,
+    two exception classes; caught in review, not by the first bad-clock test,
+    whose fixture was an unparseable string and so only ever exercised
+    `ValueError`.
     """
     try:
         return _iso_utc(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return value
 
 
