@@ -453,9 +453,15 @@ def test_the_opening_range_is_read_from_the_dom_not_written_into_the_js(js):
         "the opening range belongs to `web.DEFAULT_RANGE` and is read back out "
         "of the rendered markup (#108)"
     )
-    assert not re.search(r"""range:\s*["'`]""", body), (
-        "`state.range` is initialised from a string literal — that is a second "
-        "copy of a default that lives in `web.DEFAULT_RANGE` (#108)"
+    assert not re.search(r"""["'`]""", expression), (
+        f"`state.range` is initialised from {expression.strip()!r}, which "
+        "contains a string literal -- that is a second copy of a default that "
+        "lives in `web.DEFAULT_RANGE` (#108). Scoped to the captured "
+        "expression rather than to the whole state object, and scoped to ANY "
+        "quote rather than to one immediately after `range:`: a literal in the "
+        "SECOND position of a fallback -- `pressed ? pressed.dataset.range : "
+        '"7d"` -- satisfies both the mechanism assertion above and a '
+        "`range:\\s*[\"']` ban, and is the same defect."
     )
 
 

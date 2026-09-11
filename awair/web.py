@@ -194,7 +194,7 @@ RANGE_LABELS = {"today": "Today", "7d": "7 days", "30d": "30 days"}
 
 # The one place the page's opening range is written down (#108).
 #
-# It used to be written down three times, in three languages -- twice as a
+# It used to be written down four times across three surfaces -- twice as a
 # `request.args.get(..., "7d")` default below, once as `aria-pressed="true"` on
 # a button in the template, and once as `state.range = "7d"` in
 # `dashboard.js` -- with nothing holding them in step. The template now derives
@@ -202,9 +202,18 @@ RANGE_LABELS = {"today": "Today", "7d": "7 days", "30d": "30 days"}
 # back out of the DOM, so changing the default is this line and nothing else.
 #
 # `today` is local midnight, not the last 24 h (see `_since_for`), so shortly
-# after midnight the page opens on a nearly empty chart. That is the literal
-# meaning of the button and is what Tom asked for on #108; the 7-day view is
-# one click away.
+# after midnight the page opens on a nearly empty chart -- and a dashboard left
+# open overnight collapses to it at 00:00 on the five-minute refresh. That is
+# the literal meaning of the button and is what Tom asked for on #108; the
+# 7-day view is one click away.
+#
+# Whose local, specifically: the WEB PROCESS's, via `datetime.now().astimezone()`.
+# Not `AWAIR_TZ`, which only `awair.solar` reads. The homelab box is
+# `America/New_York` and sets no `AWAIR_TZ`, so the window follows Tom's wall
+# clock and the solar markers fall back to UTC -- they can pick different days
+# for a few hours each evening. That divergence predates this change and is
+# unaffected by it (clicking Today always did exactly this); it is named here
+# because #108 makes it the default rather than a click.
 DEFAULT_RANGE = "today"
 
 # Open-Meteo returns precipitation in mm. The dashboard displays inches — Tom's
