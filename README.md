@@ -9,8 +9,9 @@ Two long-running processes:
   reading in SQLite, runs spike detection, and fires [ntfy](https://ntfy.sh)
   notifications when CO2 / TVOC / PM2.5 climb above their baseline or a hard
   ceiling.
-- **Dashboard** — a small Flask app that renders 7d / 30d small-multiple charts
-  of every metric, with detected spikes overlaid.
+- **Dashboard** — a small Flask app that renders today / 7d / 30d
+  small-multiple charts of every metric, with detected spikes overlaid. It
+  opens on **today** (`web.DEFAULT_RANGE`).
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).
@@ -100,8 +101,9 @@ ingestion, so a wrong URL or 401 just gets logged.)
   "stale" event (the wedged-but-HTTP-200 failure mode after some firmware
   updates). Recovery closes the event.
 - **Dashboard** — small multiples for CO2, TVOC, PM2.5, temp, humidity, and
-  score over 7d or 30d. Detected events overlay as shaded spans. LAN-only by
-  default (no auth).
+  score over today, 7d or 30d, opening on today (#108). "Today" is since local
+  midnight, not the last 24 h. Detected events overlay as shaded spans.
+  LAN-only by default (no auth).
 - **`GET /api/latest`** — the newest reading plus every open event, as
   read-only JSON, for the house hub to poll (#70). awairelement stays the
   system of record; the hub stores nothing and derives its own card colour

@@ -47,7 +47,21 @@ const METRICS = {
   const PRESSURE_SCALE_MIN_INHG = 28.5;
   const PRESSURE_SCALE_MAX_INHG = 31.0;
 
-  const state = { range: "7d", plots: [], events: [], dailyEvents: [] };
+  // The opening range is NOT written down here (#108). `web.DEFAULT_RANGE`
+  // renders it as `aria-pressed="true"` on one button, and this reads it back
+  // out; a literal here would be a second copy of the default that nothing
+  // keeps in step with the server's, which is how the button row and the data
+  // it fetched could disagree. Falls back to the first button if no button is
+  // pressed -- an empty `state.range` would fetch `/api/series?range=` and
+  // 400.
+  const pressedRange = document.querySelector('.ranges button[aria-pressed="true"]');
+  const firstRange = document.querySelector(".ranges button");
+  const state = {
+    range: (pressedRange || firstRange).dataset.range,
+    plots: [],
+    events: [],
+    dailyEvents: [],
+  };
   // Cursor-broadcast group for the synced crosshair. Charts join it by
   // passing `cursor: { sync: { key: sync.key } }` — uPlot's constructor ends
   // with `syncGroup.sub(self)`, so that config IS the subscription. Do not

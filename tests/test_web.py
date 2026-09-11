@@ -170,6 +170,127 @@ def test_dashboard_page_offers_all_three_range_buttons(client):
     assert html.index('data-range="today"') < html.index('data-range="7d"')
 
 
+# --- the default range (#108) ---
+#
+# Tom asked for the page to open on Today rather than 7 days. Before #108 that
+# answer lived in three places in three languages -- `request.args.get(...,
+# "7d")` twice in `web.py`, `aria-pressed="true"` on one button in the
+# template, and `state.range = "7d"` in `dashboard.js` -- and nothing held them
+# in step. These tests pin the single constant and, separately, pin that each
+# surface *derives* from it rather than agreeing with it by coincidence.
+
+
+def _close_a_pm25_event_days_ago(db_path, days):
+    """One closed pm25 event, `days` old. Closed, because `events_since` keeps
+    every *open* event regardless of window — only a closed one can fall out."""
+    conn = db.connect(db_path)
+    now = datetime.now(UTC)
+    event = db.open_event(
+        conn,
+        metric="pm25",
+        tier="relative",
+        opened_at=now - timedelta(days=days, hours=1),
+        value=60.0,
+        baseline=10.0,
+        threshold=50.0,
+        notified=True,
+    )
+    db.close_event(conn, event, closed_at=now - timedelta(days=days), notified=True)
+    conn.close()
+
+
+def _event_metrics(client, query=""):
+    return {
+        ev["metric"] for ev in client.get(f"/api/events{query}").get_json()["events"]
+    }
+
+
+def test_series_defaults_to_today_when_no_range_is_given(client):
+    # `bucket_seconds` is the discriminator, not row count. The fixture seeds
+    # one hour of readings, which falls inside every range, so "some data came
+    # back" would pass on `7d` exactly as readily.
+    assert client.get("/api/series").get_json()["bucket_seconds"] == 60
+
+
+def test_events_defaults_to_today_when_no_range_is_given(client, tmp_path):
+    # `/api/events` shares `_range_params`, and a default that moved on
+    # `/api/series` alone would leave the alert strip on a 7-day window under
+    # a chart showing one day.
+    _close_a_pm25_event_days_ago(tmp_path / "web.db", days=2)
+    assert "pm25" in _event_metrics(client, "?range=7d")
+    assert "pm25" not in _event_metrics(client)
+
+
+def test_outdoor_series_defaults_to_today_when_no_range_is_given(client, tmp_path):
+    # Outdoor buckets are 900 s on BOTH `today` and `7d`, so `bucket_seconds`
+    # cannot discriminate here the way it does indoors. The window itself has
+    # to be measured: a reading from three days ago is inside `7d` and outside
+    # `today`.
+    db_path = tmp_path / "web.db"
+    conn = db.connect(db_path)
+    three_days_ago = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    conn.execute(
+        "INSERT INTO outdoor_readings (ts, received_at, temp) VALUES (?, ?, ?)",
+        (three_days_ago, three_days_ago, 5.0),
+    )
+    conn.commit()
+    conn.close()
+    _seed_outdoor(db_path)
+
+    week = client.get("/api/outdoor-series?range=7d").get_json()["metrics"]["temp"]
+    default = client.get("/api/outdoor-series").get_json()["metrics"]["temp"]
+    assert 5.0 in [v for v in week["avg"] if v is not None]
+    assert 5.0 not in [v for v in default["avg"] if v is not None]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_bucket"),
+    [("/api/series", 900), ("/api/outdoor-series", 3600)],
+)
+def test_series_endpoints_read_the_default_from_one_constant(
+    client, monkeypatch, path, expected_bucket
+):
+    # The derivation test, and the reason the assertions above are not enough:
+    # each of those passes just as well against a second hard-coded "today".
+    # Moving the constant has to move the endpoint. 30d is chosen because its
+    # bucket differs from today's on both endpoints.
+    monkeypatch.setattr(web, "DEFAULT_RANGE", "30d")
+    assert client.get(path).get_json()["bucket_seconds"] == expected_bucket
+
+
+def test_events_reads_the_default_from_the_same_constant(client, monkeypatch, tmp_path):
+    # `/api/events` publishes no bucket, so its window is measured with an
+    # event that sits between the two ranges.
+    _close_a_pm25_event_days_ago(tmp_path / "web.db", days=2)
+    assert "pm25" not in _event_metrics(client)
+    monkeypatch.setattr(web, "DEFAULT_RANGE", "30d")
+    assert "pm25" in _event_metrics(client)
+
+
+def test_dashboard_page_presses_the_default_range_button(client):
+    html = client.get("/").get_data(as_text=True)
+    assert '<button data-range="today" aria-pressed="true">Today</button>' in html
+    assert '<button data-range="7d" aria-pressed="false">7 days</button>' in html
+    assert '<button data-range="30d" aria-pressed="false">30 days</button>' in html
+
+
+def test_dashboard_range_buttons_follow_the_default_constant(client, monkeypatch):
+    # Same derivation question for the template. Without this, the assertion
+    # above is satisfied by an `aria-pressed="true"` typed into the HTML.
+    monkeypatch.setattr(web, "DEFAULT_RANGE", "30d")
+    html = client.get("/").get_data(as_text=True)
+    assert 'data-range="30d" aria-pressed="true"' in html
+    assert 'data-range="today" aria-pressed="false"' in html
+
+
+def test_range_labels_cover_exactly_the_ranges_both_endpoints_accept():
+    # The buttons are rendered from RANGE_LABELS, and both endpoints validate
+    # against their own dict. A label without a range 400s on click; a range
+    # without a label is unreachable from the page.
+    assert set(web.RANGE_LABELS) == set(web.RANGES) == set(web.OUTDOOR_RANGES)
+    assert web.DEFAULT_RANGE in web.RANGE_LABELS
+
+
 def test_dashboard_stamps_ceilings_for_alerting_metrics(client):
     # data-ceiling on the card feeds the JS reference-line plugin (#25).
     # Metrics without an alert ceiling (temp, humid, score) get no attribute.

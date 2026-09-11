@@ -187,6 +187,26 @@ OUTDOOR_RANGES = {
     "30d": {"days": 30, "bucket_seconds": 3600},
 }
 
+# The range control's buttons, in the order they are drawn -- narrowest first,
+# so the row reads left-to-right from detail to context (#46). The template
+# renders from this dict; nothing in `dashboard.html` names a range.
+RANGE_LABELS = {"today": "Today", "7d": "7 days", "30d": "30 days"}
+
+# The one place the page's opening range is written down (#108).
+#
+# It used to be written down three times, in three languages -- twice as a
+# `request.args.get(..., "7d")` default below, once as `aria-pressed="true"` on
+# a button in the template, and once as `state.range = "7d"` in
+# `dashboard.js` -- with nothing holding them in step. The template now derives
+# `aria-pressed` from this constant and `dashboard.js` reads the pressed button
+# back out of the DOM, so changing the default is this line and nothing else.
+#
+# `today` is local midnight, not the last 24 h (see `_since_for`), so shortly
+# after midnight the page opens on a nearly empty chart. That is the literal
+# meaning of the button and is what Tom asked for on #108; the 7-day view is
+# one click away.
+DEFAULT_RANGE = "today"
+
 # Open-Meteo returns precipitation in mm. The dashboard displays inches — Tom's
 # expected scale on #31 was "tenths of an inch". Conversion happens at the API
 # boundary so storage stays raw (same shape as temperature: DB in Celsius,
@@ -216,7 +236,7 @@ def _since_for(spec):
 
 
 def _range_params():
-    name = request.args.get("range", "7d")
+    name = request.args.get("range", DEFAULT_RANGE)
     if name not in RANGES:
         abort(400, f"range must be one of {sorted(RANGES)}")
     spec = RANGES[name]
@@ -224,7 +244,7 @@ def _range_params():
 
 
 def _outdoor_range_params():
-    name = request.args.get("range", "7d")
+    name = request.args.get("range", DEFAULT_RANGE)
     if name not in OUTDOOR_RANGES:
         abort(400, f"range must be one of {sorted(OUTDOOR_RANGES)}")
     spec = OUTDOOR_RANGES[name]
@@ -288,6 +308,8 @@ def create_app(db_path=None):
             metrics=METRIC_NAMES,
             ceilings=CEILINGS,
             temp_unit_symbol=units.symbol(temp_unit()),
+            range_labels=RANGE_LABELS,
+            default_range=DEFAULT_RANGE,
         )
 
     @app.get("/api/series")
