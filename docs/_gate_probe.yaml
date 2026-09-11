@@ -1,0 +1,3 @@
+probe:
+  - unclosed: [a, b
+  bad indent here
