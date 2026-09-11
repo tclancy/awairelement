@@ -1094,6 +1094,31 @@ def record_fan_event(conn, at, fan_id: int, action: str, reason: str, ok: bool) 
     conn.commit()
 
 
+def fan_events_since(conn, since) -> list:
+    """Fan actuation attempts at or after `since`, oldest first.
+
+    Ordered by `(at, id)`, not `at` alone: `check_fans` commands every fan from
+    one `now`, so ties are the normal case rather than an edge, and insertion
+    order is the only thing that separates fan 1's command from fan 2's.
+    """
+    rows = conn.execute(
+        "SELECT id, at, fan_id, action, reason, ok FROM fan_events"
+        " WHERE at >= ? ORDER BY at, id",
+        (since.isoformat(),),
+    )
+    return [
+        {
+            "id": row_id,
+            "at": datetime.fromisoformat(at),
+            "fan_id": fan_id,
+            "action": action,
+            "reason": reason,
+            "ok": bool(ok),
+        }
+        for row_id, at, fan_id, action, reason, ok in rows
+    ]
+
+
 # The `weather_alerts` columns written from an NWS CAP feature (#79). `id` is
 # the CAP urn from `properties.id`, NOT the feature's `id`, which is the
 # api.weather.gov URL for the same alert -- the urn is the identifier NWS keeps
@@ -1138,31 +1163,6 @@ def _upsert_weather_alerts(conn, alerts, seen_at) -> None:
         " last_seen_at = excluded.last_seen_at",
         [alert | {"seen_at": seen_at} for alert in alerts],
     )
-
-
-def fan_events_since(conn, since) -> list:
-    """Fan actuation attempts at or after `since`, oldest first.
-
-    Ordered by `(at, id)`, not `at` alone: `check_fans` commands every fan from
-    one `now`, so ties are the normal case rather than an edge, and insertion
-    order is the only thing that separates fan 1's command from fan 2's.
-    """
-    rows = conn.execute(
-        "SELECT id, at, fan_id, action, reason, ok FROM fan_events"
-        " WHERE at >= ? ORDER BY at, id",
-        (since.isoformat(),),
-    )
-    return [
-        {
-            "id": row_id,
-            "at": datetime.fromisoformat(at),
-            "fan_id": fan_id,
-            "action": action,
-            "reason": reason,
-            "ok": bool(ok),
-        }
-        for row_id, at, fan_id, action, reason, ok in rows
-    ]
 
 
 def _stamp_weather_alert_poll(conn, attempted_at, succeeded_at) -> None:
