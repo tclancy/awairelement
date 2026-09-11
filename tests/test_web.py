@@ -847,6 +847,7 @@ def outdoor_client(make_raw_client):
             wind_speed=3.2,
             pressure=1013.2,
             precipitation=0.4,
+            snowfall=1.5,
             pm25=5.6,
             pm10=8.1,
             us_aqi=32,
@@ -874,6 +875,7 @@ def test_outdoor_latest_publishes_exactly_the_agreed_fields(outdoor_client):
         "wind_speed",
         "pressure",
         "precipitation",
+        "snowfall",
         "pm25",
         "pm10",
         "us_aqi",
@@ -935,6 +937,24 @@ def test_outdoor_latest_is_always_celsius_whatever_the_display_unit_says(
     payload = app.test_client().get("/api/outdoor-latest").get_json()
     assert payload["temp_unit"] == "C"
     assert payload["reading"]["temp"] == 22.4
+
+
+def test_outdoor_latest_labels_every_unit_a_consumer_converts(outdoor_client):
+    """Five labels, and `snowfall_unit` is the one that is not `mm` (#79).
+
+    Open-Meteo publishes rain as a water equivalent in mm and snow as a depth
+    in cm, so a shared `precipitation_unit` would be a silent 10x on the one
+    number whose red threshold is "more than 4 inches of snow" — the hub would
+    read 12 cm of snow as 12 mm and render green.
+    """
+    payload = outdoor_client.get("/api/outdoor-latest").get_json()
+    assert payload["temp_unit"] == "C"
+    assert payload["pressure_unit"] == "hPa"
+    assert payload["wind_speed_unit"] == "km/h"
+    assert payload["precipitation_unit"] == "mm"
+    assert payload["snowfall_unit"] == "cm"
+    assert payload["snowfall_unit"] != payload["precipitation_unit"]
+    assert payload["reading"]["snowfall"] == 1.5
 
 
 def test_outdoor_latest_publishes_pressure_in_source_hpa(outdoor_client):
@@ -1068,3 +1088,332 @@ def test_outdoor_latest_names_every_unit_the_hub_converts(outdoor_client):
     # Source values, unconverted -- the labels have to be true.
     assert payload["reading"]["wind_speed"] == 3.2
     assert payload["reading"]["precipitation"] == 0.4
+
+
+# --- /api/outdoor-today (#79) -----------------------------------------------
+#
+# The machine-facing day aggregate. `/api/outdoor-series?range=today` cannot
+# answer "how much rain fell today" for two independent reasons -- it converts
+# to display units, and `bucket()` has no sum -- and the coincidence that makes
+# summing its `avg` appear to work is the trap this endpoint removes.
+
+
+def _today_window():
+    """The same local-midnight window the endpoint resolves, as UTC."""
+    return web._since_for(web.OUTDOOR_RANGES["today"])
+
+
+@pytest.fixture
+def today_client(make_raw_client):
+    """Three in-window rows plus one from before local midnight.
+
+    The out-of-window row carries a huge `precipitation` so that including it
+    cannot be mistaken for a rounding difference.
+    """
+    since = _today_window()
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts=(since - timedelta(hours=1)).isoformat(),
+            received_at=(since - timedelta(hours=1)).isoformat(),
+            precipitation=50.0,
+            temp=-5.0,
+        )
+        for index, minutes in enumerate((15, 30, 45)):
+            at = since + timedelta(minutes=minutes)
+            _seed_outdoor_row(
+                conn,
+                ts=at.isoformat(),
+                received_at=at.isoformat(),
+                precipitation=0.4,
+                snowfall=1.5,
+                temp=18.0 + index,
+                wind_speed=3.0 + index,
+                us_aqi=20 + index,
+            )
+
+    return make_raw_client("today", seed)
+
+
+def test_outdoor_today_publishes_real_sums_not_averages(today_client):
+    payload = today_client.get("/api/outdoor-today").get_json()
+    assert payload["precipitation_total"] == pytest.approx(1.2)
+    assert payload["snowfall_total"] == pytest.approx(4.5)
+    assert payload["temp_min"] == 18.0
+    assert payload["temp_max"] == 20.0
+    assert payload["wind_speed_max"] == 5.0
+    assert payload["us_aqi_min"] == 20
+    assert payload["us_aqi_max"] == 22
+
+
+def test_outdoor_today_excludes_yesterday(today_client):
+    """Local midnight, not the last 24h — the same "today" the dashboard means."""
+    payload = today_client.get("/api/outdoor-today").get_json()
+    assert payload["row_count"] == 3
+    assert payload["precipitation_total"] < 50.0
+    assert payload["temp_min"] == 18.0, "the -5.0 row is before the window"
+
+
+def test_outdoor_today_names_its_units_and_never_converts(make_raw_client, monkeypatch):
+    """Source units regardless of `TEMPERATURE_UNIT`, like every machine-facing
+    endpoint here. Inheriting the display setting would hand a consumer a
+    silent 30-degree error the day the config flips.
+
+    The env var is set **before** the client is built, which is the whole
+    point: `create_app` reads `TEMPERATURE_UNIT` once at construction, so
+    setting it against an already-built client proves nothing. A mutation
+    round caught that — `"temp_unit": "C"` swapped for `temp_unit()` survived
+    the earlier version of this test.
+    """
+    monkeypatch.setenv("TEMPERATURE_UNIT", "F")
+    since = _today_window()
+
+    def seed(conn):
+        for index, minutes in enumerate((15, 30, 45)):
+            at = since + timedelta(minutes=minutes)
+            _seed_outdoor_row(
+                conn,
+                ts=at.isoformat(),
+                received_at=at.isoformat(),
+                precipitation=0.4,
+                snowfall=1.5,
+                temp=18.0 + index,
+                wind_speed=3.0 + index,
+                us_aqi=20 + index,
+            )
+
+    payload = make_raw_client("today-f", seed).get("/api/outdoor-today").get_json()
+    assert payload["temp_unit"] == "C"
+    assert payload["precipitation_unit"] == "mm"
+    assert payload["snowfall_unit"] == "cm"
+    assert payload["wind_speed_unit"] == "km/h"
+    assert payload["temp_max"] == 20.0, "20 C must not arrive as 68"
+    assert payload["precipitation_total"] == pytest.approx(1.2), "mm, not inches"
+
+
+def test_outdoor_today_publishes_its_window_so_a_total_can_be_placed(today_client):
+    payload = today_client.get("/api/outdoor-today").get_json()
+    start = datetime.fromisoformat(payload["start"])
+    end = datetime.fromisoformat(payload["end"])
+    assert payload["start"].endswith("Z") and payload["end"].endswith("Z")
+    assert start == _today_window()
+    assert start < end <= datetime.now(UTC) + timedelta(seconds=5)
+
+
+def test_outdoor_today_over_an_empty_day_is_a_200_with_nulls(make_raw_client):
+    """ "No rain today" must not be spelled the same way as "the poller is dead"."""
+    response = make_raw_client("today-empty").get("/api/outdoor-today")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["row_count"] == 0
+    assert payload["precipitation_total"] is None
+    assert payload["snowfall_total"] is None
+    assert payload["contributing_rows"]["precipitation"] == 0
+
+
+def test_outdoor_today_distinguishes_a_partial_column_from_a_complete_one(
+    make_raw_client,
+):
+    """The snowfall migration boundary, which is a real state on deploy day.
+
+    Two rows in the window; one predates the column. `row_count` says 2 either
+    way, so only the per-column count can tell a half-day snow total from a
+    whole-day one.
+    """
+    since = _today_window()
+
+    def seed(conn):
+        _seed_outdoor_row(
+            conn,
+            ts=(since + timedelta(minutes=15)).isoformat(),
+            received_at=(since + timedelta(minutes=15)).isoformat(),
+            precipitation=0.1,
+        )
+        _seed_outdoor_row(
+            conn,
+            ts=(since + timedelta(minutes=30)).isoformat(),
+            received_at=(since + timedelta(minutes=30)).isoformat(),
+            precipitation=0.1,
+            snowfall=2.0,
+        )
+
+    payload = (
+        make_raw_client("today-partial", seed).get("/api/outdoor-today").get_json()
+    )
+    assert payload["row_count"] == 2
+    assert payload["contributing_rows"]["precipitation"] == 2
+    assert payload["contributing_rows"]["snowfall"] == 1
+    assert payload["snowfall_total"] == pytest.approx(2.0)
+
+
+# --- /api/weather-alerts (#79) ----------------------------------------------
+#
+# The one rule: a failed poll must never render as "no alerts". `alerts: null`
+# means "we have never had an answer"; `alerts: []` means "we asked and NWS
+# said none". Everything below is that distinction in a different position.
+
+
+def _seed_alert(conn, seen_at, **overrides):
+    alert = {
+        "id": "urn:oid:2.49.0.1.840.0.abc.001.1",
+        "event": "Tornado Warning",
+        "severity": "Extreme",
+        "certainty": "Observed",
+        "urgency": "Immediate",
+        "headline": "Tornado Warning issued September 11 at 8:00AM EDT",
+        "onset": "2026-09-11T08:00:00-04:00",
+        "ends": None,
+        "expires": None,
+        **overrides,
+    }
+    db.commit_weather_alert_poll(conn, [alert], seen_at)
+
+
+def test_weather_alerts_is_null_before_any_successful_poll(make_raw_client):
+    """A fresh install whose NWS fetch has never worked. The worst case."""
+    payload = make_raw_client("alerts-never").get("/api/weather-alerts").get_json()
+    assert payload["alerts"] is None
+    assert payload["last_success_at"] is None
+    assert payload["last_attempt_at"] is None
+
+
+def test_weather_alerts_is_an_empty_list_after_a_successful_empty_poll(
+    make_raw_client,
+):
+    """The other half. `[]` and `null` are different answers, deliberately."""
+
+    def seed(conn):
+        db.record_weather_alert_poll(
+            conn, "2026-09-11T12:00:00+00:00", "2026-09-11T12:00:00+00:00"
+        )
+
+    payload = (
+        make_raw_client("alerts-clear", seed).get("/api/weather-alerts").get_json()
+    )
+    assert payload["alerts"] == []
+    assert payload["last_success_at"] == "2026-09-11T12:00:00Z"
+
+
+def test_weather_alerts_publishes_exactly_the_agreed_fields(make_raw_client):
+    """A literal set, not `{*web._ALERT_FIELDS}` — this is a contract with
+    another repo, so widening the constant has to fail here."""
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00")
+
+    (alert,) = (
+        make_raw_client("alerts-fields", seed).get("/api/weather-alerts").get_json()
+    )["alerts"]
+    assert set(alert) == {
+        "id",
+        "event",
+        "severity",
+        "certainty",
+        "urgency",
+        "headline",
+        "onset",
+        "ends",
+        "expires",
+        "first_seen_at",
+        "last_seen_at",
+    }
+    assert alert["event"] == "Tornado Warning"
+    assert alert["severity"] == "Extreme"
+
+
+def test_weather_alerts_normalises_nws_clocks_to_one_spelling(make_raw_client):
+    """NWS publishes local offsets (`-04:00`); every other clock this app
+    ships is `...Z`, and the consumer compares them against each other."""
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00")
+
+    (alert,) = (
+        make_raw_client("alerts-clocks", seed).get("/api/weather-alerts").get_json()
+    )["alerts"]
+    assert alert["onset"] == "2026-09-11T12:00:00Z"
+    assert alert["first_seen_at"].endswith("Z")
+    assert alert["ends"] is None
+
+
+def test_an_unreadable_nws_clock_does_not_take_down_the_feed(make_raw_client):
+    """Third-party data, so `_iso_utc`'s right to raise does not apply.
+
+    A 500 here reads to the consumer as "awairelement is broken", which is a
+    worse answer than "here is the alert and here is its `ends` verbatim".
+    """
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00", ends="sometime tuesday")
+
+    response = make_raw_client("alerts-badclock", seed).get("/api/weather-alerts")
+    assert response.status_code == 200
+    (alert,) = response.get_json()["alerts"]
+    assert alert["ends"] == "sometime tuesday"
+    assert alert["event"] == "Tornado Warning"
+
+
+def test_a_stale_poll_still_publishes_its_alerts_with_both_clocks(make_raw_client):
+    """A transient NWS outage must not delete a live tornado warning.
+
+    The consumer sees it going stale because `last_attempt_at` keeps moving
+    while `last_success_at` does not — which is why both ship.
+    """
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00")
+        db.record_weather_alert_poll(conn, "2026-09-11T13:00:00+00:00")
+
+    payload = (
+        make_raw_client("alerts-stale", seed).get("/api/weather-alerts").get_json()
+    )
+    assert [a["event"] for a in payload["alerts"]] == ["Tornado Warning"]
+    assert payload["last_success_at"] == "2026-09-11T12:00:00Z"
+    assert payload["last_attempt_at"] == "2026-09-11T13:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("stored", "why"),
+    [
+        ("sometime tuesday", "an unparseable string (ValueError)"),
+        ("9999-12-31T23:59:59-12:00", "an offset out of datetime's range (Overflow)"),
+    ],
+)
+def test_no_stored_clock_shape_can_500_the_alert_feed(make_raw_client, stored, why):
+    """Two shapes, two exception classes, one required outcome.
+
+    The first version of this test used only the unparseable string, so the
+    `OverflowError` arm went unexercised — and it was genuinely missing from
+    the tuple, which meant one hostile `expires` took the whole feed down for
+    as long as NWS kept publishing that alert, tornado warnings on the same
+    poll included. `astimezone` raises `OverflowError`, not `ValueError`, when
+    the offset carries the result out of `datetime`'s range.
+    """
+
+    def seed(conn):
+        _seed_alert(conn, "2026-09-11T12:00:00+00:00", ends=stored)
+
+    response = make_raw_client(f"alerts-clock-{hash(stored) & 0xFFFF}", seed).get(
+        "/api/weather-alerts"
+    )
+    assert response.status_code == 200, why
+    (alert,) = response.get_json()["alerts"]
+    assert alert["ends"] == stored, "published verbatim rather than dropped"
+    assert alert["event"] == "Tornado Warning"
+
+
+def test_a_non_string_clock_cannot_reach_the_endpoint_but_is_handled_anyway():
+    """Why `TypeError` is in `_alert_clock`'s tuple despite being unreachable.
+
+    Measured, not assumed: `weather_alerts.ends` is TEXT, so SQLite's type
+    affinity converts a stored `12345` to the string `"12345"` on the way back
+    out — every value the endpoint ever sees is `str` or `None`, and `None`
+    returns early. So the `TypeError` arm cannot fire from the route, a mutant
+    dropping it survives the suite, and that mutant is *equivalent* rather than
+    a test gap. It stays because the function is a boundary helper and the
+    guarantee comes from a column type two modules away.
+    """
+    assert web._alert_clock(12345) == 12345
+    assert web._alert_clock(None) is None
+    assert web._alert_clock("2026-09-11T08:00:00-04:00") == "2026-09-11T12:00:00Z"

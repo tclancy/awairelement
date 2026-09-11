@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, solar, spikes, units
+from awair import db, solar, spikes, units, weather_alerts
 from awair.series import bucket
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -44,6 +44,11 @@ OUTDOOR_LATEST_FIELDS = (
     "wind_speed",
     "pressure",
     "precipitation",
+    # #79. Beside `precipitation` because that is where a reader looks for it,
+    # even though `db.OUTDOOR_COLUMNS` has to keep it last to match the ALTER
+    # order. NULL here means *unknown* -- the row predates the snowfall
+    # migration -- and the hub must not read it as "it is not snowing".
+    "snowfall",
     "pm25",
     "pm10",
     "us_aqi",
@@ -112,6 +117,55 @@ def _public_event(event):
     return {field: event[field] for field in _OPEN_EVENT_FIELDS} | {
         "opened_at": _iso_utc(event["opened_at"])
     }
+
+
+# The `weather_alerts` fields `/api/weather-alerts` publishes, split by whether
+# they are clocks. A whitelist for the same reason `_OPEN_EVENT_FIELDS` is one:
+# a column added to the table later is private until someone publishes it on
+# purpose. Between them these happen to cover every stored column today.
+_ALERT_FIELDS = ("id", "event", "severity", "certainty", "urgency", "headline")
+_ALERT_CLOCK_FIELDS = ("onset", "ends", "expires", "first_seen_at", "last_seen_at")
+
+
+def _alert_clock(value):
+    """`_iso_utc` for a third-party timestamp, falling back to the raw string.
+
+    Every other clock this app publishes was written by a process in this repo,
+    which is why `_iso_utc` is allowed to raise on those -- an unparseable one
+    would be our own bug. These came from NWS. A stamp we cannot normalise must
+    not 500 the whole feed, because the consumer would then see an error where
+    the honest answer is "here is the alert, and here is its `ends` exactly as
+    published". Losing a tornado warning over its end time is the wrong trade
+    in the one direction this endpoint cares about.
+
+    `OverflowError` is in the tuple because `astimezone` raises it, not
+    `ValueError`, when the offset carries the result out of `datetime`'s range
+    -- `"9999-12-31T23:59:59-12:00"` is the reproducer, and it 500s the whole
+    feed for as long as NWS keeps publishing that alert. Two accessor styles,
+    two exception classes; caught in review, not by the first bad-clock test,
+    whose fixture was an unparseable string and so only ever exercised
+    `ValueError`.
+    """
+    try:
+        return _iso_utc(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
+def _public_alerts(alerts):
+    """The stored alerts as `/api/weather-alerts` publishes them, or None.
+
+    **None passes through as None.** It means "no poll has ever succeeded", and
+    mapping it to `[]` here would undo the whole point of the endpoint -- see
+    its docstring.
+    """
+    if alerts is None:
+        return None
+    return [
+        {field: alert[field] for field in _ALERT_FIELDS}
+        | {field: _alert_clock(alert[field]) for field in _ALERT_CLOCK_FIELDS}
+        for alert in alerts
+    ]
 
 
 # "today" == since local midnight, not the last 24h — it's the single-day
@@ -347,12 +401,14 @@ def create_app(db_path=None):
         display config says**, and **an empty table is a 200 with a null
         reading, not an error**.
 
-        Four units are named in the payload rather than left implied: the
-        four the consumer is known to convert. #71's own motivating card reads
+        Five units are named in the payload rather than left implied: the
+        five the consumer is known to convert. #71's own motivating card reads
         `62°F, 8 mph, 0.00 in`, so the hub turns Celsius into F, km/h into mph
         and mm into inches -- and this app separately turns hPa into inHg at
         the `/api/outdoor-series` boundary and Celsius into F at every
-        browser-facing one. Every one of those is a silent multiply on a
+        browser-facing one. `snowfall_unit` joined them in #79, and it is `cm`
+        rather than `mm`: Open-Meteo publishes snow depth and rain in different
+        units, so one shared label would be a silent 10x. Every one of those is a silent multiply on a
         number the card exists to display, and an unlabelled payload gives a
         consumer no way to notice it guessed wrong.
 
@@ -386,6 +442,12 @@ def create_app(db_path=None):
             "pressure_unit": "hPa",
             "wind_speed_unit": "km/h",
             "precipitation_unit": "mm",
+            # cm, not mm, and it is the fifth unit rather than a second use of
+            # `precipitation_unit` because Open-Meteo genuinely publishes the
+            # two in different units (#79). Folding snow into the mm label
+            # would be a silent 10x on the one number whose threshold is "more
+            # than 4 inches".
+            "snowfall_unit": "cm",
             "reading": None,
         }
         if reading is not None:
@@ -403,6 +465,99 @@ def create_app(db_path=None):
                 **{name: reading[name] for name in OUTDOOR_LATEST_FIELDS},
             }
         return jsonify(payload)
+
+    @app.get("/api/outdoor-today")
+    def outdoor_today():
+        """Today's outdoor totals and extremes, for the house hub (#79).
+
+        The machine-facing sibling of `/api/outdoor-latest`, and it exists
+        because `/api/outdoor-series?range=today` **cannot** answer "how much
+        rain fell today", for two independent reasons. It converts to display
+        units (`_MM_PER_INCH`, hPa to inHg, Celsius to F) -- the exact silent
+        multiply `/api/outdoor-latest` was built to avoid -- and `series.bucket`
+        emits avg/min/max with no sum at all.
+
+        There is a trap here worth naming, because a consumer who falls into it
+        finds that it works. At `range=today` the bucket is 900 s and so is the
+        source cadence, so each bucket holds exactly one point and `avg`
+        *equals* the raw value; summing `avg` therefore produces the right rain
+        total today, by coincidence, and would start under-reporting silently
+        the moment either number changed.
+
+        Inherits the machine-facing rules: **source units regardless of
+        `TEMPERATURE_UNIT`**, units named in the payload, and an empty window
+        is a 200 rather than an error.
+
+        `row_count` and `contributing_rows` are both published and they are not
+        the same number. `row_count` separates "no rain today" from "the poller
+        has been down since 03:00" -- a day total over three rows is not a day
+        total, and without it the hub renders a confident zero.
+        `contributing_rows` is per source column, because a column can be NULL
+        on a row that exists: every row predating the `snowfall` migration is
+        exactly that, so for one day after deploy `snowfall_total` is a real
+        sum over a strict subset of the day. A field with no values at all is
+        `null`, never `0`.
+        """
+        since = _since_for(OUTDOOR_RANGES["today"])
+        conn = connect()
+        try:
+            aggregate = db.outdoor_day_aggregate(conn, since)
+        finally:
+            conn.close()
+        return jsonify(
+            {
+                # Literals, not lookups, for the same reason the sibling
+                # endpoints use literals -- see `/api/outdoor-latest`.
+                "temp_unit": "C",
+                "wind_speed_unit": "km/h",
+                "precipitation_unit": "mm",
+                "snowfall_unit": "cm",
+                # The window this is a total over, so a consumer can tell which
+                # local day it got and how much of it has happened yet.
+                "start": _iso_utc(since),
+                "end": _iso_utc(datetime.now(UTC)),
+                "row_count": aggregate["row_count"],
+                "contributing_rows": aggregate["contributing_rows"],
+                **aggregate["values"],
+            }
+        )
+
+    @app.get("/api/weather-alerts")
+    def weather_alert_feed():
+        """NWS active alerts for the parcel, for the house hub (#79).
+
+        Tornado and hurricane warnings are two of the three conditions the
+        hub's card goes red for and neither has an Open-Meteo equivalent, so
+        the outdoor poller fetches them from api.weather.gov on its existing
+        timer (`awair.weather_alerts`).
+
+        **`alerts` is `null` until a poll has succeeded, and that is the
+        contract.** An empty list means "we asked NWS and it said none"; `null`
+        means "we have never had an answer". Collapsing the two into `[]` is
+        the one failure that turns a missing number into a false all-clear
+        about a tornado, so it is the shape rather than a caveat in the docs.
+        Both clocks ship beside it: `last_attempt_at` says the poller is alive
+        and trying, `last_success_at` is what an all-clear has to be measured
+        against, and the two diverging is precisely a sustained NWS outage.
+
+        The endpoint is `/api/weather-alerts` rather than `/api/alerts` as #79
+        drafted it. `awair.alerts` is this app's ntfy notifier and
+        `alert_events` is its own spike bookkeeping, both a year older than
+        this; `/api/alerts` beside `/api/latest`'s `open_events` would read as
+        those. One extra word, and the two senses stop colliding.
+        """
+        conn = connect()
+        try:
+            feed = weather_alerts.active_alerts(conn, datetime.now(UTC))
+        finally:
+            conn.close()
+        return jsonify(
+            {
+                "last_attempt_at": _iso_utc(feed["last_attempt_at"]),
+                "last_success_at": _iso_utc(feed["last_success_at"]),
+                "alerts": _public_alerts(feed["alerts"]),
+            }
+        )
 
     @app.get("/api/outdoor-series")
     def outdoor_series():

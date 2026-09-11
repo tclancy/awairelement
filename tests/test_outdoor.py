@@ -24,6 +24,28 @@ from awair.outdoor import (
 
 RECEIVED = "2026-07-12T04:30:00+00:00"
 
+NWS_EMPTY = json.dumps({"type": "FeatureCollection", "features": []})
+
+
+@pytest.fixture(autouse=True)
+def no_live_nws(monkeypatch):
+    """Keep `main()` off api.weather.gov.
+
+    Every `main()` test below patches `outdoor.make_fetch`, which builds the two
+    Open-Meteo fetchers -- and since #79 the loop builds a *third* through
+    `weather_alerts.make_fetch`, which that patch does not touch. Without this
+    fixture those tests reach the live NWS endpoint: verified, the run logged
+    "NWS alerts: 0 active" against the real service before this was added.
+
+    Autouse rather than opt-in, because the next `main()` test will not
+    remember, and a suite that silently makes a WAN call is green until the
+    network is not there.
+    """
+    monkeypatch.setattr(
+        outdoor.weather_alerts, "make_fetch", lambda url, agent: lambda: NWS_EMPTY
+    )
+
+
 WEATHER = {
     "current": {
         "time": "2026-07-12T04:30",
@@ -1062,3 +1084,188 @@ def test_a_null_ts_that_does_reach_the_insert_is_an_error_not_a_duplicate(
     assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 0
     assert "IntegrityError" in caplog.text, caplog.text
     assert conn.in_transaction is False
+
+
+# --- snowfall, the source interval, and NWS alerts on the same timer (#79) ---
+
+
+def test_snowfall_is_requested_and_mapped_to_its_own_column():
+    """`precipitation` cannot stand in for it and that is the whole ticket.
+
+    Open-Meteo publishes precipitation as a water equivalent in mm and snowfall
+    as a depth in cm; the ratio moves with the snow's density, so "more than 4
+    inches of snow" is not recoverable downstream from anything else here.
+    """
+    assert "snowfall" in WEATHER_FIELDS
+    assert outdoor.WEATHER_TO_COLUMN["snowfall"] == "snowfall"
+    assert "snowfall" in _build_url("https://x", 1.0, 2.0, WEATHER_FIELDS)
+    # And it is not quietly aliased onto the mm field.
+    assert outdoor.WEATHER_TO_COLUMN["precipitation"] == "precipitation"
+
+
+def test_parse_reading_carries_snowfall_through():
+    weather = {"current": dict(WEATHER["current"], snowfall=1.4)}
+    reading = parse_reading(weather, AIR_QUALITY, received_at=RECEIVED)
+    assert reading["snowfall"] == 1.4
+
+
+def test_an_absent_snowfall_is_none_rather_than_zero():
+    """NULL means *unknown*. Zero would be a fabricated all-clear on the one
+    input whose red threshold is "more than 4 inches of snow"."""
+    reading = parse_reading(WEATHER, AIR_QUALITY, received_at=RECEIVED)
+    assert reading["snowfall"] is None
+
+
+def test_a_changed_source_interval_warns_because_the_day_totals_would_break(caplog):
+    """The silent-4x case.
+
+    `current.precipitation` is a backward-looking sum over `current.interval`.
+    At 900 s that equals the publish cadence, so `/api/outdoor-today` sums
+    disjoint windows. At 3600 s every row would cover the preceding hour, four
+    rows would overlap three times over, and a day's rain total would
+    over-report by about 4x -- with every stored value still correct and
+    nothing raising. Only a log can catch that.
+    """
+    weather = {"current": dict(WEATHER["current"], interval=3600)}
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        reading = parse_reading(weather, AIR_QUALITY, received_at=RECEIVED)
+    assert reading["ts"], "the row is still written -- this warns, it does not refuse"
+    assert "3600" in caplog.text
+    assert "outdoor-today" in caplog.text
+
+
+def test_the_expected_interval_and_an_absent_one_are_both_silent(caplog):
+    """900 is the measured value; absent is "no claim", not drift.
+
+    The second half matters because hand-written payloads predating #79 omit
+    `interval` entirely, and warning on those would train the reader to ignore
+    the message that exists for the 3600 case.
+    """
+    with caplog.at_level(logging.WARNING, logger="awair.outdoor"):
+        parse_reading(WEATHER, AIR_QUALITY, received_at=RECEIVED)
+        parse_reading(
+            {
+                "current": {
+                    k: v for k, v in WEATHER["current"].items() if k != "interval"
+                }
+            },
+            AIR_QUALITY,
+            received_at=RECEIVED,
+        )
+    assert caplog.text == ""
+    assert WEATHER["current"]["interval"] == outdoor.SOURCE_INTERVAL_SECONDS
+
+
+def test_main_polls_nws_on_the_same_timer_with_an_identifying_agent(
+    monkeypatch, tmp_path, restore_signal_handlers, no_live_nws
+):
+    """End-to-end wiring: the alert poll is built from the parcel coords and runs.
+
+    Asserted through `main()` rather than on the helpers, because the defect
+    this guards is a poller that constructs the fetcher and never calls it --
+    which every unit test of `weather_alerts` would still pass.
+    """
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "900")
+    monkeypatch.setenv("AWAIR_NWS_ALERTS_URL", "https://nws.invalid/alerts/active")
+
+    built = {}
+
+    def fake_alert_fetch(url, agent):
+        built["url"] = url
+        built["agent"] = agent
+        return lambda: NWS_EMPTY
+
+    monkeypatch.setattr(outdoor.weather_alerts, "make_fetch", fake_alert_fetch)
+
+    def weather_then_sigterm():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return WEATHER_TEXT
+
+    monkeypatch.setattr(
+        outdoor,
+        "make_fetch",
+        lambda url: (
+            weather_then_sigterm
+            if "air-quality" not in url
+            else (lambda: AIR_QUALITY_TEXT)
+        ),
+    )
+
+    outdoor.main()
+
+    assert built["url"].startswith("https://nws.invalid/alerts/active?")
+    assert "point=43.1%2C-70.9" in built["url"]
+    assert built["agent"] == outdoor.weather_alerts.DEFAULT_USER_AGENT
+    # The poll ran: a successful empty poll stamps the success clock, and
+    # nothing else in `main()` writes that row.
+    conn = outdoor.db.connect(str(tmp_path / "out.db"))
+    try:
+        assert outdoor.db.weather_alert_poll_state(conn)["last_success_at"] is not None
+    finally:
+        conn.close()
+
+
+def test_an_nws_outage_does_not_escalate_the_outdoor_poller_to_unreachable(
+    monkeypatch, tmp_path, restore_signal_handlers
+):
+    """Two upstreams, two verdicts.
+
+    `OutdoorHealth` pages at *high* priority for `unreachable`, and NWS being
+    down is not a fault on our box or Open-Meteo's. Feeding the alert poll's
+    status to `health` would wake someone for someone else's outage.
+    """
+    monkeypatch.setenv("AWAIR_LAT", "43.1")
+    monkeypatch.setenv("AWAIR_LON", "-70.9")
+    monkeypatch.setenv("AWAIR_DB", str(tmp_path / "out.db"))
+    monkeypatch.setenv("AWAIR_OUTDOOR_POLL_SECONDS", "900")
+    monkeypatch.setenv("AWAIR_OUTDOOR_HEALTH_POLLS", "1")
+
+    def refusing_alert_fetch():
+        raise URLError("nws is down")
+
+    monkeypatch.setattr(
+        outdoor.weather_alerts,
+        "make_fetch",
+        lambda url, agent: refusing_alert_fetch,
+    )
+
+    def weather_then_sigterm():
+        os.kill(os.getpid(), signal.SIGTERM)
+        return WEATHER_TEXT
+
+    monkeypatch.setattr(
+        outdoor,
+        "make_fetch",
+        lambda url: (
+            weather_then_sigterm
+            if "air-quality" not in url
+            else (lambda: AIR_QUALITY_TEXT)
+        ),
+    )
+
+    sent = []
+    monkeypatch.setattr(outdoor, "Notifier", lambda **kwargs: _RecordingNotifier(sent))
+
+    outdoor.main()
+
+    assert sent == [], "an NWS outage must not notify about the outdoor poller"
+    conn = outdoor.db.connect(str(tmp_path / "out.db"))
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM outdoor_readings").fetchone()[0] == 1
+        assert "outdoor" not in outdoor.db.get_open_events(conn)
+    finally:
+        conn.close()
+
+
+class _RecordingNotifier:
+    """Minimal Notifier double that records rather than sending."""
+
+    def __init__(self, sent):
+        self.sent = sent
+
+    def send(self, message, title="", priority="default"):
+        self.sent.append((title, message, priority))
+        return True
