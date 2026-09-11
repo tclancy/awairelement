@@ -9,8 +9,8 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, solar, spikes, units, weather_alerts
-from awair.series import bucket
+from awair import db, outdoor, solar, spikes, units, weather_alerts
+from awair.series import bucket, carry_forward
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 
@@ -18,6 +18,18 @@ METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 # Y-axis autoscaled to a peak doesn't visually collapse "still elevated" into
 # "cleared" (#25). Metrics without an entry in spikes.METRICS get no line.
 CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
+
+# Indoor metric cards that carry a second, overlaid series (#109), and the name
+# of the overlay. Rendered onto the card as `data-overlay`, which is the one
+# marker the CSS legend reservation and `dashboard.js` both read -- so a card
+# cannot end up drawing a fifth legend entry it has not reserved room for.
+#
+# Only temp, and only temp can be here: the overlay shares the card's Y axis,
+# which is sound exactly when both series are the same quantity in the same
+# unit. Outdoor humidity onto `humid` would be the other honest candidate; an
+# outdoor temperature onto `co2` would not, and this constant is not the place
+# that would stop it -- see `_outdoor_temp_on_grid`.
+METRIC_OVERLAYS = {"temp": "outdoor-temp"}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.
@@ -226,6 +238,20 @@ _MM_PER_INCH = 25.4
 # precipitation. Conversion at the API boundary (same pattern as precip).
 _HPA_PER_INHG = 33.8639
 
+# How many source publish intervals an outdoor observation stays on the
+# combined temperature chart after the one that should have replaced it never
+# arrived (#109).
+#
+# Two, not one: at exactly one, a single skipped poll punches a hole in the
+# trace, and the poller skips for ordinary reasons -- a restart, a WAN blip --
+# that are not an outage. At two, one missed publish is bridged.
+#
+# The bound exists at all because the alternative is worse than a gap. Held
+# indefinitely, a dead outdoor poller renders as a perfectly flat outdoor line
+# beside a moving indoor one -- on a chart whose question is "does indoor
+# follow outdoor", that is not a missing answer but a wrong one.
+_OUTDOOR_CARRY_INTERVALS = 2
+
 
 def _since_for(spec):
     """Resolve a RANGES/OUTDOOR_RANGES spec to a UTC `since` datetime.
@@ -258,6 +284,54 @@ def _outdoor_range_params():
         abort(400, f"range must be one of {sorted(OUTDOOR_RANGES)}")
     spec = OUTDOOR_RANGES[name]
     return _since_for(spec), spec["bucket_seconds"]
+
+
+def _outdoor_carry_max_age_seconds():
+    """How long one outdoor observation may be held onto the chart grid (#109).
+
+    A function rather than a module constant so the derivation from
+    `outdoor.SOURCE_INTERVAL_SECONDS` is *observable*: bound at import time,
+    `2 * 900` and a literal `1800` are indistinguishable to every test that
+    can be written, and the whole claim being made here is that this number
+    tracks the source cadence rather than restating it. Read per call, a test
+    can move the cadence and watch the window follow -- which is the only way
+    to tell a derivation from a coincidence while the cadence happens to be
+    900 (#109 review).
+
+    `outdoor.SOURCE_INTERVAL_SECONDS` already warns if Open-Meteo stops
+    publishing quarter-hourly; this is what makes that warning actionable
+    here rather than merely logged.
+    """
+    return _OUTDOOR_CARRY_INTERVALS * outdoor.SOURCE_INTERVAL_SECONDS
+
+
+def _outdoor_temp_on_grid(outdoor_rows, grid, unit):
+    """The outdoor temperature trace, in display units, on the indoor x-grid (#109).
+
+    `outdoor_rows` is `db.outdoor_readings_since(conn, ("temp",), ...)` --
+    `[(epoch_seconds, celsius)]` -- and `grid` is `metrics["temp"]["t"]`, the
+    bucket stamps the indoor temperature chart is already drawn against.
+
+    The two series are sampled an order of magnitude apart (a 30 s indoor poll
+    bucketed to 60 s on `today`, against a quarter-hourly outdoor publish), and
+    uPlot takes exactly one x array per chart, so the coarse side is held onto
+    the fine side's stamps by `series.carry_forward`. Not resampled the other
+    way: the indoor trace is the subject of this chart and its detail is the
+    thing worth keeping.
+
+    Converted *before* the carry rather than after, so each observation is
+    converted once rather than once per grid stamp it is held across -- and so
+    the conversion plainly applies to the readings rather than to the drawing.
+
+    NULL temps are not filtered here on purpose: `units.from_celsius` passes
+    None through and `carry_forward` drops it, and that rule -- an empty
+    window is "nothing landed", never a held value and never evidence of
+    freshness -- belongs in one place rather than two.
+    """
+    points = list(outdoor_rows)
+    if unit != "C":
+        points = [(t, units.from_celsius(value, unit)) for t, value in points]
+    return carry_forward(points, grid, _outdoor_carry_max_age_seconds())
 
 
 def _bootstrap_schema(db_path, logger) -> None:
@@ -319,6 +393,7 @@ def create_app(db_path=None):
             temp_unit_symbol=units.symbol(temp_unit()),
             range_labels=RANGE_LABELS,
             default_range=DEFAULT_RANGE,
+            overlays=METRIC_OVERLAYS,
         )
 
     @app.get("/api/series")
@@ -327,6 +402,18 @@ def create_app(db_path=None):
         conn = connect()
         try:
             rows = db.readings_since(conn, METRIC_NAMES, since)
+            # One carry window BEFORE `since`, not `since` (#109 review). The
+            # observation that was current at the left edge was published
+            # before it, so reading from `since` leaves the first grid stamps
+            # with nothing at-or-before them and draws up to one publish
+            # interval of blank on a perfectly healthy poller -- which the
+            # footer promises means an outage. `carry_forward` clips to the
+            # grid, so the extra rows cost one bucket's worth of scan.
+            outdoor_rows = db.outdoor_readings_since(
+                conn,
+                ("temp",),
+                since - timedelta(seconds=_outdoor_carry_max_age_seconds()),
+            )
         finally:
             conn.close()
         unit = temp_unit()
@@ -344,6 +431,14 @@ def create_app(db_path=None):
             {
                 "bucket_seconds": bucket_seconds,
                 "metrics": metrics,
+                # #109. A flat list, not a `{t, avg, min, max}` block, because
+                # its x values ARE `metrics["temp"]["t"]` -- shipping a second
+                # `t` beside it would be the same value published twice with
+                # nothing holding the copies in step, and the browser would
+                # have to reconcile them before it could draw one chart.
+                "outdoor_temp": _outdoor_temp_on_grid(
+                    outdoor_rows, metrics["temp"]["t"], unit
+                ),
                 "temp_unit_symbol": units.symbol(unit),
             }
         )

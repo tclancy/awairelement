@@ -296,11 +296,24 @@ const METRICS = {
     };
   }
 
-  function makePlot(card, metric, series) {
+  function makePlot(card, metric, series, outdoorTemp) {
     const meta = METRICS[metric];
     const color = cssVar(`--series-${metric}`);
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
+
+    // #109: the outdoor temperature trace rides on the indoor temp card.
+    // Dispatched on `data-overlay`, not on `metric === "temp"`, because the
+    // CSS reserves this card's extra legend row from the same attribute — one
+    // marker, so the fifth entry and the space for it cannot disagree.
+    //
+    // The server ships `outdoor_temp` already on `series.t` (see
+    // `web._outdoor_temp_on_grid`): uPlot takes one x array per chart, and the
+    // two sides are sampled an order of magnitude apart. Nothing here
+    // resamples, interpolates or holds anything — that is a decision about
+    // what a stale reading means, and it belongs in Python where it is tested.
+    const overlayOutdoor =
+      card.dataset.overlay === "outdoor-temp" && Array.isArray(outdoorTemp);
 
     // Server stamps the alert ceiling on the card when the metric has one in
     // spikes.METRICS. Missing → no reference line for this chart.
@@ -315,13 +328,49 @@ const METRICS = {
       plugins.push(ceilingLinePlugin(ceiling));
     }
 
-    const data = [series.t, series.min, series.max, series.avg];
+    const data = overlayOutdoor
+      ? [series.t, series.min, series.max, series.avg, outdoorTemp]
+      : [series.t, series.min, series.max, series.avg];
     const axisStyle = {
       stroke: cssVar("--ink-muted"),
       grid: { stroke: cssVar("--grid"), width: 1 },
       ticks: { stroke: cssVar("--axis"), width: 1 },
       font: "11px system-ui, sans-serif",
     };
+    const seriesConfig = [
+      // Year-free hover timestamp: the full default ("2026-07-11 10:50am")
+      // wraps the legend row in a card this narrow, and the row growing to
+      // two lines shifts every chart below it.
+      { value: "{M}/{D} {h}:{mm}{aa}" },
+      { label: "low", stroke: null, points: { show: false } },
+      { label: "high", stroke: null, points: { show: false } },
+      {
+        label: "avg",
+        stroke: color,
+        width: 2,
+        points: { show: false },
+        spanGaps: false,
+      },
+    ];
+    if (overlayOutdoor) {
+      seriesConfig.push({
+        label: OUTDOOR_METRICS.temp.name,
+        stroke: cssVar(OUTDOOR_METRICS.temp.colorVar),
+        width: 1.5,
+        // Deliberately NO `scale:` — this shares the card's y axis, unlike
+        // #42's pressure overlay two functions down. Both lines here are a
+        // temperature in the same unit, and the distance between them is the
+        // answer #109 asked for. Two auto-fitted axes would draw a 1° indoor
+        // drift and a 20° outdoor swing as the same stroke.
+        value: (u, v) => (v == null ? "–" : v.toFixed(meta.digits) + " " + meta.unit),
+        points: { show: false },
+        // The server nulls the trace once the last outdoor observation goes
+        // stale, so a dead outdoor poller has to render as a break. Spanned,
+        // it would render as a flat line instead — a wrong answer, not a
+        // missing one.
+        spanGaps: false,
+      });
+    }
 
     const plot = new uPlot(
       {
@@ -331,21 +380,7 @@ const METRICS = {
         legend: { live: true },
         scales: { x: { time: true } },
         bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
-        series: [
-          // Year-free hover timestamp: the full default ("2026-07-11 10:50am")
-          // wraps the legend row in a card this narrow, and the row growing to
-          // two lines shifts every chart below it.
-          { value: "{M}/{D} {h}:{mm}{aa}" },
-          { label: "low", stroke: null, points: { show: false } },
-          { label: "high", stroke: null, points: { show: false } },
-          {
-            label: "avg",
-            stroke: color,
-            width: 2,
-            points: { show: false },
-            spanGaps: false,
-          },
-        ],
+        series: seriesConfig,
         axes: [
           { ...axisStyle },
           { ...axisStyle, size: 52 },
@@ -362,8 +397,16 @@ const METRICS = {
     card.querySelector(".unit").textContent = meta.unit;
     card.querySelector(".dot").style.background = color;
     const latest = [...series.avg].reverse().find((v) => v != null);
-    card.querySelector(".now").textContent =
-      fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    let nowText = fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    if (overlayOutdoor) {
+      const latestOutdoor = [...outdoorTemp].reverse().find((v) => v != null);
+      // Prefixed rather than bare: two numbers in the same unit side by side
+      // is exactly the header that reads as a range.
+      nowText +=
+        " · out " + fmt(latestOutdoor, meta.digits) +
+        (meta.unit ? " " + meta.unit : "");
+    }
+    card.querySelector(".now").textContent = nowText;
   }
 
   function renderEvents() {
@@ -442,8 +485,12 @@ const METRICS = {
     // the storm-signal glance: rain accumulation + pressure trace + trend
     // arrow. The pressure series is min-per-bucket (the trough matters more
     // than the average for a front-moving-in signal).
+    // `data-overlay`, not the metric name: the CSS reserves this card's third
+    // legend row from the same attribute (#109), so a card that loses the
+    // marker loses the fifth entry and the space for it together rather than
+    // drawing one into a box sized for four.
     const overlayPressure =
-      metric === "precipitation" && allMetrics && allMetrics.pressure;
+      card.dataset.overlay === "pressure" && allMetrics && allMetrics.pressure;
     const pressureSeries = overlayPressure ? allMetrics.pressure : null;
     const pressureColor = overlayPressure
       ? cssVar(OUTDOOR_METRICS.pressure.colorVar)
@@ -539,7 +586,12 @@ const METRICS = {
     state.plots = [];
     for (const card of document.querySelectorAll(".card[data-metric]")) {
       const metric = card.dataset.metric;
-      makePlot(card, metric, seriesPayload.metrics[metric]);
+      makePlot(
+        card,
+        metric,
+        seriesPayload.metrics[metric],
+        seriesPayload.outdoor_temp
+      );
     }
     for (const card of document.querySelectorAll(".card[data-outdoor]")) {
       const metric = card.dataset.outdoor;

@@ -104,6 +104,21 @@ ingestion, so a wrong URL or 401 just gets logged.)
   score over today, 7d or 30d, opening on today (#108). "Today" is since local
   midnight, not the last 24 h. Detected events overlay as shaded spans.
   LAN-only by default (no auth).
+- **One temperature chart, indoors and out** (#109) — the outdoor trace is
+  drawn on the indoor temp card rather than on a card of its own, **sharing its
+  Y axis**: both are a temperature in the same unit, and the distance between
+  the lines is the thing the chart is for. A second auto-fitted axis would draw
+  a 1° indoor drift and a 20° outdoor swing as the same stroke. The two sides
+  are sampled an order of magnitude apart (30 s indoor, quarter-hourly
+  outdoor), so `/api/series` **carry-forward**s the outdoor observations onto
+  the indoor bucket grid — held, because the last published value is what an
+  outdoor reading means between publishes, and nulled once it is more than two
+  publish intervals old so a dead outdoor poller reads as a gap rather than as
+  a flat line. One missed publish is always bridged; how many further misses
+  it takes to open a gap depends on where the grid stamps fall (see
+  **carry-forward** in `GLOSSARY.md`). *Assumption, since #109 did not say:* combining them replaces
+  the standalone outdoor temp card. `/api/outdoor-series` still publishes
+  `temp` at outdoor cadence and is unchanged; the page no longer draws it.
 - **`GET /api/latest`** — the newest reading plus every open event, as
   read-only JSON, for the house hub to poll (#70). awairelement stays the
   system of record; the hub stores nothing and derives its own card colour

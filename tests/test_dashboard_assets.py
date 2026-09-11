@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers import strip_js_comments
+
 REPO = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML = REPO / "templates" / "dashboard.html"
 DASHBOARD_JS = REPO / "static" / "dashboard.js"
@@ -119,16 +121,60 @@ def test_legend_reserves_a_fixed_height_and_clips(html):
     )
 
 
-def test_the_five_entry_outdoor_card_reserves_an_extra_row(html):
-    """The precipitation card carries #42's pressure overlay as a 5th entry.
+def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
+    """An overlay card carries a 5th legend entry — #42's pressure, #109's outdoor.
 
     Measured at 375px and 390px it wraps to three rows where every other card
     needs two, so without its own reservation `overflow: hidden` clips the
-    pressure reading away entirely — on the phone #87 exists to serve.
+    fifth reading away entirely — on the phone #87 exists to serve.
+
+    Asserted on the *attribute* selector rather than on either card's name.
+    The rule shipped for #42 named `[data-outdoor="precipitation"]`, and the
+    day #109 put an overlay on the indoor temp card that selector went stale
+    silently: the new card drew its fifth entry into a two-row box and clipped
+    it, with nothing failing. A selector keyed on the marker covers the next
+    one without an edit.
     """
-    body = _rule_body(html, '.card[data-outdoor="precipitation"] .u-legend')
-    assert body is not None, "precipitation card has no legend-height override"
+    body = _rule_body(html, ".card[data-overlay] .u-legend")
+    assert body is not None, (
+        "no legend-height override keyed on `data-overlay` — a per-card "
+        "selector goes stale the moment another card grows an overlay"
+    )
     assert re.search(r"--legend-rows:\s*3\s*;", body)
+    assert not re.search(r'\.card\[data-outdoor="[a-z]+"\]\s*\.u-legend', html), (
+        "a legend reservation is still keyed to one named card; key it on "
+        "`[data-overlay]` so every overlay card is covered"
+    )
+
+
+def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
+    """#109's outdoor trace must NOT get a scale of its own.
+
+    Both series are a temperature in the same unit, and the gap between them IS
+    the thing the chart was asked for — "how outdoor affects indoor". Give the
+    outdoor line its own auto-fitted axis and the two are drawn to different
+    rulers: a 1° indoor drift and a 20° outdoor swing become the same stroke on
+    screen, and a reader cannot tell a well-insulated house from a leaky one.
+
+    This is a real temptation rather than a hypothetical, because the pattern
+    beside it does exactly that on purpose — #42 puts pressure on `scale:
+    "pressure"` with a fixed range, correctly, since inHg and inches of rain
+    are different quantities. Copying that line onto a second temperature is
+    the likeliest way this regresses.
+    """
+    match = re.search(
+        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
+        js_code,
+        re.S,
+    )
+    assert match, (
+        "no outdoor series pushed with `label: OUTDOOR_METRICS.temp.name` — "
+        "if the overlay moved, this guard has to move with it"
+    )
+    assert not re.search(r"\bscale\s*:", match.group(0)), (
+        "the outdoor temperature series declares its own `scale:`, so the two "
+        "temperatures are drawn against different rulers (#109)"
+    )
 
 
 def test_plot_container_clips_its_contents(html):
@@ -222,127 +268,15 @@ def test_touch_reads_are_clamped_to_the_plot_area(js):
     assert "top: clamp(" in args, "top is passed to setCursor unclamped"
 
 
-def _strip_js_comments(source):
-    """`source` with `//` and `/* */` comments removed, string literals intact.
-
-    The sync guards below assert on the *absence* of a construct, and an
-    absence assertion over raw text has the failure mode the wrong way round:
-    a developer who disables a line by commenting it out leaves the text in
-    place, so the guard fires on a file that is now correct. A gate that
-    cannot go green on correct code gets deleted, which is strictly worse than
-    one that cannot go red.
-
-    Quote-awareness is not decoration: `"http://x"` contains `//`, and a naive
-    line-comment strip would silently truncate the string and every construct
-    after it on that line. dashboard.js has no such URL today — this keeps the
-    stripper from becoming a trap for the edit that adds one.
-
-    Regex literals are handled for the same reason: `/it's/` would otherwise
-    open a string that never closes, and `/\\/\\//` would read as a line
-    comment. dashboard.js has no regex today, so this is entirely about the
-    one-line future edit that adds one. `/` is disambiguated from division by
-    the preceding significant token — the standard heuristic, and ample for a
-    hand-written file. The unterminated-quote check at the end is the backstop
-    for whatever the heuristic still gets wrong: it converts a silent
-    mis-parse into an error that names its own cause, rather than letting the
-    guards below go red citing the wrong one.
-    """
-    # A `/` starts a regex literal unless the previous significant token could
-    # end a value, in which case it is division. `)` and `}` are genuinely
-    # ambiguous in JS; treating them as value-enders is the conventional call
-    # and is right for every form this file plausibly grows.
-    value_enders = ")]}"
-    keywords = (
-        "return",
-        "typeof",
-        "case",
-        "in",
-        "of",
-        "new",
-        "delete",
-        "void",
-        "instanceof",
-        "do",
-        "else",
-        "yield",
-        "await",
-    )
-
-    keyword_tail = re.compile(rf"\b(?:{'|'.join(keywords)})$")
-
-    def starts_regex(prev):
-        if prev is None or not (prev.isalnum() or prev in value_enders + "_$"):
-            return True
-        return bool(keyword_tail.search("".join(out)))
-
-    out = []
-    i, n = 0, len(source)
-    quote = None
-    prev_significant = None
-    while i < n:
-        char = source[i]
-        if quote:
-            out.append(char)
-            if char == "\\" and i + 1 < n:
-                out.append(source[i + 1])
-                i += 2
-                continue
-            if char == quote:
-                quote = None
-            i += 1
-        elif char in "\"'`":
-            quote = char
-            prev_significant = char
-            out.append(char)
-            i += 1
-        elif source.startswith("//", i):
-            while i < n and source[i] != "\n":
-                i += 1
-        elif source.startswith("/*", i):
-            end = source.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-        elif char == "/" and starts_regex(prev_significant):
-            # Consume to the closing `/`. Inside a `[...]` class, `/` is literal.
-            out.append(char)
-            i += 1
-            in_class = False
-            while i < n and source[i] != "\n":
-                c = source[i]
-                out.append(c)
-                i += 1
-                if c == "\\" and i < n:
-                    out.append(source[i])
-                    i += 1
-                elif c == "[":
-                    in_class = True
-                elif c == "]":
-                    in_class = False
-                elif c == "/" and not in_class:
-                    break
-            prev_significant = "/"
-        else:
-            out.append(char)
-            if not char.isspace():
-                prev_significant = char
-            i += 1
-    assert quote is None, (
-        f"comment stripper ended inside an unterminated {quote!r} string — "
-        "dashboard.js has most likely gained a regex literal, which this "
-        "helper cannot parse. Nothing was stripped, so the sync guards below "
-        "would fail citing the wrong cause. See `_strip_js_comments` (#90)."
-    )
-    return "".join(out)
-
-
 @pytest.fixture(scope="module")
 def js_code(js):
-    """dashboard.js with comments stripped — see `_strip_js_comments`."""
-    return _strip_js_comments(js)
+    """dashboard.js with comments stripped — see `strip_js_comments`."""
+    return strip_js_comments(js)
 
 
 def test_the_comment_stripper_keeps_strings_and_drops_comments():
     """The helper the two sync guards rest on, checked against its own traps."""
-    stripped = _strip_js_comments(
+    stripped = strip_js_comments(
         'const u = "http://x//y";\n'
         "sync.sub(a); // sync.sub(b)\n"
         "/* sync.sub(c)\n   sync.sub(d) */\n"
@@ -491,3 +425,65 @@ def test_the_template_presses_a_range_button_by_derivation_not_by_hand(html):
         "accept (#108)"
     )
     assert "range_labels" in markup and "default_range" in markup
+
+
+def test_the_overlay_trace_breaks_rather_than_spanning_a_stale_gap(js_code):
+    """`spanGaps: false` on the outdoor series, and the reason is not cosmetic.
+
+    `web._outdoor_temp_on_grid` nulls the trace once the last outdoor
+    observation is older than `_OUTDOOR_CARRY_MAX_AGE_SECONDS`, so a dead
+    outdoor poller arrives at the browser as a run of nulls. Spanned, uPlot
+    joins the two live ends into one straight line across the outage — and a
+    flat outdoor trace beside a moving indoor one reads as "the weather held
+    steady", which is the single most misleading thing this chart can say.
+
+    uPlot's default is `spanGaps: false`, so this asserts the key is present
+    and false rather than merely absent: an explicit `true` is the regression,
+    and "absent" and "present and false" are different edits to review.
+    """
+    match = re.search(
+        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
+        js_code,
+        re.S,
+    )
+    assert match, "the outdoor temperature series is no longer pushed here"
+    assert re.search(r"spanGaps:\s*false", match.group(0)), (
+        "the outdoor trace spans its gaps, so an outdoor-poller outage draws "
+        "as a flat line across the outage instead of a break (#109)"
+    )
+
+
+def test_the_overlay_series_is_actually_given_a_data_column(js_code):
+    """A 5th series config with no 5th data array is a blank chart, not a bug report.
+
+    uPlot indexes `data` by series position, so the config and the data array
+    have to grow together. They are built in two separate places here — the
+    ternary on `data` and the `push` onto `seriesConfig` — under one flag, and
+    editing one without the other is the realistic slip. Neither structural
+    guard above can see it: both read the series config alone.
+    """
+    match = re.search(
+        r"const data = overlayOutdoor\s*\?\s*\[(.*?)\]\s*:\s*\[(.*?)\]", js_code, re.S
+    )
+    assert match, "no `overlayOutdoor` branch building the temp card's data array"
+    columns = [
+        [part.strip() for part in group.split(",") if part.strip()]
+        for group in match.groups()
+    ]
+    with_overlay, without = columns
+    # ORDER, not membership. uPlot maps `data[i]` to `series[i]`, so
+    # `[series.t, outdoorTemp, series.min, series.max, series.avg]` contains
+    # every column, differs by exactly one comma, and silently makes the
+    # outdoor trace the hidden `low` band while the real average is drawn as
+    # the overlay — every number on the card wrong, nothing red. A membership
+    # assertion cannot see that, and it was the mutant this test missed on
+    # its first draft (#109 review).
+    assert without == ["series.t", "series.min", "series.max", "series.avg"], (
+        f"the non-overlay data columns changed shape: {without}"
+    )
+    assert with_overlay == [*without, "outdoorTemp"], (
+        "the overlay branch must be the base columns with `outdoorTemp` "
+        f"appended, in that order — got {with_overlay}. The pushed series is "
+        "appended to `seriesConfig` last, so its data column has to be last "
+        "too, or uPlot pairs every series with the wrong array."
+    )

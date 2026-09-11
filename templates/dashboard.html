@@ -113,12 +113,20 @@ main {
   height: calc(var(--legend-rows) * var(--legend-row-height));
   overflow: hidden;
 }
-/* The precipitation card carries a fifth entry — #42's pressure overlay — and
-   at phone widths that wraps to three rows where every other card needs two.
-   Reserved per-card rather than raising the floor everywhere: two rows is the
-   honest reservation for the other seven, and the point of reserving at all is
-   that the height never changes, not that every card matches. */
-.card[data-outdoor="precipitation"] .u-legend { --legend-rows: 3; }
+/* A card carrying an overlay series has a fifth legend entry — #42's pressure
+   trace on precipitation, #109's outdoor trace on temp — and at phone widths
+   that wraps to three rows where every other card needs two. Reserved per-card
+   rather than raising the floor everywhere: two rows is the honest reservation
+   for the others, and the point of reserving at all is that the height never
+   changes, not that every card matches.
+
+   Keyed on `data-overlay`, which is the SAME attribute `dashboard.js` reads to
+   decide whether to draw the overlay at all. One marker, two consumers: a card
+   that loses it loses the fifth entry and its reservation together, rather
+   than keeping the entry and silently clipping it. Naming the two cards here
+   instead is what let #42's selector go stale the moment a second card grew an
+   overlay. */
+.card[data-overlay] .u-legend { --legend-rows: 3; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
@@ -161,16 +169,12 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
 </header>
 <main id="charts">
   {% for metric in metrics %}
-  <section class="card" data-metric="{{ metric }}"{% if metric in ceilings %} data-ceiling="{{ ceilings[metric] }}"{% endif %}>
+  <section class="card" data-metric="{{ metric }}"{% if metric in ceilings %} data-ceiling="{{ ceilings[metric] }}"{% endif %}{% if metric in overlays %} data-overlay="{{ overlays[metric] }}"{% endif %}>
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
   </section>
   {% endfor %}
-  <section class="card" data-outdoor="temp">
-    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
-    <div class="plot"></div>
-  </section>
-  <section class="card" data-outdoor="precipitation">
+  <section class="card" data-outdoor="precipitation" data-overlay="pressure">
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
   </section>
@@ -182,7 +186,10 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
 <footer>
   Times shown in your local timezone. Shaded spans are alert events (band shows
   each bucket's low–high range; line is the average). Data: 30-second polls from
-  the Awair Element local API.
+  the Awair Element local API. The Temp card also carries the outdoor
+  temperature on the same axis, from quarter-hourly Open-Meteo readings held
+  between publishes — a break in that line is an outdoor-poller gap, not a
+  weather event.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
