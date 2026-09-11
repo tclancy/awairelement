@@ -91,6 +91,16 @@ CREATE TABLE IF NOT EXISTS fan_state (
     run_started_at TEXT,
     capped INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS fan_events (
+    id INTEGER PRIMARY KEY,
+    at TEXT NOT NULL,
+    fan_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('off', 'speed1', 'speed2', 'speed3')),
+    reason TEXT NOT NULL,
+    ok INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fan_events_at ON fan_events (at);
 """
 # Concatenated rather than interpolated: `str.format` and f-strings both treat
 # `{` as a placeholder, and SQL is full of braceable syntax (a future CHECK or a
@@ -891,3 +901,91 @@ def set_fan_run(conn, fan_id: int, started_at, capped: bool) -> None:
         ),
     )
     conn.commit()
+
+
+def record_fan_event(conn, at, fan_id: int, action: str, reason: str, ok: bool) -> None:
+    """Append one actuation attempt to the durable fan history (#84).
+
+    `fan_state` holds *now* — two rows, overwritten in place — so the only
+    queryable fan data in this database was a snapshot. ADR-002's 0.62% duty
+    cycle is a replay of the shipped rules over recorded co2, and the ADR asks
+    for a re-measurement after the first cold month; without history that
+    re-measurement is another replay against the same rules, which can only
+    report what the rules would do. This table is what makes it an observation.
+
+    One row per *attempt*, written from `_command_fan` after the actuation
+    resolves, so the four divergences a replay cannot model land differently
+    and legibly:
+
+    * **A refused command** is a row with `ok = 0`. Nothing else records it --
+      `upsert_fan_state` deliberately keeps the *old* `last_action` on a failed
+      actuate, so the state table's honest answer is indistinguishable from a
+      poll that never asked for anything.
+    * **A rate-limited command** is the *absence* of a row, because `decide`
+      returned None and no command reached the fan. Not the same thing as
+      `ok = 0`, and the difference matters to anyone counting actuations.
+    * **A pm25 veto** and **a capped run** are both `action = "off"`, separated
+      only by `reason`, which is stored verbatim for exactly that reason.
+    * **Poller downtime** is a gap between rows, which a replay treats as time
+      the rules were running.
+
+    Not wrapped in a `try`, and **every caller must write `fan_state` first**
+    for that to be safe. The reasoning is that a failure here is one
+    `upsert_fan_state` has already hit a line earlier -- the same connection,
+    the same commit path, and a CHECK constraint whose domain is a copy of
+    `fan_state.last_action`'s -- so swallowing would buy no availability the
+    caller does not already lack, and would hide a broken database from a
+    poller whose loop deliberately has no `except` of its own. Called *before*
+    the state write, that reasoning is simply false, and an observability write
+    can then strand a physically-running fan; see `fans.run_fan_test`.
+
+    No pruning. The issue's ~28 rows per eight weeks is the steady state and is
+    right; the bound is higher, and it has two different shapes because the
+    pm25 safety-off bypasses the rate limit:
+
+    * **Drive path, dead NodeMCU, co2 high.** `last_action` keeps its old value
+      on a failed actuate, so the command is re-issued once per `RATE_LIMIT`
+      forever: 2,880 rows/day across two fans.
+    * **pm25 suppressor, dead NodeMCU, fans believed on.** `decide` bypasses
+      the rate limit for a safety-off, so this is once per *poll*: 5,760
+      rows/day at the 30 s cadence.
+
+    Under 20 MB a month at the worse of those, so the no-pruning conclusion
+    holds -- but the growth driver is hardware failure, not air quality, and a
+    consumer counting vetoes or actuations **must collapse contiguous runs of
+    `ok = 0` rows carrying the same reason**. A single pm25 veto against a dead
+    NodeMCU writes thousands of identical rows, and the naive
+    `COUNT(*) WHERE reason LIKE 'pm25 %'` is exactly the query this table was
+    built to make possible.
+    """
+    conn.execute(
+        "INSERT INTO fan_events (at, fan_id, action, reason, ok)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (at.isoformat(), fan_id, action, reason, int(ok)),
+    )
+    conn.commit()
+
+
+def fan_events_since(conn, since) -> list:
+    """Fan actuation attempts at or after `since`, oldest first.
+
+    Ordered by `(at, id)`, not `at` alone: `check_fans` commands every fan from
+    one `now`, so ties are the normal case rather than an edge, and insertion
+    order is the only thing that separates fan 1's command from fan 2's.
+    """
+    rows = conn.execute(
+        "SELECT id, at, fan_id, action, reason, ok FROM fan_events"
+        " WHERE at >= ? ORDER BY at, id",
+        (since.isoformat(),),
+    )
+    return [
+        {
+            "id": row_id,
+            "at": datetime.fromisoformat(at),
+            "fan_id": fan_id,
+            "action": action,
+            "reason": reason,
+            "ok": bool(ok),
+        }
+        for row_id, at, fan_id, action, reason, ok in rows
+    ]
