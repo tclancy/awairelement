@@ -146,9 +146,9 @@ ingestion, so a wrong URL or 401 just gets logged.)
   read that as *"no current AQI"* (yellow) rather than folding an undateable
   number into a green.
 
-  Four units are named in the payload — `temp_unit`, `pressure_unit`,
-  `wind_speed_unit`, `precipitation_unit` — and they are the four somebody
-  converts. #71's own motivating card reads `62°F, 8 mph, 0.00 in`, so the hub
+  Five units are named in the payload — `temp_unit`, `pressure_unit`,
+  `wind_speed_unit`, `precipitation_unit` and `snowfall_unit` — and they are
+  the five somebody converts. #71's own motivating card reads `62°F, 8 mph, 0.00 in`, so the hub
   turns Celsius into F, km/h into mph and mm into inches; and this app
   separately turns hPa into inHg at the `/api/outdoor-series` boundary and
   Celsius into F at every browser-facing one. Each of those is a silent
@@ -161,6 +161,16 @@ ingestion, so a wrong URL or 401 just gets logged.)
   contract converts them — so naming them would be documentation rather than
   disambiguation, and this paragraph is that documentation.
 
+  `snowfall` is snow depth in **cm** (#79), and it is a separate field rather
+  than something derived from `precipitation` because it cannot be: that one is
+  the water equivalent in mm and the depth-to-water ratio moves with the snow's
+  density. `snowfall_unit` is `cm` where `precipitation_unit` is `mm`, on
+  purpose — one shared label would be a silent 10x on the one number whose
+  threshold is *"more than 4 inches of snow"*. A NULL `snowfall` means
+  **unknown**, not "it is not snowing": rows predating #79 never asked for the
+  field, and the migration adds the column with no DEFAULT precisely so a
+  fabricated zero cannot read as an all-clear.
+
   `weather_code` is the WMO interpretation code as the **integer** the source
   published. The code→word mapping is the hub's, for the same reason
   `/api/latest` ships open events rather than a card colour: awairelement is
@@ -170,6 +180,71 @@ ingestion, so a wrong URL or 401 just gets logged.)
   `aq_ts` exists to prevent. **Expect NULLs for the first quarter-hour after
   deploy**, until the outdoor poller writes its first post-migration row. That
   is correct behaviour and it will look like a bug to whoever is watching.
+
+- **`GET /api/outdoor-today`** — today's outdoor totals and extremes, in
+  source units, over the **local-midnight** window (#79). The machine-facing
+  day aggregate: `precipitation_total`, `snowfall_total`, `temp_min`,
+  `temp_max`, `wind_speed_max`, `us_aqi_min`, `us_aqi_max`, plus the window's
+  `start`/`end`.
+
+  `/api/outdoor-series?range=today` looks like the answer and is not, for two
+  independent reasons. It converts to display units — inches, inHg, °F — which
+  is the silent multiply `/api/outdoor-latest` exists to avoid; and
+  `series.bucket` emits `avg`/`min`/`max` with no sum at all. There is a trap
+  worth naming, because a consumer who tries it anyway **finds that it works**:
+  at `range=today` the bucket is 900 s and so is the source cadence, so each
+  bucket holds exactly one point and `avg` equals the raw value. Summing `avg`
+  therefore produces the right rain total today, by coincidence, and would
+  start under-reporting silently the moment either number changed.
+
+  `row_count` and `contributing_rows` are both published and they are **not the
+  same number**. `row_count` is rows in the window, and it separates "no rain
+  today" from "the poller has been down since 03:00" — a day total over three
+  rows is not a day total, and without it the hub renders a confident zero.
+  `contributing_rows` is per source column, because a column can be NULL on a
+  row that exists: every row written before the `snowfall` migration is exactly
+  that, so for one day after deploy `snowfall_total` is a real sum over a
+  strict subset of the day. A field with no contributing values at all is
+  `null`, never `0`.
+
+  Summing rows is sound only because Open-Meteo's `current.precipitation` and
+  `current.snowfall` are backward-looking sums over the block's own `interval`
+  — 900 s, equal to the publish cadence — and `ts` is the primary key, so a
+  re-poll cannot double-count a window. `outdoor.SOURCE_INTERVAL_SECONDS`
+  carries that assumption and the poller logs a warning if the source ever
+  stops matching it; at `interval: 3600` these totals would over-report by
+  about 4x with every individual value still correct.
+
+- **`GET /api/weather-alerts`** — active National Weather Service alerts for
+  the parcel (#79). Tornado and hurricane warnings are two of the three
+  conditions the hub paints its card red for and neither has an Open-Meteo
+  equivalent, so the outdoor poller fetches
+  `api.weather.gov/alerts/active?point=<lat>,<lon>` on its existing 15-minute
+  timer. No API key and no account; NWS asks only that the client identify
+  itself, which `AWAIR_NWS_USER_AGENT` does.
+
+  It lives here rather than in the hub because this app already polls the WAN
+  against `AWAIR_LAT`/`AWAIR_LON` and already owns "outdoor conditions"; the
+  hub is a viewport with no producer and no WAN reach by design, so alerts
+  landing here means it needs no new process, systemd unit or Ansible role.
+
+  **`alerts` is `null` until a poll has succeeded.** An empty list means "we
+  asked NWS and it said none"; `null` means "we have never had an answer".
+  That distinction is the endpoint's whole reason for existing — a failed poll
+  rendering as an all-clear is the one direction in which a missing number
+  becomes a false statement about a tornado. Both clocks ship beside it:
+  `last_attempt_at` says the poller is alive and trying, `last_success_at` is
+  what an all-clear has to be measured against, and the two diverging is
+  exactly a sustained outage. Nothing is ever deleted, so a transient NWS
+  failure keeps publishing the last known set rather than emptying it, and one
+  unreadable feature fails the **whole** poll rather than storing the readable
+  remainder under a successful clock. Severity ranking is the consumer's, for
+  the same reason card colour and the WMO code→word mapping are.
+
+  The endpoint is `/api/weather-alerts` rather than `/api/alerts`: `awair.alerts`
+  is this app's ntfy notifier and `alert_events` is its own spike bookkeeping,
+  both a year older, and `/api/alerts` beside `/api/latest`'s `open_events`
+  would read as those.
 
 ## Running as a systemd user service
 

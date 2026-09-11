@@ -219,42 +219,53 @@ def test_schema_column_order_matches_a_migrated_database():
     Built by actually running both paths rather than by parsing the SQL, so it
     fails if `_migrate` changes too, not only if SCHEMA does.
 
-    **Scoped to the two columns #71 added, and it cannot grow itself.** The
-    "old" DB is derived from the current SCHEMA by dropping exactly those two,
-    so a *future* column added to SCHEMA with no matching `_migrate` ALTER
-    appears on both sides and survives this test -- measured, not assumed. The
-    `fresh_order[-2:]` assertion below catches the ordering half of that
-    (a new column appended after `aq_ts` fails here), but the missing-ALTER half
-    needs the drop list to track `_migrate`. Add the column to both lists when
-    you add the ALTER.
+    **The drop list is derived, not retyped** (#79). It used to be two
+    hand-written `DROP COLUMN` statements, and this docstring warned that a new
+    column had to be added to both the test and `_migrate`; the first person to
+    add one (`snowfall`) walked into it and got this failure rather than a
+    passing test, which is the good direction but is still work nobody needed
+    to do. Both sides now read `db.OUTDOOR_MIGRATED_COLUMNS`, so the fixture
+    tracks the migration by construction.
+
+    What that does *not* buy: a column added to SCHEMA with no entry in
+    `OUTDOOR_MIGRATED_COLUMNS` and no ALTER appears on both sides and still
+    survives -- measured, not assumed. The last assertion below is what catches
+    it, by pinning SCHEMA's trailing columns to the migrated list rather than
+    to a literal.
     """
     import sqlite3
+
+    added = [column_def.split()[0] for column_def in db.OUTDOOR_MIGRATED_COLUMNS]
+    assert added, "no migrated outdoor columns: this test would be vacuous"
 
     fresh = sqlite3.connect(":memory:")
     fresh.executescript(db.SCHEMA)
 
-    # An install predating #71, derived from SCHEMA rather than hand-written:
-    # create the current table, then drop the two columns #71 added. DROP COLUMN
-    # preserves the order of the survivors, so this is exactly the shape a
-    # pre-#71 CREATE TABLE left behind -- and it cannot drift out of date the
-    # way a pasted copy of the old DDL would.
+    # An install predating every one of those migrations, derived from the
+    # current SCHEMA rather than hand-written: create the current table, then
+    # drop the migrated columns. DROP COLUMN preserves the order of the
+    # survivors, so this is exactly the shape the older CREATE TABLE left
+    # behind -- and it cannot drift the way a pasted copy of the old DDL would.
     migrated = sqlite3.connect(":memory:")
     migrated.executescript(db.SCHEMA)
-    migrated.execute("ALTER TABLE outdoor_readings DROP COLUMN weather_code")
-    migrated.execute("ALTER TABLE outdoor_readings DROP COLUMN aq_ts")
+    for name in added:
+        migrated.execute(f"ALTER TABLE outdoor_readings DROP COLUMN {name}")
     before = _column_order(migrated, "outdoor_readings")
-    assert "weather_code" not in before, "fixture no longer models a pre-#71 DB"
-    assert "aq_ts" not in before, "fixture no longer models a pre-#71 DB"
+    for name in added:
+        assert name not in before, f"fixture no longer models a pre-{name} DB"
 
     db._migrate(migrated)
 
     fresh_order = _column_order(fresh, "outdoor_readings")
     migrated_order = _column_order(migrated, "outdoor_readings")
-    assert "weather_code" in migrated_order, "the migration under test did not run"
+    for name in added:
+        assert name in migrated_order, f"the migration did not add {name}"
     assert fresh_order == migrated_order
     # The property that makes the two orders agree, named so a future column
     # lands in the right place rather than merely keeping this test green.
-    assert fresh_order[-2:] == ["weather_code", "aq_ts"]
+    # Compared against the migrated list, which is what makes a SCHEMA-only
+    # addition fail here instead of passing on both sides.
+    assert fresh_order[-len(added) :] == added
 
     fresh.close()
     migrated.close()
@@ -666,6 +677,13 @@ def test_a_migration_that_begins_in_a_transaction_does_not_raise(tmp_path):
     legacy.close()
 
     conn = sqlite3.connect(path)
+    # This test drives the rebuild directly rather than through `_migrate`, so
+    # the ALTERs that normally precede it have to be issued here -- the rebuild
+    # copies every column in `OUTDOOR_COLUMNS` and fails on "no such column"
+    # without them. `_add_column` commits, which is why it runs *before* the
+    # UPDATE that opens the transaction under test rather than after it.
+    for column_def in db.OUTDOOR_MIGRATED_COLUMNS:
+        db._add_column(conn, "outdoor_readings", column_def)
     conn.execute(
         "UPDATE outdoor_readings SET temp = 20.0 WHERE ts = '2026-07-01T00:00:00+00:00'"
     )
@@ -720,3 +738,133 @@ def test_a_large_unkeyed_drop_is_capped_and_says_how_many_it_left_out(tmp_path, 
     assert caplog.text.count("dropped unkeyed row") == db._UNKEYED_LOG_CAP
     assert f"{db._UNKEYED_LOG_CAP + 5} unkeyed row(s)" in caplog.text
     assert "5 further unkeyed row(s) not logged" in caplog.text
+
+
+# --- the day aggregate behind /api/outdoor-today (#79) ----------------------
+
+
+def _day(conn, *hours, **values):
+    """Insert one row per `hours` entry on 2026-07-12, all carrying `values`."""
+    for hour in hours:
+        db.insert_outdoor_reading(conn, _row(ts=f"2026-07-12T{hour}", **values))
+
+
+def test_the_day_aggregate_sums_rather_than_averages(conn):
+    """The defect this endpoint exists for.
+
+    `/api/outdoor-series?range=today` emits avg/min/max and no sum, and at that
+    range each 900 s bucket holds exactly one 900 s sample -- so summing `avg`
+    gives the right answer today, by coincidence, and starts under-reporting
+    the moment either number changes. 0.4 + 0.4 + 0.4 is 1.2, not 0.4.
+    """
+    _day(conn, "04:00", "04:15", "04:30", precipitation=0.4, snowfall=0.5)
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["values"]["precipitation_total"] == pytest.approx(1.2)
+    assert aggregate["values"]["snowfall_total"] == pytest.approx(1.5)
+    assert aggregate["row_count"] == 3
+
+
+def test_the_day_aggregate_reports_extremes_not_means(conn):
+    db.insert_outdoor_reading(
+        conn, _row(ts="2026-07-12T04:00", temp=18.0, wind_speed=3.0, us_aqi=20)
+    )
+    db.insert_outdoor_reading(
+        conn, _row(ts="2026-07-12T04:15", temp=26.0, wind_speed=11.5, us_aqi=64)
+    )
+    values = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))[
+        "values"
+    ]
+    assert values["temp_min"] == 18.0
+    assert values["temp_max"] == 26.0
+    assert values["wind_speed_max"] == 11.5
+    assert values["us_aqi_min"] == 20
+    assert values["us_aqi_max"] == 64
+
+
+def test_an_empty_window_is_zero_rows_and_no_values_rather_than_zeroes(conn):
+    """ "No rain today" and "the poller has been down since 03:00" are different
+    answers, and a consumer with only a `0.0` renders a confident zero."""
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["row_count"] == 0
+    assert set(aggregate["values"].values()) == {None}
+    assert set(aggregate["contributing_rows"].values()) == {0}
+
+
+def test_a_column_that_is_null_on_every_row_totals_to_none_not_zero(conn):
+    """The `snowfall` migration boundary, which is a real state on deploy day.
+
+    Rows exist, so `row_count` is 3; none of them knows whether it was snowing,
+    so the total is unknown. Coalescing that to `0.0` would publish a
+    fabricated all-clear on the input whose red rule is "more than 4 inches".
+    """
+    _day(conn, "04:00", "04:15", "04:30", precipitation=0.2)
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["row_count"] == 3
+    assert aggregate["values"]["snowfall_total"] is None
+    assert aggregate["values"]["precipitation_total"] == pytest.approx(0.6)
+
+
+def test_contributing_rows_exposes_a_partial_column(conn):
+    """`row_count` alone cannot see this, which is why both are published.
+
+    Three rows in the window, one of them predating the snowfall migration: the
+    snow total is a real sum over a strict subset, and nothing but a per-column
+    count can tell that from a complete one.
+    """
+    db.insert_outdoor_reading(conn, _row(ts="2026-07-12T04:00", precipitation=0.1))
+    _day(conn, "04:15", "04:30", precipitation=0.1, snowfall=1.0)
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["row_count"] == 3
+    assert aggregate["contributing_rows"]["precipitation"] == 3
+    assert aggregate["contributing_rows"]["snowfall"] == 2
+    assert aggregate["values"]["snowfall_total"] == pytest.approx(2.0)
+
+
+def test_the_day_aggregate_excludes_rows_before_the_window(conn):
+    db.insert_outdoor_reading(conn, _row(ts="2026-07-11T23:45", precipitation=9.0))
+    _day(conn, "00:15", precipitation=0.5)
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["row_count"] == 1
+    assert aggregate["values"]["precipitation_total"] == pytest.approx(0.5)
+
+
+def test_a_re_polled_window_cannot_be_counted_twice(conn):
+    """What makes summing rows sound at all.
+
+    Each row is a backward-looking sum over its own 900 s window, so the totals
+    are only right because `ts` is the primary key and a re-poll is a no-op.
+    """
+    _day(conn, "04:00", precipitation=0.4)
+    assert (
+        db.insert_outdoor_reading(conn, _row(ts="2026-07-12T04:00", precipitation=0.4))
+        is False
+    )
+    aggregate = db.outdoor_day_aggregate(conn, datetime.fromisoformat("2026-07-12"))
+    assert aggregate["values"]["precipitation_total"] == pytest.approx(0.4)
+
+
+# --- the weather_alerts tables (#79) ---------------------------------------
+
+
+def test_the_alert_id_column_really_is_not_null(conn):
+    """Same SQLite compatibility bug `ts` hit in #98.
+
+    A non-INTEGER PRIMARY KEY on a rowid table gets no implicit NOT NULL, so
+    without the explicit one this table would accept unlimited unkeyed rows --
+    invisible to the upsert's conflict target and to every lookup.
+    """
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO weather_alerts (id, event, first_seen_at, last_seen_at)"
+            " VALUES (NULL, 'Tornado Warning', '2026-09-11T12:00:00+00:00',"
+            " '2026-09-11T12:00:00+00:00')"
+        )
+
+
+def test_the_poll_state_table_holds_exactly_one_row(conn):
+    """The CHECK is what keeps `WHERE id = 1` a total description of the table."""
+    db.record_weather_alert_poll(conn, "2026-09-11T12:00:00+00:00")
+    db.record_weather_alert_poll(conn, "2026-09-11T12:15:00+00:00")
+    assert conn.execute("SELECT COUNT(*) FROM weather_alert_poll").fetchone()[0] == 1
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO weather_alert_poll (id) VALUES (2)")

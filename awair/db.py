@@ -39,12 +39,15 @@ _UNKEYED_LOG_CAP = 20
 # rowid table gets no implicit NOT NULL, so two null-`ts` rows both insert and
 # the table accumulates rows no dedup and no `ORDER BY ts` can key on.
 #
-# `weather_code` and `aq_ts` are ordered last, and in this order, to match what
-# `_migrate` ALTERs onto an existing DB (#77). A fresh install and a migrated
-# one otherwise end up with different physical column orders and SCHEMA stops
-# describing a live database. Harmless while every query names its columns --
-# which `test_schema_column_order_matches_a_migrated_database` keeps true --
-# but SCHEMA is read as documentation, so it should not be false.
+# `weather_code`, `aq_ts` and `snowfall` are ordered last, and in this order, to
+# match what `_migrate` ALTERs onto an existing DB (#77, #79). A fresh install
+# and a migrated one otherwise end up with different physical column orders and
+# SCHEMA stops describing a live database. Harmless while every query names its
+# columns -- which `test_schema_column_order_matches_a_migrated_database` keeps
+# true -- but SCHEMA is read as documentation, so it should not be false.
+#
+# That ordering rule is why `snowfall` sits below `aq_ts` here rather than
+# beside `precipitation`, which is where it belongs by meaning.
 #
 # Keep prose *outside* this string. SQLite stores the statement text verbatim
 # and re-parses it on ALTER TABLE ... DROP COLUMN; a comment between the columns
@@ -55,7 +58,8 @@ OUTDOOR_COLUMNS_DDL = """
     temp REAL, humid REAL, wind_speed REAL, pressure REAL, precipitation REAL,
     pm25 REAL, pm10 REAL, us_aqi INTEGER, co REAL, o3 REAL,
     weather_code INTEGER,
-    aq_ts TEXT
+    aq_ts TEXT,
+    snowfall REAL
 """
 
 SCHEMA = """
@@ -101,6 +105,21 @@ CREATE TABLE IF NOT EXISTS fan_events (
     ok INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fan_events_at ON fan_events (at);
+
+CREATE TABLE IF NOT EXISTS weather_alerts (
+    id TEXT NOT NULL PRIMARY KEY,
+    event TEXT NOT NULL,
+    severity TEXT, certainty TEXT, urgency TEXT, headline TEXT,
+    onset TEXT, ends TEXT, expires TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS weather_alert_poll (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_attempt_at TEXT,
+    last_success_at TEXT
+);
 """
 # Concatenated rather than interpolated: `str.format` and f-strings both treat
 # `{` as a placeholder, and SQL is full of braceable syntax (a future CHECK or a
@@ -131,6 +150,38 @@ OUTDOOR_COLUMNS = (
     # routinely older than `ts`, which is the weather block's. Not the primary
     # key and not a substitute for `received_at`. See GLOSSARY.md: `aq_ts`.
     "aq_ts",
+    # Open-Meteo's `snowfall` for the row's own `interval` window, in cm (#79).
+    # NOT derivable from `precipitation`, which is the water equivalent in mm --
+    # the ratio varies with the snow's density, so no downstream arithmetic
+    # recovers depth from it. NULL on rows predating #79 and NULL means
+    # *unknown*, never "it is not snowing". See GLOSSARY.md: `snowfall`.
+    "snowfall",
+)
+
+# The `outdoor_readings` columns that reach a *deployed* database through an
+# ALTER rather than through the original CREATE, in the order they are
+# appended. SCHEMA's table must END with exactly these, in this order: a
+# migrated install can only append, so listing one anywhere else makes a fresh
+# install and a migrated one physically different tables (#77).
+#
+# One list, two consumers -- `_migrate` issues them, and
+# `test_schema_column_order_matches_a_migrated_database` derives its
+# pre-migration fixture by dropping them. Before #79 that test carried its own
+# hand-written copy and its docstring warned that a new column had to be added
+# to both lists; the first person to add one walked straight into it.
+#
+# All three are nullable with no DEFAULT, which is the whole point and is why
+# they group: rows written before each migration genuinely do not know their
+# weather code, the age of their AQI, or whether it was snowing. Backfilling a
+# clock -- even from the row's own `ts` -- would manufacture a measurement time
+# the source never published, and `aq_ts` exists precisely so a consumer can
+# refuse to trust an AQI it cannot date. `DEFAULT 0` on `snowfall` would be
+# worse than a fabricated clock: it asserts, across a whole history, that it
+# was not snowing, on the one input whose threshold is "more than 4 inches".
+OUTDOOR_MIGRATED_COLUMNS = (
+    "weather_code INTEGER",
+    "aq_ts TEXT",
+    "snowfall REAL",
 )
 
 READING_COLUMNS = (
@@ -347,14 +398,6 @@ def _migrate(conn) -> None:
     # events at migration time, and they must land unlatched rather than
     # spuriously driving the fans on the first poll after deploy.
     _add_column(conn, "alert_events", "fans_engaged INTEGER NOT NULL DEFAULT 0")
-    # #71. Both nullable with no DEFAULT, which is the whole point: rows written
-    # before this migration genuinely do not know their weather code or the age
-    # of their AQI, and NULL is the only honest way to say so. Backfilling
-    # either one -- even from the row's own `ts` -- would manufacture a
-    # measurement time the source never published, and `aq_ts` exists precisely
-    # so a consumer can refuse to trust an AQI it cannot date.
-    _add_column(conn, "outdoor_readings", "weather_code INTEGER")
-    _add_column(conn, "outdoor_readings", "aq_ts TEXT")
     # The duration cap's bookkeeping (ADR-002). `run_started_at` is nullable and
     # starts NULL: a fan already running at migration time has no recorded
     # start, and `run_exhausted` treats "no start" as "not yet exhausted", so
@@ -362,6 +405,8 @@ def _migrate(conn) -> None:
     # capping it instantly on a start time we never observed.
     _add_column(conn, "fan_state", "run_started_at TEXT")
     _add_column(conn, "fan_state", "capped INTEGER NOT NULL DEFAULT 0")
+    for column_def in OUTDOOR_MIGRATED_COLUMNS:
+        _add_column(conn, "outdoor_readings", column_def)
     # Last, and it must stay last: the rebuild copies the columns named in
     # OUTDOOR_COLUMNS, so it has to run after the ALTERs that add them. On a
     # pre-#71 DB the reverse order fails on "no such column: weather_code".
@@ -583,6 +628,73 @@ def outdoor_readings_since(conn, columns, since) -> list:
         (since.isoformat(),),
     )
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
+
+
+# The `/api/outdoor-today` aggregate, as (published name, SQL function, column).
+# Written out rather than derived because the *point* of #79's second half is
+# that two of these are SUMs and the rest are not: `series.bucket` emits
+# avg/min/max only, so "how much rain fell today" is not a question the
+# existing series endpoint can answer at any bucket size.
+#
+# These are the only values interpolated into the SQL below, and they are
+# literals in this tuple -- no caller-supplied column name reaches the query.
+OUTDOOR_DAY_AGGREGATES = (
+    ("precipitation_total", "SUM", "precipitation"),
+    ("snowfall_total", "SUM", "snowfall"),
+    ("temp_min", "MIN", "temp"),
+    ("temp_max", "MAX", "temp"),
+    ("wind_speed_max", "MAX", "wind_speed"),
+    ("us_aqi_min", "MIN", "us_aqi"),
+    ("us_aqi_max", "MAX", "us_aqi"),
+)
+
+
+def outdoor_day_aggregate(conn, since) -> dict:
+    """Sums and extremes over `outdoor_readings` from `since` onward.
+
+    Returns `{"row_count": int, "values": {...}, "contributing_rows": {...}}`.
+
+    **`row_count` and `contributing_rows` are not the same number and both are
+    load-bearing** (#79). `row_count` is rows in the window -- it separates "no
+    rain today" from "the poller has been down since 03:00", which is the same
+    "an old row and no row must arrive as different answers" rule
+    `latest_outdoor_reading` is built on. `contributing_rows` is per *column*,
+    because a column can be NULL on a row that exists: every row written before
+    the `snowfall` migration is exactly that, so on deploy day `snowfall_total`
+    is a real sum over a strict subset of a full day's rows. Without the second
+    number a consumer cannot tell that from a complete one.
+
+    SQL aggregates ignore NULLs, so a column with no values at all comes back
+    NULL rather than 0.0 -- which is the honest answer and is deliberately not
+    coalesced. `COUNT(*)` is the one that still counts those rows.
+
+    **Why summing rows is sound at all**: Open-Meteo's `current.precipitation`
+    and `current.snowfall` are backward-looking sums over the block's own
+    `interval`, which is 900 s -- equal to the source's publish cadence, so
+    consecutive `ts` values cover disjoint, contiguous windows. `ts` is the
+    primary key and inserts are `ON CONFLICT(ts) DO NOTHING`, so a re-poll
+    cannot double-count one window however often we ask. See
+    `outdoor.SOURCE_INTERVAL_SECONDS` for the guard on that assumption; if
+    `interval` ever became 3600 these sums would over-report by 4x, silently.
+    """
+    selects = ", ".join(f"{fn}({col})" for _, fn, col in OUTDOOR_DAY_AGGREGATES)
+    columns = tuple(dict.fromkeys(col for _, _, col in OUTDOOR_DAY_AGGREGATES))
+    counts = ", ".join(f"COUNT({col})" for col in columns)
+    row = conn.execute(
+        f"SELECT COUNT(*), {selects}, {counts} FROM outdoor_readings WHERE ts >= ?",
+        (since.isoformat(),),
+    ).fetchone()
+    split = 1 + len(OUTDOOR_DAY_AGGREGATES)
+    return {
+        "row_count": row[0],
+        "values": {
+            name: value
+            for (name, _, _), value in zip(
+                OUTDOOR_DAY_AGGREGATES, row[1:split], strict=True
+            )
+        },
+        "contributing_rows": dict(zip(columns, row[split:], strict=True)),
+    }
 
 
 def latest_outdoor_reading(conn, columns) -> dict | None:
@@ -966,6 +1078,54 @@ def record_fan_event(conn, at, fan_id: int, action: str, reason: str, ok: bool) 
     conn.commit()
 
 
+# The `weather_alerts` columns written from an NWS CAP feature (#79). `id` is
+# the CAP urn from `properties.id`, NOT the feature's `id`, which is the
+# api.weather.gov URL for the same alert -- the urn is the identifier NWS keeps
+# stable across the message's own updates.
+WEATHER_ALERT_COLUMNS = (
+    "id",
+    "event",
+    "severity",
+    "certainty",
+    "urgency",
+    "headline",
+    "onset",
+    "ends",
+    "expires",
+)
+
+_WEATHER_ALERT_UPDATES = ", ".join(
+    f"{col} = excluded.{col}" for col in WEATHER_ALERT_COLUMNS if col != "id"
+)
+
+
+def upsert_weather_alerts(conn, alerts, seen_at) -> None:
+    """Record each alert NWS reports active, stamping `last_seen_at = seen_at`.
+
+    Upsert rather than replace, and `first_seen_at` is deliberately absent from
+    the UPDATE clause: an alert that persists across many polls keeps the
+    instant we first heard of it, which is the fact the durable record exists
+    to hold. The mutable fields are refreshed, because NWS revises a live alert
+    in place -- `ends` in particular gets extended.
+
+    **Nothing here deletes.** Which alerts are *currently* active is answered
+    by `last_seen_at` against the last successful poll (see
+    `weather_alerts_seen_at`), so a fetch failure leaves the table alone and
+    cannot manufacture an all-clear. The history is kept for the same reason
+    `alert_events` rows are.
+    """
+    placeholders = ", ".join(f":{col}" for col in WEATHER_ALERT_COLUMNS)
+    conn.executemany(
+        f"INSERT INTO weather_alerts ({', '.join(WEATHER_ALERT_COLUMNS)},"
+        " first_seen_at, last_seen_at)"
+        f" VALUES ({placeholders}, :seen_at, :seen_at)"
+        f" ON CONFLICT(id) DO UPDATE SET {_WEATHER_ALERT_UPDATES},"
+        " last_seen_at = excluded.last_seen_at",
+        [alert | {"seen_at": seen_at} for alert in alerts],
+    )
+    conn.commit()
+
+
 def fan_events_since(conn, since) -> list:
     """Fan actuation attempts at or after `since`, oldest first.
 
@@ -989,3 +1149,64 @@ def fan_events_since(conn, since) -> list:
         }
         for row_id, at, fan_id, action, reason, ok in rows
     ]
+
+
+def record_weather_alert_poll(conn, attempted_at, succeeded_at=None) -> None:
+    """Stamp the alert poll's clocks. `succeeded_at` stays put on a failure.
+
+    Two clocks, because they answer different questions and only one of them
+    can be inferred from the other's absence. `last_attempt_at` says the poller
+    is alive and trying; `last_success_at` says when we last actually heard
+    from NWS, and is the one an all-clear has to be measured against.
+
+    A failed attempt passes `succeeded_at=None` and the COALESCE keeps the
+    previous success -- writing NULL there would turn every transient failure
+    into "we have never asked", which is louder than the truth.
+    """
+    conn.execute(
+        "INSERT INTO weather_alert_poll (id, last_attempt_at, last_success_at)"
+        " VALUES (1, ?, ?)"
+        " ON CONFLICT(id) DO UPDATE SET last_attempt_at = excluded.last_attempt_at,"
+        " last_success_at = COALESCE(excluded.last_success_at, last_success_at)",
+        (attempted_at, succeeded_at),
+    )
+    conn.commit()
+
+
+def weather_alert_poll_state(conn) -> dict:
+    """Both alert-poll clocks. Missing row reads as never attempted, not as an error.
+
+    A fresh install has no row until the first poll, and the endpoint has to
+    answer before then -- with "we have never successfully asked", which is
+    exactly what two NULLs mean.
+    """
+    row = conn.execute(
+        "SELECT last_attempt_at, last_success_at FROM weather_alert_poll WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return {"last_attempt_at": None, "last_success_at": None}
+    return {"last_attempt_at": row[0], "last_success_at": row[1]}
+
+
+def weather_alerts_seen_at(conn, seen_at) -> list[dict]:
+    """Stored alerts whose `last_seen_at` equals `seen_at`, oldest onset first.
+
+    Equality against one instant rather than a range: every alert in a
+    successful poll is stamped with that poll's clock, so this returns the
+    exact set NWS reported and nothing that has since been cancelled. `seen_at`
+    is meant to be `weather_alert_poll_state()["last_success_at"]`; passing
+    NULL returns nothing, which is the correct read of "we have never had a
+    successful poll" only because the caller publishes the clocks beside it.
+
+    Ordered by `onset` (NULLs first, SQLite's default) then `id`, so the order
+    is stable and chronological. It is deliberately NOT ordered by severity:
+    ranking alerts is presentation, and the hub owns that here for the same
+    reason it owns card colour and the WMO code-to-word mapping.
+    """
+    rows = conn.execute(
+        f"SELECT {', '.join(WEATHER_ALERT_COLUMNS)}, first_seen_at, last_seen_at"
+        " FROM weather_alerts WHERE last_seen_at = ? ORDER BY onset, id",
+        (seen_at,),
+    )
+    fields = (*WEATHER_ALERT_COLUMNS, "first_seen_at", "last_seen_at")
+    return [dict(zip(fields, row, strict=True)) for row in rows]

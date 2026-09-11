@@ -8,6 +8,8 @@ Config via environment:
   AWAIR_OUTDOOR_WEATHER_URL         — override for test/staging (see DEFAULT_WEATHER_URL)
   AWAIR_OUTDOOR_AIR_QUALITY_URL     — override for test/staging (see DEFAULT_AIR_QUALITY_URL)
   AWAIR_OUTDOOR_HEALTH_POLLS        — default 4 (~1h at the default cadence); see OutdoorHealth
+  AWAIR_NWS_ALERTS_URL              — override for test/staging (see weather_alerts)
+  AWAIR_NWS_USER_AGENT              — NWS asks clients to identify themselves; see weather_alerts
   AWAIR_NTFY_URL, AWAIR_NTFY_TOPIC, AWAIR_NTFY_TOKEN
                                     — shared with the indoor poller; a sustained failure notifies
 
@@ -28,7 +30,7 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, date, datetime
 
-from awair import db
+from awair import db, weather_alerts
 from awair.alerts import Notifier
 from awair.monitor import OutdoorHealth
 from awair.shutdown import install_handler
@@ -42,6 +44,20 @@ log = logging.getLogger("awair.outdoor")
 
 FETCH_TIMEOUT_SECONDS = 10
 DEFAULT_POLL_SECONDS = 900
+
+# What Open-Meteo's `current` block says its own window is, in seconds. Every
+# accumulating field in that block -- `precipitation`, `snowfall` -- is a
+# backward-looking sum over exactly this many seconds, and the source publishes
+# the figure back to us as `current.interval` (measured 900 on 2026-09-11).
+#
+# It is load-bearing for `/api/outdoor-today`, and silently so. Consecutive
+# `ts` values are 900 s apart and `ts` is the primary key, so summing rows adds
+# disjoint, contiguous windows and a re-poll cannot double-count one. Were this
+# to become 3600 upstream, each row would cover the preceding *hour*, four rows
+# would overlap three times over, and a day's rain total would over-report by
+# about 4x -- with every individual value still correct and nothing failing.
+# Hence the warning below rather than a comment nobody reads.
+SOURCE_INTERVAL_SECONDS = 900
 DEFAULT_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 DEFAULT_AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
@@ -55,6 +71,11 @@ WEATHER_FIELDS = (
     # "Overcast" rather than a number. Requested and stored as the source's
     # integer; the word is the hub's job (GLOSSARY.md: `weather_code`).
     "weather_code",
+    # Snow depth in cm for the block's own window (#79). `precipitation` above
+    # is the *water equivalent* in mm and cannot stand in for it: the depth-to-
+    # water ratio swings with the snow's density, so "more than 4 inches of
+    # snow" is not recoverable downstream from any other field here.
+    "snowfall",
 )
 AIR_QUALITY_FIELDS = (
     "pm2_5",
@@ -73,6 +94,7 @@ WEATHER_TO_COLUMN = {
     "pressure_msl": "pressure",
     "precipitation": "precipitation",
     "weather_code": "weather_code",
+    "snowfall": "snowfall",
 }
 AIR_QUALITY_TO_COLUMN = {
     "pm2_5": "pm25",
@@ -211,6 +233,28 @@ def _normalize_aq_time(source_time) -> str | None:
         return None
 
 
+def _warn_on_interval_drift(interval) -> None:
+    """Log when the source's accumulation window stops matching our assumption.
+
+    A warning rather than a refusal, because the row itself is still correct --
+    only the *sum* over rows in `/api/outdoor-today` would be wrong, and
+    dropping readings to protect a derived total is the worse trade. The value
+    is absent on some Open-Meteo shapes and on every hand-written test payload
+    that predates #79, which reads as "no claim" rather than as drift.
+
+    This is the only check on `SOURCE_INTERVAL_SECONDS`; without it a change
+    upstream would inflate a rain total by 4x with every stored number still
+    right and nothing raising.
+    """
+    if interval is not None and interval != SOURCE_INTERVAL_SECONDS:
+        log.warning(
+            "Open-Meteo current.interval is %rs, not the %ss /api/outdoor-today "
+            "sums assume -- daily precipitation and snowfall totals are now wrong",
+            interval,
+            SOURCE_INTERVAL_SECONDS,
+        )
+
+
 def _is_readable_air_quality(payload) -> bool:
     """True when the AQ block is an object whose `current` block is one too.
 
@@ -288,6 +332,7 @@ def parse_reading(
     weather_current = weather_payload["current"]
     reading = {col: None for col in db.OUTDOOR_COLUMNS}
     reading["ts"] = _normalize_source_time(weather_current["time"])
+    _warn_on_interval_drift(weather_current.get("interval"))
     reading["received_at"] = received_at
     for source_field, column in WEATHER_TO_COLUMN.items():
         reading[column] = weather_current.get(source_field)
@@ -501,6 +546,12 @@ def main() -> None:
     air_quality_base = os.environ.get(
         "AWAIR_OUTDOOR_AIR_QUALITY_URL", DEFAULT_AIR_QUALITY_URL
     )
+    alerts_base = os.environ.get(
+        "AWAIR_NWS_ALERTS_URL", weather_alerts.DEFAULT_ALERTS_URL
+    )
+    user_agent = os.environ.get(
+        "AWAIR_NWS_USER_AGENT", weather_alerts.DEFAULT_USER_AGENT
+    )
 
     notifier = Notifier(
         base_url=os.environ.get(
@@ -524,6 +575,9 @@ def main() -> None:
     fetch_air_quality = make_fetch(
         _build_url(air_quality_base, lat, lon, AIR_QUALITY_FIELDS)
     )
+    fetch_alerts = weather_alerts.make_fetch(
+        weather_alerts.build_url(alerts_base, lat, lon), user_agent
+    )
     log.info(
         "polling Open-Meteo every %ss for (%s, %s) into %s", interval, lat, lon, db_path
     )
@@ -543,6 +597,12 @@ def main() -> None:
             handle_outdoor_health(
                 conn, notifier, health, status, datetime.now(UTC), interval
             )
+            # After the weather row, never before it, and its result is
+            # deliberately not fed to `health`: NWS and Open-Meteo are separate
+            # upstreams, so an NWS outage must not escalate the *outdoor poller*
+            # to "unreachable" and page at high priority for a fault on someone
+            # else's box. `poll_once` logs its own outcome and cannot raise.
+            weather_alerts.poll_once(conn, fetch_alerts)
             if stop.wait(interval):
                 break
     finally:
