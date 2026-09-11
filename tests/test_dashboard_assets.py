@@ -425,3 +425,69 @@ def test_no_chart_subscribes_to_the_sync_group_a_second_time(js_code):
         "`cursor.sync.key` already subscribes each chart at construction, so "
         "this registers every plot twice and doubles peer cursor work (#90)"
     )
+
+
+def test_the_opening_range_is_read_from_the_dom_not_written_into_the_js(js):
+    """`state.range` must be derived from the pressed button, never a literal (#108).
+
+    The default used to be written down three times — twice in `web.py`, once
+    as `aria-pressed="true"` in the template, once here — and a change to any
+    one of them left the other two behind. `web.DEFAULT_RANGE` is now the only
+    copy, and this is the half of that no Flask test can reach: `dashboard.js`
+    is shipped verbatim to a browser.
+
+    Asserted on the *mechanism* rather than the absent string. A ban on the
+    literal `"7d"` would pass the day somebody wrote `"today"` here instead —
+    which is the same defect, and the one a reader implementing #108 by hand
+    is most likely to introduce.
+    """
+    match = re.search(r"const state\s*=\s*\{(.*?)\}\s*;", js, re.S)
+    assert match, "no `const state = { ... };` in dashboard.js"
+    body = match.group(1)
+    initialiser = re.search(r"\brange:\s*([^,]+),", body)
+    assert initialiser, f"no `range:` key in the state initialiser: {body!r}"
+    expression = initialiser.group(1)
+    assert "dataset.range" in expression, (
+        "`state.range` is initialised from "
+        f"{expression.strip()!r} rather than from a button's `dataset.range` — "
+        "the opening range belongs to `web.DEFAULT_RANGE` and is read back out "
+        "of the rendered markup (#108)"
+    )
+    assert not re.search(r"""["'`]""", expression), (
+        f"`state.range` is initialised from {expression.strip()!r}, which "
+        "contains a string literal -- that is a second copy of a default that "
+        "lives in `web.DEFAULT_RANGE` (#108). Scoped to the captured "
+        "expression rather than to the whole state object, and scoped to ANY "
+        "quote rather than to one immediately after `range:`: a literal in the "
+        "SECOND position of a fallback -- `pressed ? pressed.dataset.range : "
+        '"7d"` -- satisfies both the mechanism assertion above and a '
+        "`range:\\s*[\"']` ban, and is the same defect."
+    )
+
+
+def test_the_template_presses_a_range_button_by_derivation_not_by_hand(html):
+    """No range name and no pressed state is typed into `dashboard.html` (#108).
+
+    The `<button>` row is rendered from `web.RANGE_LABELS` and pressed from
+    `web.DEFAULT_RANGE`. Both halves are asserted, because either one alone
+    leaves a working copy of the defect: a hand-written button list drifts from
+    the ranges the endpoints accept, and a hand-written `aria-pressed="true"`
+    drifts from the range they default to.
+
+    The CSS rule `.ranges button[aria-pressed="true"]` is a *selector*, not a
+    pressed button, so the search is scoped to the `<nav class="ranges">`
+    element rather than run over the whole file.
+    """
+    nav = re.search(r'<nav class="ranges".*?</nav>', html, re.S)
+    assert nav, 'no `<nav class="ranges">` in dashboard.html'
+    markup = nav.group(0)
+    assert 'aria-pressed="true"' not in markup, (
+        "a range button is pressed by hand in the template — press it from "
+        "`web.DEFAULT_RANGE` instead (#108)"
+    )
+    assert not re.search(r'data-range="[a-z0-9]', markup), (
+        "a range name is typed into the template — render the row from "
+        "`web.RANGE_LABELS` so it cannot drift from the ranges the endpoints "
+        "accept (#108)"
+    )
+    assert "range_labels" in markup and "default_range" in markup
