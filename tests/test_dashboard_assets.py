@@ -119,16 +119,60 @@ def test_legend_reserves_a_fixed_height_and_clips(html):
     )
 
 
-def test_the_five_entry_outdoor_card_reserves_an_extra_row(html):
-    """The precipitation card carries #42's pressure overlay as a 5th entry.
+def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
+    """An overlay card carries a 5th legend entry — #42's pressure, #109's outdoor.
 
     Measured at 375px and 390px it wraps to three rows where every other card
     needs two, so without its own reservation `overflow: hidden` clips the
-    pressure reading away entirely — on the phone #87 exists to serve.
+    fifth reading away entirely — on the phone #87 exists to serve.
+
+    Asserted on the *attribute* selector rather than on either card's name.
+    The rule shipped for #42 named `[data-outdoor="precipitation"]`, and the
+    day #109 put an overlay on the indoor temp card that selector went stale
+    silently: the new card drew its fifth entry into a two-row box and clipped
+    it, with nothing failing. A selector keyed on the marker covers the next
+    one without an edit.
     """
-    body = _rule_body(html, '.card[data-outdoor="precipitation"] .u-legend')
-    assert body is not None, "precipitation card has no legend-height override"
+    body = _rule_body(html, ".card[data-overlay] .u-legend")
+    assert body is not None, (
+        "no legend-height override keyed on `data-overlay` — a per-card "
+        "selector goes stale the moment another card grows an overlay"
+    )
     assert re.search(r"--legend-rows:\s*3\s*;", body)
+    assert not re.search(r'\.card\[data-outdoor="[a-z]+"\]\s*\.u-legend', html), (
+        "a legend reservation is still keyed to one named card; key it on "
+        "`[data-overlay]` so every overlay card is covered"
+    )
+
+
+def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
+    """#109's outdoor trace must NOT get a scale of its own.
+
+    Both series are a temperature in the same unit, and the gap between them IS
+    the thing the chart was asked for — "how outdoor affects indoor". Give the
+    outdoor line its own auto-fitted axis and the two are drawn to different
+    rulers: a 1° indoor drift and a 20° outdoor swing become the same stroke on
+    screen, and a reader cannot tell a well-insulated house from a leaky one.
+
+    This is a real temptation rather than a hypothetical, because the pattern
+    beside it does exactly that on purpose — #42 puts pressure on `scale:
+    "pressure"` with a fixed range, correctly, since inHg and inches of rain
+    are different quantities. Copying that line onto a second temperature is
+    the likeliest way this regresses.
+    """
+    match = re.search(
+        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
+        js_code,
+        re.S,
+    )
+    assert match, (
+        "no outdoor series pushed with `label: OUTDOOR_METRICS.temp.name` — "
+        "if the overlay moved, this guard has to move with it"
+    )
+    assert "scale:" not in match.group(0), (
+        "the outdoor temperature series declares its own `scale:`, so the two "
+        "temperatures are drawn against different rulers (#109)"
+    )
 
 
 def test_plot_container_clips_its_contents(html):
@@ -491,3 +535,56 @@ def test_the_template_presses_a_range_button_by_derivation_not_by_hand(html):
         "accept (#108)"
     )
     assert "range_labels" in markup and "default_range" in markup
+
+
+def test_the_overlay_trace_breaks_rather_than_spanning_a_stale_gap(js_code):
+    """`spanGaps: false` on the outdoor series, and the reason is not cosmetic.
+
+    `web._outdoor_temp_on_grid` nulls the trace once the last outdoor
+    observation is older than `_OUTDOOR_CARRY_MAX_AGE_SECONDS`, so a dead
+    outdoor poller arrives at the browser as a run of nulls. Spanned, uPlot
+    joins the two live ends into one straight line across the outage — and a
+    flat outdoor trace beside a moving indoor one reads as "the weather held
+    steady", which is the single most misleading thing this chart can say.
+
+    uPlot's default is `spanGaps: false`, so this asserts the key is present
+    and false rather than merely absent: an explicit `true` is the regression,
+    and "absent" and "present and false" are different edits to review.
+    """
+    match = re.search(
+        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
+        js_code,
+        re.S,
+    )
+    assert match, "the outdoor temperature series is no longer pushed here"
+    assert re.search(r"spanGaps:\s*false", match.group(0)), (
+        "the outdoor trace spans its gaps, so an outdoor-poller outage draws "
+        "as a flat line across the outage instead of a break (#109)"
+    )
+
+
+def test_the_overlay_series_is_actually_given_a_data_column(js_code):
+    """A 5th series config with no 5th data array is a blank chart, not a bug report.
+
+    uPlot indexes `data` by series position, so the config and the data array
+    have to grow together. They are built in two separate places here — the
+    ternary on `data` and the `push` onto `seriesConfig` — under one flag, and
+    editing one without the other is the realistic slip. Neither structural
+    guard above can see it: both read the series config alone.
+    """
+    match = re.search(
+        r"const data = overlayOutdoor\s*\?\s*\[(.*?)\]\s*:\s*\[(.*?)\]", js_code, re.S
+    )
+    assert match, "no `overlayOutdoor` branch building the temp card's data array"
+    with_overlay, without = match.group(1), match.group(2)
+    assert "outdoorTemp" in with_overlay, (
+        "the overlay branch does not add the outdoor column, so the pushed "
+        "series has no data and uPlot draws nothing"
+    )
+    assert "outdoorTemp" not in without, (
+        "the non-overlay branch carries the outdoor column, so every other "
+        "metric card gets a series it never configured"
+    )
+    assert with_overlay.count(",") == without.count(",") + 1, (
+        "the two branches differ by something other than the outdoor column"
+    )

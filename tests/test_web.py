@@ -1,11 +1,17 @@
 """Dashboard Flask app: series/events endpoints and the page itself."""
 
+import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from awair import db, web
 from awair.web import METRIC_NAMES, create_app
+
+DASHBOARD_JS_TEXT = (
+    Path(__file__).resolve().parent.parent / "static" / "dashboard.js"
+).read_text()
 
 
 @pytest.fixture(autouse=True)
@@ -156,9 +162,40 @@ def test_dashboard_page_renders(client):
     html = response.get_data(as_text=True)
     for name in METRIC_NAMES:
         assert f'data-metric="{name}"' in html
-    assert 'data-outdoor="temp"' in html
+    # The standalone outdoor temp card is gone — its trace now overlays the
+    # indoor temp card (#109), and leaving both would draw the same line twice.
+    assert 'data-outdoor="temp"' not in html
     assert 'data-outdoor="precipitation"' in html
     assert "uplot" in html
+
+
+def test_the_temp_card_is_the_only_card_marked_to_carry_an_overlay(client):
+    """`data-overlay` is read by two consumers that must not disagree.
+
+    The CSS reserves a third legend row for `.card[data-overlay]`, and
+    `dashboard.js` decides whether to draw a fifth series from the same
+    attribute. Rendered from `web.METRIC_OVERLAYS` rather than typed onto a
+    card, so the marker cannot be added in the template without the constant
+    that names what to draw.
+    """
+    html = client.get("/").get_data(as_text=True)
+    marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w-]+)"', html)
+    assert marked == [("temp", "outdoor-temp")]
+    # The precipitation card carries #42's pressure overlay and must keep the
+    # same marker — the reservation rule has no other way to reach it.
+    assert 'data-outdoor="precipitation" data-overlay="pressure"' in html
+
+
+def test_no_metric_card_is_marked_for_an_overlay_the_page_cannot_draw(client):
+    """Every `data-overlay` value must be one `dashboard.js` handles.
+
+    The attribute buys a legend row unconditionally, so a marker naming an
+    overlay nothing draws costs a card a permanent band of blank space — and
+    that is the silent half, because the chart itself still looks right.
+    """
+    drawable = set(re.findall(r'dataset\.overlay === "([\w-]+)"', DASHBOARD_JS_TEXT))
+    assert drawable, "dashboard.js no longer dispatches on dataset.overlay"
+    assert set(web.METRIC_OVERLAYS.values()) <= drawable
 
 
 def test_dashboard_page_offers_all_three_range_buttons(client):
@@ -1538,3 +1575,120 @@ def test_a_non_string_clock_cannot_reach_the_endpoint_but_is_handled_anyway():
     assert web._alert_clock(12345) == 12345
     assert web._alert_clock(None) is None
     assert web._alert_clock("2026-09-11T08:00:00-04:00") == "2026-09-11T12:00:00Z"
+
+
+# --- #109: indoor and outdoor temperature on one chart -----------------------
+#
+# The chart needs one x-axis and the two sides do not share one — indoor
+# buckets at 60/300/900 s against a 30 s poll, outdoor publishes every 900 s.
+# `/api/series` is where the indoor grid is decided, so it is where the
+# alignment happens: the outdoor trace ships as a flat list already on
+# `metrics.temp.t`, rather than as a second `{t, avg, min, max}` block the
+# browser would have to reconcile.
+
+
+def _seed_outdoor_temps(db_path, samples):
+    """samples: [(datetime, celsius_or_None)] straight into outdoor_readings."""
+    conn = db.connect(db_path)
+    for at, celsius in samples:
+        conn.execute(
+            "INSERT INTO outdoor_readings (ts, received_at, temp) VALUES (?, ?, ?)",
+            (at.isoformat(), at.isoformat(), celsius),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_series_ships_the_outdoor_trace_on_the_indoor_temp_grid(client, tmp_path):
+    """One list, exactly as long as the x array it is drawn against.
+
+    uPlot raises if a series is not the same length as its x array, so this is
+    the difference between a combined chart and a blank page.
+    """
+    now = datetime.now(UTC)
+    _seed_outdoor_temps(tmp_path / "web.db", [(now - timedelta(minutes=10), 10.0)])
+    payload = client.get("/api/series?range=7d").get_json()
+    assert len(payload["outdoor_temp"]) == len(payload["metrics"]["temp"]["t"])
+    assert 10.0 in payload["outdoor_temp"]
+
+
+def test_the_outdoor_trace_follows_temps_grid_not_some_other_metrics(tmp_path):
+    """`bucket` builds a `t` per metric, and they are not interchangeable.
+
+    `/api/series` filters `row[i] is not None` per metric before bucketing, so
+    a stretch of readings with a NULL temp gives `temp` a *shorter* grid than
+    `co2` over the same window. Aligning the outdoor trace to the payload's
+    first metric, or to co2, or to the raw row count would ship a list that is
+    the wrong length for the one chart it is drawn on — and every assertion
+    above would still pass on a fixture where every metric has every column.
+    """
+    db_path = tmp_path / "grid.db"
+    conn = db.connect(db_path)
+    now = datetime.now(UTC)
+    for i in range(40):
+        at = now - timedelta(seconds=300 * (39 - i))
+        # temp is NULL for the older half: co2 spans all 40 samples, temp 20.
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, co2, temp) VALUES (?, ?, ?, ?)",
+            (iso_z(at), at.isoformat(), 500, None if i < 20 else 22.5),
+        )
+    conn.commit()
+    conn.close()
+    _seed_outdoor_temps(db_path, [(now - timedelta(minutes=10), 10.0)])
+    app = create_app(db_path=str(db_path))
+    app.testing = True
+
+    payload = app.test_client().get("/api/series?range=7d").get_json()
+    temp_grid = payload["metrics"]["temp"]["t"]
+    co2_grid = payload["metrics"]["co2"]["t"]
+    assert len(temp_grid) < len(co2_grid), "fixture no longer separates the grids"
+    assert len(payload["outdoor_temp"]) == len(temp_grid)
+
+
+def test_the_outdoor_trace_is_in_display_units(make_client, tmp_path):
+    """Converted at the same boundary indoor temp is, and measured separately.
+
+    Indoor is seeded at 22.5 C and outdoor at 10.0 C on purpose: a conversion
+    applied to the indoor series and forgotten on the outdoor one puts two
+    temperatures on one shared axis in two different units — the worst outcome
+    available on this chart, because it still renders and still looks plausible.
+    """
+    client = make_client("F")
+    # Ten minutes back, not `now`: the newest indoor bucket stamp is at most
+    # one bucket old, so an observation stamped `now` is to the RIGHT of the
+    # whole grid and is correctly not back-filled onto it. Real outdoor rows
+    # land on a quarter-hour boundary in the past.
+    _seed_outdoor_temps(
+        tmp_path / "web-F.db", [(datetime.now(UTC) - timedelta(minutes=10), 10.0)]
+    )
+    payload = client.get("/api/series?range=7d").get_json()
+    assert 50.0 in payload["outdoor_temp"]  # 10 C
+    assert 72.5 in payload["metrics"]["temp"]["avg"]  # 22.5 C
+    assert 10.0 not in payload["outdoor_temp"]
+
+
+def test_a_stale_outdoor_observation_becomes_a_gap_not_a_flat_line(client, tmp_path):
+    """An outdoor poller outage must read as absence on this chart.
+
+    Held forward without a bound it renders as a flat outdoor trace beside a
+    moving indoor one — which on a chart asking "does indoor follow outdoor"
+    is a wrong answer rather than a missing one.
+    """
+    now = datetime.now(UTC)
+    _seed_outdoor_temps(tmp_path / "web.db", [(now - timedelta(days=2), 10.0)])
+    payload = client.get("/api/series?range=7d").get_json()
+    assert set(payload["outdoor_temp"]) == {None}
+
+
+def test_the_outdoor_trace_is_full_length_nulls_when_nothing_has_been_polled(
+    client,
+):
+    """A fresh box runs the web app before the outdoor poller has ever written.
+
+    The key must still be present and still be grid-shaped — an absent key or a
+    short list is a broken chart, not a blank one.
+    """
+    payload = client.get("/api/series?range=7d").get_json()
+    grid = payload["metrics"]["temp"]["t"]
+    assert grid, "fixture has no indoor temp grid to align against"
+    assert payload["outdoor_temp"] == [None] * len(grid)
