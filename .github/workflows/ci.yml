@@ -32,6 +32,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-groups --frozen
 
+      # `awair/ tests/` rather than the whole tree, which is every Python file
+      # this repo has. The hooks these two steps stand in for select by file
+      # type, so Python added at the root or under `scripts/` would be linted
+      # by neither -- widen these paths rather than adding a third step.
       - name: Lint (ruff)
         run: uv run --frozen ruff check awair/ tests/
 
@@ -40,3 +44,45 @@ jobs:
 
       - name: Run tests
         run: uv run --frozen pytest
+
+      # Placed after the tests deliberately: both must pass, and a job that
+      # stops at a one-character whitespace nit never reports whether anything
+      # is actually broken. The fixing hooks always exit non-zero when they
+      # rewrite a file, so pytest can never run against a tree they touched.
+      #
+      # The hooks nothing else enforces (#106). This runs every hook in a
+      # checkout where `pre-commit install` has never been run -- which is every
+      # CI runner and every fresh clone.
+      #
+      # #106 says six hooks were enforced nowhere. Measured hook by hook, by
+      # breaking each one and running the suite, it was two: `trailing-
+      # whitespace` and `check-merge-conflict`. `end-of-file-fixer` was covered
+      # by `test_every_tracked_text_file_ends_with_a_newline`, the radon gate by
+      # `test_gate_passes_on_this_repo_as_committed`, `check-toml` by `uv lock
+      # --check` (and by pytest, which cannot boot without a readable
+      # `[tool.pytest.ini_options]`), and `check-yaml` by the three modules that
+      # parse `.pre-commit-config.yaml`. Which leaves
+      # `.github/dependabot.yml` -- the one tracked YAML file nothing read.
+      #
+      # None of that argues for doing less. Every one of those is coverage that
+      # holds for exactly as long as an unrelated test happens to keep parsing
+      # an unrelated file, and nothing announces when it stops.
+      #
+      # `uv run --frozen pre-commit`, not `uvx pre-commit`: pre-commit is in the
+      # dev group and so pinned by uv.lock, and `uvx` would resolve a different
+      # version at run time. That is exactly the drift #54 cost four blocked PRs
+      # to diagnose, arriving through the gate meant to prevent it.
+      #
+      # SKIP is the deliberate half of #106's "resolve the ruff duplication":
+      # ruff keeps its own two steps above, because their failure output names
+      # the rule and prints the diff, where a pre-commit failure on the fixing
+      # variants reports only "files were modified by this hook".
+      # `test_ci_precommit_gate.py` asserts over the hook set rather than over
+      # SKIP: every hook must run here or be named in a table whose dedicated
+      # step is asserted to run the right command. It also pins the quieter
+      # ways this step can go green enforcing nothing -- `stages: [manual]`,
+      # `continue-on-error`, an `if:`, and a bare hook id after `run`.
+      - name: Run pre-commit hooks
+        env:
+          SKIP: ruff,ruff-format
+        run: uv run --frozen pre-commit run --all-files --show-diff-on-failure
