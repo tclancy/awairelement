@@ -114,7 +114,9 @@ ingestion, so a wrong URL or 401 just gets logged.)
   the indoor bucket grid — held, because the last published value is what an
   outdoor reading means between publishes, and nulled once it is more than two
   publish intervals old so a dead outdoor poller reads as a gap rather than as
-  a flat line. *Assumption, since #109 did not say:* combining them replaces
+  a flat line. One missed publish is always bridged; how many further misses
+  it takes to open a gap depends on where the grid stamps fall (see
+  **carry-forward** in `GLOSSARY.md`). *Assumption, since #109 did not say:* combining them replaces
   the standalone outdoor temp card. `/api/outdoor-series` still publishes
   `temp` at outdoor cadence and is unchanged; the page no longer draws it.
 - **`GET /api/latest`** — the newest reading plus every open event, as

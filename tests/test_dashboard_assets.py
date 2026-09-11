@@ -35,6 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from tests._helpers import strip_js_comments
+
 REPO = Path(__file__).resolve().parent.parent
 DASHBOARD_HTML = REPO / "templates" / "dashboard.html"
 DASHBOARD_JS = REPO / "static" / "dashboard.js"
@@ -169,7 +171,7 @@ def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
         "no outdoor series pushed with `label: OUTDOOR_METRICS.temp.name` — "
         "if the overlay moved, this guard has to move with it"
     )
-    assert "scale:" not in match.group(0), (
+    assert not re.search(r"\bscale\s*:", match.group(0)), (
         "the outdoor temperature series declares its own `scale:`, so the two "
         "temperatures are drawn against different rulers (#109)"
     )
@@ -266,127 +268,15 @@ def test_touch_reads_are_clamped_to_the_plot_area(js):
     assert "top: clamp(" in args, "top is passed to setCursor unclamped"
 
 
-def _strip_js_comments(source):
-    """`source` with `//` and `/* */` comments removed, string literals intact.
-
-    The sync guards below assert on the *absence* of a construct, and an
-    absence assertion over raw text has the failure mode the wrong way round:
-    a developer who disables a line by commenting it out leaves the text in
-    place, so the guard fires on a file that is now correct. A gate that
-    cannot go green on correct code gets deleted, which is strictly worse than
-    one that cannot go red.
-
-    Quote-awareness is not decoration: `"http://x"` contains `//`, and a naive
-    line-comment strip would silently truncate the string and every construct
-    after it on that line. dashboard.js has no such URL today — this keeps the
-    stripper from becoming a trap for the edit that adds one.
-
-    Regex literals are handled for the same reason: `/it's/` would otherwise
-    open a string that never closes, and `/\\/\\//` would read as a line
-    comment. dashboard.js has no regex today, so this is entirely about the
-    one-line future edit that adds one. `/` is disambiguated from division by
-    the preceding significant token — the standard heuristic, and ample for a
-    hand-written file. The unterminated-quote check at the end is the backstop
-    for whatever the heuristic still gets wrong: it converts a silent
-    mis-parse into an error that names its own cause, rather than letting the
-    guards below go red citing the wrong one.
-    """
-    # A `/` starts a regex literal unless the previous significant token could
-    # end a value, in which case it is division. `)` and `}` are genuinely
-    # ambiguous in JS; treating them as value-enders is the conventional call
-    # and is right for every form this file plausibly grows.
-    value_enders = ")]}"
-    keywords = (
-        "return",
-        "typeof",
-        "case",
-        "in",
-        "of",
-        "new",
-        "delete",
-        "void",
-        "instanceof",
-        "do",
-        "else",
-        "yield",
-        "await",
-    )
-
-    keyword_tail = re.compile(rf"\b(?:{'|'.join(keywords)})$")
-
-    def starts_regex(prev):
-        if prev is None or not (prev.isalnum() or prev in value_enders + "_$"):
-            return True
-        return bool(keyword_tail.search("".join(out)))
-
-    out = []
-    i, n = 0, len(source)
-    quote = None
-    prev_significant = None
-    while i < n:
-        char = source[i]
-        if quote:
-            out.append(char)
-            if char == "\\" and i + 1 < n:
-                out.append(source[i + 1])
-                i += 2
-                continue
-            if char == quote:
-                quote = None
-            i += 1
-        elif char in "\"'`":
-            quote = char
-            prev_significant = char
-            out.append(char)
-            i += 1
-        elif source.startswith("//", i):
-            while i < n and source[i] != "\n":
-                i += 1
-        elif source.startswith("/*", i):
-            end = source.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-        elif char == "/" and starts_regex(prev_significant):
-            # Consume to the closing `/`. Inside a `[...]` class, `/` is literal.
-            out.append(char)
-            i += 1
-            in_class = False
-            while i < n and source[i] != "\n":
-                c = source[i]
-                out.append(c)
-                i += 1
-                if c == "\\" and i < n:
-                    out.append(source[i])
-                    i += 1
-                elif c == "[":
-                    in_class = True
-                elif c == "]":
-                    in_class = False
-                elif c == "/" and not in_class:
-                    break
-            prev_significant = "/"
-        else:
-            out.append(char)
-            if not char.isspace():
-                prev_significant = char
-            i += 1
-    assert quote is None, (
-        f"comment stripper ended inside an unterminated {quote!r} string — "
-        "dashboard.js has most likely gained a regex literal, which this "
-        "helper cannot parse. Nothing was stripped, so the sync guards below "
-        "would fail citing the wrong cause. See `_strip_js_comments` (#90)."
-    )
-    return "".join(out)
-
-
 @pytest.fixture(scope="module")
 def js_code(js):
-    """dashboard.js with comments stripped — see `_strip_js_comments`."""
-    return _strip_js_comments(js)
+    """dashboard.js with comments stripped — see `strip_js_comments`."""
+    return strip_js_comments(js)
 
 
 def test_the_comment_stripper_keeps_strings_and_drops_comments():
     """The helper the two sync guards rest on, checked against its own traps."""
-    stripped = _strip_js_comments(
+    stripped = strip_js_comments(
         'const u = "http://x//y";\n'
         "sync.sub(a); // sync.sub(b)\n"
         "/* sync.sub(c)\n   sync.sub(d) */\n"
@@ -576,15 +466,24 @@ def test_the_overlay_series_is_actually_given_a_data_column(js_code):
         r"const data = overlayOutdoor\s*\?\s*\[(.*?)\]\s*:\s*\[(.*?)\]", js_code, re.S
     )
     assert match, "no `overlayOutdoor` branch building the temp card's data array"
-    with_overlay, without = match.group(1), match.group(2)
-    assert "outdoorTemp" in with_overlay, (
-        "the overlay branch does not add the outdoor column, so the pushed "
-        "series has no data and uPlot draws nothing"
+    columns = [
+        [part.strip() for part in group.split(",") if part.strip()]
+        for group in match.groups()
+    ]
+    with_overlay, without = columns
+    # ORDER, not membership. uPlot maps `data[i]` to `series[i]`, so
+    # `[series.t, outdoorTemp, series.min, series.max, series.avg]` contains
+    # every column, differs by exactly one comma, and silently makes the
+    # outdoor trace the hidden `low` band while the real average is drawn as
+    # the overlay — every number on the card wrong, nothing red. A membership
+    # assertion cannot see that, and it was the mutant this test missed on
+    # its first draft (#109 review).
+    assert without == ["series.t", "series.min", "series.max", "series.avg"], (
+        f"the non-overlay data columns changed shape: {without}"
     )
-    assert "outdoorTemp" not in without, (
-        "the non-overlay branch carries the outdoor column, so every other "
-        "metric card gets a series it never configured"
-    )
-    assert with_overlay.count(",") == without.count(",") + 1, (
-        "the two branches differ by something other than the outdoor column"
+    assert with_overlay == [*without, "outdoorTemp"], (
+        "the overlay branch must be the base columns with `outdoorTemp` "
+        f"appended, in that order — got {with_overlay}. The pushed series is "
+        "appended to `seriesConfig` last, so its data column has to be last "
+        "too, or uPlot pairs every series with the wrong array."
     )

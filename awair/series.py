@@ -1,5 +1,7 @@
 """Bucket raw 30s readings into chart-sized avg/min/max series."""
 
+from itertools import pairwise
+
 
 def bucket(points, bucket_seconds):
     """[(epoch_seconds, value)] → {t, avg, min, max} arrays.
@@ -57,7 +59,17 @@ def carry_forward(points, grid, max_age_seconds):
     The result is always exactly as long as `grid`: uPlot requires every series
     to match its x array, so a source that has never published still has to
     produce a full-length run of None.
+
+    `points` may arrive in any order and is sorted. **`grid` may not** -- the
+    scan below walks it once and never rewinds, so a descending or shuffled
+    grid returns wrong values rather than raising. Callers pass `bucket`'s
+    `t`, which is ascending by construction; the assertion makes that a
+    precondition rather than a coincidence.
     """
+    assert all(a <= b for a, b in pairwise(grid)), (
+        "`grid` must be ascending -- the hold scan walks it once and cannot "
+        "rewind, so an out-of-order stamp silently takes an earlier value"
+    )
     observations = sorted((t, v) for t, v in points if v is not None)
     result = []
     index = 0

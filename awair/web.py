@@ -238,21 +238,19 @@ _MM_PER_INCH = 25.4
 # precipitation. Conversion at the API boundary (same pattern as precip).
 _HPA_PER_INHG = 33.8639
 
-# How long one outdoor observation stays on the combined temperature chart
-# after the observation that should have replaced it never arrived (#109).
+# How many source publish intervals an outdoor observation stays on the
+# combined temperature chart after the one that should have replaced it never
+# arrived (#109).
 #
-# Derived from the source cadence rather than typed, so it cannot drift from
-# it -- `outdoor.SOURCE_INTERVAL_SECONDS` already carries a warning that fires
-# if Open-Meteo ever stops publishing quarter-hourly. Two intervals, not one:
-# at exactly one, a single skipped poll punches a hole in the trace, and the
-# poller skips for ordinary reasons (a restart, a WAN blip) that are not an
-# outage. At two, one miss is bridged and two is a visible gap.
+# Two, not one: at exactly one, a single skipped poll punches a hole in the
+# trace, and the poller skips for ordinary reasons -- a restart, a WAN blip --
+# that are not an outage. At two, one missed publish is bridged.
 #
 # The bound exists at all because the alternative is worse than a gap. Held
 # indefinitely, a dead outdoor poller renders as a perfectly flat outdoor line
 # beside a moving indoor one -- on a chart whose question is "does indoor
 # follow outdoor", that is not a missing answer but a wrong one.
-_OUTDOOR_CARRY_MAX_AGE_SECONDS = 2 * outdoor.SOURCE_INTERVAL_SECONDS
+_OUTDOOR_CARRY_INTERVALS = 2
 
 
 def _since_for(spec):
@@ -288,6 +286,25 @@ def _outdoor_range_params():
     return _since_for(spec), spec["bucket_seconds"]
 
 
+def _outdoor_carry_max_age_seconds():
+    """How long one outdoor observation may be held onto the chart grid (#109).
+
+    A function rather than a module constant so the derivation from
+    `outdoor.SOURCE_INTERVAL_SECONDS` is *observable*: bound at import time,
+    `2 * 900` and a literal `1800` are indistinguishable to every test that
+    can be written, and the whole claim being made here is that this number
+    tracks the source cadence rather than restating it. Read per call, a test
+    can move the cadence and watch the window follow -- which is the only way
+    to tell a derivation from a coincidence while the cadence happens to be
+    900 (#109 review).
+
+    `outdoor.SOURCE_INTERVAL_SECONDS` already warns if Open-Meteo stops
+    publishing quarter-hourly; this is what makes that warning actionable
+    here rather than merely logged.
+    """
+    return _OUTDOOR_CARRY_INTERVALS * outdoor.SOURCE_INTERVAL_SECONDS
+
+
 def _outdoor_temp_on_grid(outdoor_rows, grid, unit):
     """The outdoor temperature trace, in display units, on the indoor x-grid (#109).
 
@@ -305,11 +322,16 @@ def _outdoor_temp_on_grid(outdoor_rows, grid, unit):
     Converted *before* the carry rather than after, so each observation is
     converted once rather than once per grid stamp it is held across -- and so
     the conversion plainly applies to the readings rather than to the drawing.
+
+    NULL temps are not filtered here on purpose: `units.from_celsius` passes
+    None through and `carry_forward` drops it, and that rule -- an empty
+    window is "nothing landed", never a held value and never evidence of
+    freshness -- belongs in one place rather than two.
     """
-    points = [(t, value) for t, value in outdoor_rows if value is not None]
+    points = list(outdoor_rows)
     if unit != "C":
         points = [(t, units.from_celsius(value, unit)) for t, value in points]
-    return carry_forward(points, grid, _OUTDOOR_CARRY_MAX_AGE_SECONDS)
+    return carry_forward(points, grid, _outdoor_carry_max_age_seconds())
 
 
 def _bootstrap_schema(db_path, logger) -> None:
@@ -380,7 +402,18 @@ def create_app(db_path=None):
         conn = connect()
         try:
             rows = db.readings_since(conn, METRIC_NAMES, since)
-            outdoor_rows = db.outdoor_readings_since(conn, ("temp",), since)
+            # One carry window BEFORE `since`, not `since` (#109 review). The
+            # observation that was current at the left edge was published
+            # before it, so reading from `since` leaves the first grid stamps
+            # with nothing at-or-before them and draws up to one publish
+            # interval of blank on a perfectly healthy poller -- which the
+            # footer promises means an outage. `carry_forward` clips to the
+            # grid, so the extra rows cost one bucket's worth of scan.
+            outdoor_rows = db.outdoor_readings_since(
+                conn,
+                ("temp",),
+                since - timedelta(seconds=_outdoor_carry_max_age_seconds()),
+            )
         finally:
             conn.close()
         unit = temp_unit()

@@ -6,12 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from awair import db, web
+from awair import db, outdoor, web
 from awair.web import METRIC_NAMES, create_app
+from tests._helpers import strip_js_comments
 
-DASHBOARD_JS_TEXT = (
-    Path(__file__).resolve().parent.parent / "static" / "dashboard.js"
-).read_text()
+# Comment-stripped, for the same reason `test_dashboard_assets.py` does it:
+# a construct disabled by commenting it out leaves its text in place, so a
+# guard reading raw source reports a file that is now broken as healthy.
+DASHBOARD_JS = strip_js_comments(
+    (Path(__file__).resolve().parent.parent / "static" / "dashboard.js").read_text()
+)
 
 
 @pytest.fixture(autouse=True)
@@ -193,7 +197,7 @@ def test_no_metric_card_is_marked_for_an_overlay_the_page_cannot_draw(client):
     overlay nothing draws costs a card a permanent band of blank space — and
     that is the silent half, because the chart itself still looks right.
     """
-    drawable = set(re.findall(r'dataset\.overlay === "([\w-]+)"', DASHBOARD_JS_TEXT))
+    drawable = set(re.findall(r'dataset\.overlay === "([\w-]+)"', DASHBOARD_JS))
     assert drawable, "dashboard.js no longer dispatches on dataset.overlay"
     assert set(web.METRIC_OVERLAYS.values()) <= drawable
 
@@ -1692,3 +1696,137 @@ def test_the_outdoor_trace_is_full_length_nulls_when_nothing_has_been_polled(
     grid = payload["metrics"]["temp"]["t"]
     assert grid, "fixture has no indoor temp grid to align against"
     assert payload["outdoor_temp"] == [None] * len(grid)
+
+
+def test_the_carry_window_is_two_publish_intervals_wide(client, tmp_path):
+    """The bound's *value*, at its own boundary — not merely that one exists.
+
+    The end-to-end staleness test below seeds an observation two days old, so
+    it passes under any bound shorter than 48 hours. Four mutants survived it
+    on the first draft (#109 review), including `96 *` — a **24-hour hold**,
+    which is exactly the flat-outdoor-line-beside-a-moving-indoor-one this
+    feature exists to prevent, sailing past the test whose docstring names it.
+
+    Asserted through `_outdoor_temp_on_grid` against a hand-built grid so the
+    two stamps straddle the boundary exactly, and expressed in terms of
+    `outdoor.SOURCE_INTERVAL_SECONDS` rather than 1800 so what gets pinned is
+    the derivation rather than today's arithmetic.
+    """
+    window = web._OUTDOOR_CARRY_INTERVALS * outdoor.SOURCE_INTERVAL_SECONDS
+    held, gone = web._outdoor_temp_on_grid([(0, 4.0)], [window, window + 1], "C")
+    assert held == 4.0, (
+        f"an observation exactly {web._OUTDOOR_CARRY_INTERVALS} publish "
+        "intervals old is dropped — one missed publish should be bridged"
+    )
+    assert gone is None, (
+        "an observation one second past the window is still held; the trace "
+        "will draw a flat line across an outdoor-poller outage"
+    )
+
+
+def test_the_carry_window_follows_the_source_cadence_rather_than_restating_it(
+    monkeypatch,
+):
+    """`2 * SOURCE_INTERVAL_SECONDS` and a literal `1800` are the same number today.
+
+    That is the whole problem: bound at import time the two are
+    indistinguishable to every behavioural test, and the claim being made in
+    the code comment, the README and the GLOSSARY is specifically that this
+    number *tracks the source cadence*. Read per call, the cadence can be
+    moved and the window watched to follow — which is the only way to tell a
+    derivation from a coincidence while the cadence happens to be 900.
+    """
+    baseline = web._outdoor_carry_max_age_seconds()
+    monkeypatch.setattr(outdoor, "SOURCE_INTERVAL_SECONDS", 3600)
+    assert web._outdoor_carry_max_age_seconds() == 2 * 3600
+    assert web._outdoor_carry_max_age_seconds() != baseline
+
+
+def test_a_healthy_outdoor_poller_leaves_no_gap_at_the_charts_left_edge(tmp_path):
+    """The window is read from before `since`, or the left edge lies.
+
+    The observation current at `since` was published *before* it, so reading
+    outdoor rows from `since` leaves the first grid stamps with nothing
+    at-or-before them — up to one publish interval of blank on a perfectly
+    healthy poller. The footer this change added promises a break in that line
+    is an outdoor-poller gap, so a routine left-edge gap makes the page lie.
+
+    Built on `range=today`, whose `since` is local midnight — an exact instant
+    — rather than on `7d`, whose `since` is computed at request time and lands
+    a second or two from anything the fixture can predict. The outdoor cadence
+    is deliberately offset from the hour (`+450 s`) so that no observation
+    falls ON midnight: an aligned one would cover the first grid stamp with or
+    without the look-back, and this test would pass on the broken code. The
+    first draft of this test did exactly that and the mutant survived it
+    (#109 review).
+    """
+    db_path = tmp_path / "leftedge.db"
+    conn = db.connect(db_path)
+    now_local = datetime.now().astimezone()
+    midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    elapsed = int((now_local - midnight).total_seconds())
+
+    for offset in range(0, elapsed + 1, 60):
+        at = (midnight + timedelta(seconds=offset)).astimezone(UTC)
+        conn.execute(
+            "INSERT INTO readings (ts, received_at, temp) VALUES (?, ?, ?)",
+            (iso_z(at), at.isoformat(), 22.5),
+        )
+    # Quarter-hourly and unbroken from an hour before midnight, offset off the
+    # hour so the newest observation at the first grid stamp is always one
+    # published BEFORE midnight.
+    for offset in range(-3600 + 450, elapsed + 1, 900):
+        at = (midnight + timedelta(seconds=offset)).astimezone(UTC)
+        conn.execute(
+            "INSERT INTO outdoor_readings (ts, received_at, temp) VALUES (?, ?, ?)",
+            (at.isoformat(), at.isoformat(), 10.0),
+        )
+    conn.commit()
+    conn.close()
+    app = create_app(db_path=str(db_path))
+    app.testing = True
+
+    payload = app.test_client().get("/api/series?range=today").get_json()
+    trace = payload["outdoor_temp"]
+    assert trace, "no grid to measure"
+    # The reachability control: if the fixture ever stops putting an outdoor
+    # observation before midnight and none on it, this test can only pass
+    # vacuously.
+    assert payload["metrics"]["temp"]["t"][0] == int(midnight.timestamp()), (
+        "the grid no longer starts at local midnight, so `since` and the first "
+        "stamp are no longer adjacent and nothing here tests the look-back"
+    )
+    assert trace[0] is not None, (
+        "the outdoor trace starts with a gap even though the poller was "
+        "healthy across midnight — read outdoor rows from one carry window "
+        "before `since`"
+    )
+    assert None not in trace, "an unbroken quarter-hourly feed produced a gap"
+
+
+def test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
+    client,
+):
+    """The `/api/series` payload is a contract with a file no Python test runs.
+
+    `dashboard.js` reads `seriesPayload.outdoor_temp`. Rename either side and
+    `Array.isArray(undefined)` is false, so the chart quietly drops back to
+    four series — while the template still renders `data-overlay="outdoor-temp"`
+    and the stylesheet still reserves a third legend row. A card with a
+    permanent band of blank space and a silently missing trace, nothing red:
+    verbatim the failure the `data-overlay` guards were written to stop, one
+    identifier to the left (#109 review).
+
+    Harvested rather than listed, so a key added to the JS tomorrow is covered
+    without an edit here.
+    """
+    read = set(re.findall(r"seriesPayload\.(\w+)", DASHBOARD_JS))
+    assert "outdoor_temp" in read, (
+        "dashboard.js no longer reads `seriesPayload.outdoor_temp` — if the "
+        "overlay moved, this guard has to move with it"
+    )
+    shipped = set(client.get("/api/series?range=7d").get_json())
+    assert read <= shipped, (
+        f"dashboard.js reads {sorted(read - shipped)} off the /api/series "
+        "payload and the endpoint does not ship it"
+    )
