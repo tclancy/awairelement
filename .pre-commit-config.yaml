@@ -1,3 +1,11 @@
+# `pre-commit install` writes the `pre-commit` hook type and nothing else unless
+# this key says otherwise, so the pre-push work declared below runs on this
+# machine only for as long as somebody remembers to have run
+# `pre-commit install --hook-type pre-push` by hand. Declaring both types makes
+# the gate a property of the repo rather than of one laptop (metaframework
+# #725). `dispatch gates` reports the undeclared case as INERT or FRAGILE.
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
