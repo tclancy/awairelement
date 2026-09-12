@@ -117,8 +117,12 @@ ingestion, so a wrong URL or 401 just gets logged.)
   either. The peak is read off the bucket **maxima**, not the averages, because
   that is invariant under bucket size — pressing "7 days" re-buckets the same
   readings and must not move a number about the readings. It is therefore the
-  top of the shaded band (which is what the Y axis was already scaled to),
-  which sits at or above the top of the averaged line.
+  top of the shaded band, which sits at or above the top of the averaged line.
+  On five of the six cards that is also where the Y axis was scaled to; the
+  temp card is the exception, because it shares its axis with the outdoor trace
+  (#109) and in summer the axis top is the outdoor line. The composite
+  precipitation card has no peak — its header already carries two numbers of
+  two different quantities, and a third wrapped it onto a second line.
 - **One temperature chart, indoors and out** (#109) — the outdoor trace is
   drawn on the indoor temp card rather than on a card of its own, **sharing its
   Y axis**: both are a temperature in the same unit, and the distance between

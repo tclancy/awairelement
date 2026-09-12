@@ -103,8 +103,11 @@ def peak(series):
       change every time Tom pressed "7 days" — a number that moves when only
       the drawing changed is the defect this function exists to answer.
     - **It is the top of the band, not the top of the line.** The drawn `avg`
-      line necessarily tops out at or below this, and the y-axis is already
-      autoscaled to `max`, so this is the reading the axis was sized for.
+      line necessarily tops out at or below this. On five of the six cards it
+      is also what the y-axis was sized for, since uPlot autoscales over the
+      `max` series it cannot see. Not on the temp card: that one shares its
+      axis with the outdoor trace on purpose (#109), so in summer the axis top
+      is the outdoor line and the header's peak sits well below it.
 
     Empty buckets carry None ("nothing landed in this window"), which is not a
     value and must not reach `max()`.

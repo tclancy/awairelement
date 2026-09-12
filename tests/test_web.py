@@ -564,20 +564,25 @@ def test_series_peak_is_the_highest_reading_not_the_highest_bucket_average(
         .get("/api/series?range=7d")
         .get_json()
     )
+    # The fixture packs its ten samples into ONE bucket by anchoring to a
+    # 300 s boundary. Say so here, or shrinking this range's bucket turns the
+    # assertion below into a confusing claim about averages.
+    assert payload["bucket_seconds"] == 300
     voc = payload["metrics"]["voc"]
     assert [v for v in voc["avg"] if v is not None] == [3180.0]
     assert payload["peaks"]["voc"] == 30000.0
 
 
-def test_series_peak_is_in_display_units(make_client, make_raw_client):
+def test_series_peak_is_in_display_units(client, make_client):
     """Converted with the series it summarises, not before it.
 
-    The seeded temp is exactly 22.5 C. A peak computed off the stored
-    Celsius and shipped beside a Fahrenheit chart puts `72.5 °F` on the line
-    and `peak 22.5` in the header of the same card.
+    Both halves read the SAME seed — `_seed_db`, whose temp column is exactly
+    22.5 C — so these are one reading under two settings rather than two
+    fixtures that happen to agree. A peak computed off the stored Celsius and
+    shipped beside a Fahrenheit chart puts `72.5 °F` on the line and
+    `peak 22.5` in the header of the same card.
     """
-    celsius = make_raw_client("peak-C", _seed_voc_spike)
-    assert celsius.get("/api/series?range=7d").get_json()["peaks"]["temp"] == 22.5
+    assert client.get("/api/series?range=7d").get_json()["peaks"]["temp"] == 22.5
     fahrenheit = make_client("F")
     assert fahrenheit.get("/api/series?range=7d").get_json()["peaks"]["temp"] == 72.5
 
@@ -585,28 +590,6 @@ def test_series_peak_is_in_display_units(make_client, make_raw_client):
 def test_series_peak_is_none_for_a_metric_with_no_readings(make_raw_client):
     payload = make_raw_client("peak-empty").get("/api/series?range=7d").get_json()
     assert payload["peaks"] == dict.fromkeys(METRIC_NAMES)
-
-
-def test_every_outdoor_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
-    client,
-):
-    """The `/api/outdoor-series` half of the contract guarded below for `/api/series`.
-
-    Same failure and same silence: `outdoorPayload.peaks[metric]` against a
-    payload that does not ship `peaks` throws on the card's first render and
-    takes the whole `load()` with it, so every chart on the page stays empty.
-    Harvested, not listed.
-    """
-    read = set(re.findall(r"outdoorPayload\.(\w+)", DASHBOARD_JS))
-    assert "metrics" in read, (
-        "dashboard.js no longer reads `outdoorPayload.metrics` — if the "
-        "outdoor cards moved, this guard has to move with them"
-    )
-    shipped = set(client.get("/api/outdoor-series?range=7d").get_json())
-    assert read <= shipped, (
-        f"dashboard.js reads {sorted(read - shipped)} off the "
-        "/api/outdoor-series payload and the endpoint does not ship it"
-    )
 
 
 # --- TEMPERATURE_UNIT env-var driven display conversion ---
@@ -1930,4 +1913,33 @@ def test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
     assert read <= shipped, (
         f"dashboard.js reads {sorted(read - shipped)} off the /api/series "
         "payload and the endpoint does not ship it"
+    )
+
+
+def test_every_outdoor_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
+    client,
+):
+    """The `/api/outdoor-series` half of the contract guarded above for `/api/series`.
+
+    Same failure and the same silence, one endpoint over: `dashboard.js` reads
+    `outdoorPayload.metrics` and `outdoorPayload.daily_events`, and renaming
+    either side leaves `undefined` where an object was — the precipitation
+    card draws nothing, or `load()` throws on the first card and no chart on
+    the page ever populates. Nothing else here reads that payload's key set.
+
+    Written while #116 nearly shipped a third key, `peaks`, off this endpoint;
+    the card that would have consumed it has no room, so the key is not shipped
+    and the JS does not read it. That is precisely the pairing this guard
+    exists to hold: harvested from the JS rather than listed here, so it stays
+    true whichever way a future card decides.
+    """
+    read = set(re.findall(r"outdoorPayload\.(\w+)", DASHBOARD_JS))
+    assert "metrics" in read, (
+        "dashboard.js no longer reads `outdoorPayload.metrics` — if the "
+        "outdoor cards moved, this guard has to move with them"
+    )
+    shipped = set(client.get("/api/outdoor-series?range=7d").get_json())
+    assert read <= shipped, (
+        f"dashboard.js reads {sorted(read - shipped)} off the "
+        "/api/outdoor-series payload and the endpoint does not ship it"
     )

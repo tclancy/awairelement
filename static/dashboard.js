@@ -86,10 +86,13 @@ const METRICS = {
   // Thousands-grouped, because uPlot groups the numbers this one sits beside:
   // the axis reads "40,000" and the legend "8,410", so a header reading
   // "38400 ppb" is the same quantity written two ways on one card (#116).
+  // `navigator.language`, not the ICU default, because that is the locale
+  // uPlot constructs its own `Intl.NumberFormat` with -- resolving the two
+  // separately is how they would come to group differently.
   function fmt(value, digits) {
     return value == null
       ? "–"
-      : Number(value).toLocaleString(undefined, {
+      : Number(value).toLocaleString(navigator.language || "en-US", {
           minimumFractionDigits: digits,
           maximumFractionDigits: digits,
         });

@@ -489,7 +489,7 @@ def test_the_overlay_series_is_actually_given_a_data_column(js_code):
     )
 
 
-def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js):
+def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
     """Counted on both sides, because both counts are decisions (#116).
 
     Six metric cards get a peak. The seventh chart -- the composite
@@ -502,9 +502,14 @@ def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js):
     A third chart factory moves `plots` and fails here whichever way it goes,
     which is the point: the next card has to decide, rather than inherit
     either answer by omission.
+
+    Reads `js_code`, not `js`, and that is the difference between a guard and
+    a decoration: commenting out the one `peakSuffix` call leaves its text in
+    the raw file, so the raw counts stay (2, 1) while the shipped dashboard
+    renders no peak at all. Measured — raw (2, 1), stripped (2, 0).
     """
-    plots = len(re.findall(r"\bnew uPlot\(", js))
-    renders = len(re.findall(r"(?<!function )\bpeakSuffix\(", js))
+    plots = len(re.findall(r"\bnew uPlot\(", js_code))
+    renders = len(re.findall(r"(?<!function )\bpeakSuffix\(", js_code))
     assert plots == 2, (
         f"{plots} chart factories, expected 2 — does the new one report a "
         "range peak in its card header (#116)?"
@@ -533,14 +538,16 @@ def _call_args(js, name):
 def test_the_peak_is_handed_to_the_factory_in_the_slot_it_declares(js_code):
     """POSITION, not membership — the same hazard as the overlay data columns.
 
-    Both factories take a series-shaped argument next to the peak:
-    `makePlot(card, metric, series, outdoorTemp, peak)` and
-    `makeOutdoorPlot(card, metric, series, allMetrics, peak)`. Swap the last
-    two at either call site and JavaScript says nothing: the overlay argument
-    becomes a number (`Array.isArray(4210)` is false, so the trace silently
-    vanishes) and the peak becomes an array, which `fmt` renders through
-    `Number([...])` as `NaN` or a stray value in the header. A membership
-    assertion over the argument list cannot see any of it.
+    `makePlot(card, metric, series, outdoorTemp, peak)` ends with two
+    arguments of different shapes and no way to tell them apart at runtime.
+    Swap them at the call site and JavaScript says nothing: `outdoorTemp`
+    becomes a number, `Array.isArray(38000)` is false, and the outdoor trace
+    silently vanishes from a card whose stylesheet still reserves a legend row
+    for it — while `peak` becomes an array that `fmt` renders through
+    `Number([...])` as `NaN`. A membership assertion over the argument list
+    cannot see any of it. (`makeOutdoorPlot` has no peak slot by design; its
+    fourth argument is `allMetrics`, and the count test above is what keeps
+    that a decision.)
 
     Also pins the peak's *source*: it is the server's `peaks`, keyed by this
     card's metric. Deriving it in the browser from `series.max` would pass a
