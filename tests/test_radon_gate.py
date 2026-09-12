@@ -7,10 +7,12 @@ Silence is this gate's pass signal, which makes "did not complain" worth exactly
 nothing until something proves the complaint path works.
 
 These tests are about the *installed* gate in this repo — that the hook still
-points at the script, that PKG_DIR names real Python, and that a grade-C block
-makes it exit non-zero. The script's other always-green paths (uvx off PATH,
-radon erroring, an empty package dir) are covered where the canonical copy
-lives, in metaframework's tests for `templates/radon-gate.sh`.
+points at the script, that the scope names real Python, that a grade-C block
+makes it exit non-zero, and (since #112) that the radon doing the grading is
+the one `uv.lock` pins rather than one `uvx` resolved from PyPI. The script's
+other always-green paths (the resolver off PATH, radon erroring, an empty
+package dir) are covered where the canonical copy lives, in metaframework's
+tests for `templates/radon-gate.sh`.
 """
 
 import shutil
@@ -58,12 +60,58 @@ def _hook():
     return next(h for h in hooks if h["id"] == "radon-complexity")
 
 
-def _pkg_dir():
-    """The one line the template tells each project to edit."""
+def _pkg_dir_assignment():
+    """The whole scope line the template tells each project to edit.
+
+    Matched by prefix rather than by exact name so this file reads both the
+    singular `PKG_DIR` the gate shipped with and the plural `PKG_DIRS` the
+    canonical copy moved to (metaframework #596) -- a test that can only see
+    one of them goes green by not finding the other.
+    """
     for line in GATE.read_text().splitlines():
-        if line.startswith("PKG_DIR="):
-            return line.split("=", 1)[1].strip().strip('"')
-    raise AssertionError("scripts/radon-gate.sh has no PKG_DIR assignment")
+        if line.startswith(("PKG_DIR=", "PKG_DIRS=")):
+            return line
+    raise AssertionError("scripts/radon-gate.sh has no PKG_DIR/PKG_DIRS assignment")
+
+
+def _pkg_dirs():
+    """Every tree the installed gate measures, as a list."""
+    return _pkg_dir_assignment().split("=", 1)[1].strip().strip('"').split()
+
+
+def _locked_radon_version():
+    """The radon `uv.lock` pins — the version #112 says must do the grading."""
+    lines = (REPO / "uv.lock").read_text().splitlines()
+    stanza = next((i for i, line in enumerate(lines) if line == 'name = "radon"'), None)
+    assert stanza is not None, (
+        "uv.lock names no radon package — the gate's own resolver test "
+        "(grep '^name = \"radon\"$') reads the same line, so it has fallen "
+        "back to uvx and #112 has regressed"
+    )
+    key, _, value = lines[stanza + 1].partition("=")
+    assert key.strip() == "version", (
+        f"uv.lock radon stanza shape changed: {lines[stanza + 1]!r}"
+    )
+    return value.strip().strip('"')
+
+
+def _gate_over(tmp_path, probe_dir):
+    """A copy of the installed gate, repointed at `probe_dir` and executable.
+
+    A copy rather than an env override on purpose: the thing under test is the
+    script this repo commits, and the canonical copy exposes no scope override
+    at all — `PKG_DIRS` is a literal assignment. (canvasoptimizer's divergent
+    copy does have one, deliberately namespaced and self-announcing, because a
+    plain `${PKG_DIRS-...}` would let an ambient export silently narrow a
+    `language: system` hook's scope. That reasoning lives there, not upstream.)
+    """
+    gate = tmp_path / "radon-gate.sh"
+    scope = _pkg_dir_assignment()
+    gate.write_text(
+        GATE.read_text().replace(scope, f'{scope.split("=")[0]}="{probe_dir}"')
+    )
+    gate.chmod(0o755)
+    return gate
 
 
 def test_hook_entry_is_the_script_not_an_inline_pipeline():
@@ -81,32 +129,49 @@ def test_hook_runs_on_every_commit_touching_python():
     assert hook["pass_filenames"] is False
 
 
-def test_pkg_dir_points_at_this_project_s_python():
-    """`PKG_DIR="src"` survives a copy-paste; this repo's package is `awair`."""
-    pkg = REPO / _pkg_dir()
-    assert pkg.is_dir()
-    assert list(pkg.glob("*.py"))
+def test_pkg_dirs_point_at_this_project_s_python():
+    """The template default survives a copy-paste; this repo's package is `awair`.
+
+    Every entry, not just the first: the scope is a space-separated list, and a
+    tree that has been renamed or removed must be a loud failure rather than a
+    gate that silently measures less than it says it does.
+    """
+    dirs = _pkg_dirs()
+    assert dirs, "the gate must name at least one tree"
+    assert "src" not in dirs, "the template's placeholder was never repointed"
+    for name in dirs:
+        pkg = REPO / name
+        assert pkg.is_dir(), name
+        assert list(pkg.glob("*.py")), name
 
 
 @pytest.mark.skipif(shutil.which("uvx") is None, reason="gate needs uvx to measure")
 def test_gate_exits_non_zero_on_a_grade_c_block(tmp_path):
     """Prove the complaint path — the half the original hook never had.
 
-    Runs the installed script with PKG_DIR repointed at a throwaway package, so
-    the assertion is about this repo's copy of the gate rather than about
+    Runs the installed script with its scope repointed at a throwaway package,
+    so the assertion is about this repo's copy of the gate rather than about
     whatever `awair/` happens to score today.
+
+    `cwd=tmp_path` is deliberate and is what makes this the **fallback-branch**
+    test: there is no `uv.lock` beside the probe package, so the gate resolves
+    `uvx $RADON_PIN` rather than the `uv run --frozen radon` this repo actually
+    uses. That branch is otherwise untested here, and it is the one every
+    project without a locked radon depends on. The branch this repo takes is
+    covered by `test_gate_measures_with_the_radon_the_lockfile_pins`, which
+    runs from the repo root for exactly that reason — so the `skipif` on `uvx`
+    below is a real requirement of this test and not boilerplate.
     """
     pkg = tmp_path / "probe_pkg"
     pkg.mkdir()
     (pkg / "probe.py").write_text(GRADE_C_SOURCE)
-    gate = tmp_path / "radon-gate.sh"
-    gate.write_text(
-        GATE.read_text().replace(f'PKG_DIR="{_pkg_dir()}"', 'PKG_DIR="probe_pkg"')
-    )
-    gate.chmod(0o755)
 
     result = subprocess.run(
-        [str(gate)], cwd=tmp_path, capture_output=True, text=True, check=False
+        [str(_gate_over(tmp_path, "probe_pkg"))],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
     assert result.returncode != 0
@@ -114,10 +179,50 @@ def test_gate_exits_non_zero_on_a_grade_c_block(tmp_path):
     assert "grade C or worse" in result.stderr
 
 
-@pytest.mark.skipif(shutil.which("uvx") is None, reason="gate needs uvx to measure")
+@pytest.mark.skipif(shutil.which("uv") is None, reason="gate needs uv to measure")
 def test_gate_passes_on_this_repo_as_committed():
-    """The other half: a clean tree is not blocked. Both halves or neither."""
+    """The other half: a clean tree is not blocked. Both halves or neither.
+
+    Guarded on `uv`, not `uvx`: run from the repo root the gate takes the
+    `uv run --frozen radon` branch, so a box with `uv` and no `uvx` would have
+    skipped a test it could have run — and a silent skip on this file is the
+    "green because nothing ran" state #57 was about, arriving by a new route.
+    """
     result = subprocess.run(
         [str(GATE)], cwd=REPO, capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_gate_measures_with_the_radon_the_lockfile_pins(tmp_path):
+    """#112: the gate must not resolve radon from outside the project.
+
+    `uvx radon` installs an unconstrained requirement into an ephemeral
+    environment, so the version grading this repo is one `uv.lock` does not
+    govern -- the same shape as #54. The gate names its own resolver and
+    version on every failure, so the way to read which radon ran is to make it
+    fail on purpose. Run from the repo root, because that is where `uv.lock`
+    is and the resolution is a question about the project it runs in.
+    """
+    probe = tmp_path / "probe_pkg"
+    probe.mkdir()
+    (probe / "probe.py").write_text(GRADE_C_SOURCE)
+
+    result = subprocess.run(
+        [str(_gate_over(tmp_path, probe))],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    # WHICH failure, before which radon. `fail()` prints the resolver line on
+    # every exit path, so the three assertions below also pass for a gate that
+    # died at "no Python found" without grading a block — demonstrated in
+    # review against an existing-but-empty scope, four assertions out of four.
+    # This one is what makes the rest a statement about the measurement.
+    assert "grade C or worse" in result.stderr, result.stderr
+    assert "uv run --frozen radon" in result.stderr, result.stderr
+    assert f"radon {_locked_radon_version()}" in result.stderr, result.stderr
+    assert "uvx" not in result.stderr, result.stderr
