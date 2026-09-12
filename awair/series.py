@@ -82,3 +82,35 @@ def carry_forward(points, grid, max_age_seconds):
         fresh = held_at is not None and stamp - held_at <= max_age_seconds
         result.append(held_value if fresh else None)
     return result
+
+
+def peak(series):
+    """The highest single reading in a bucketed `series`, or None if it has none.
+
+    The card header's answer to "how bad did it get in this range" (#116).
+    Nothing on a chart answered that before: the drawn line is `avg`, and the
+    legend is uPlot's *live* legend, so its `low` and `high` are the extremes
+    of the one bucket under the cursor rather than of the range. At the 60 s
+    `today` bucket that is two samples of a 30 s poll, and a one-bucket spike
+    is a few pixels wide — not a number a reader can get by hovering.
+
+    Read off `max`, deliberately, and the distinction is not cosmetic:
+
+    - **`max` is invariant under bucket size; `avg` is not.** The same
+      readings re-bucketed by the range button leave every bucket maximum in
+      some bucket, so their maximum does not move. The maximum bucket
+      *average* shrinks as buckets widen, so a peak derived from it would
+      change every time Tom pressed "7 days" — a number that moves when only
+      the drawing changed is the defect this function exists to answer.
+    - **It is the top of the band, not the top of the line.** The drawn `avg`
+      line necessarily tops out at or below this. On five of the six cards it
+      is also what the y-axis was sized for, since uPlot autoscales over the
+      `max` series it cannot see. Not on the temp card: that one shares its
+      axis with the outdoor trace on purpose (#109), so in summer the axis top
+      is the outdoor line and the header's peak sits well below it.
+
+    Empty buckets carry None ("nothing landed in this window"), which is not a
+    value and must not reach `max()`.
+    """
+    values = [value for value in series["max"] if value is not None]
+    return max(values) if values else None

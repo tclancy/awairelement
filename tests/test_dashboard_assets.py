@@ -487,3 +487,87 @@ def test_the_overlay_series_is_actually_given_a_data_column(js_code):
         "appended to `seriesConfig` last, so its data column has to be last "
         "too, or uPlot pairs every series with the wrong array."
     )
+
+
+def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
+    """Counted on both sides, because both counts are decisions (#116).
+
+    Six metric cards get a peak. The seventh chart -- the composite
+    precipitation card -- does not: its header already carries rain
+    accumulation plus the pressure trace's value and trend arrow (#42) under
+    the longest name on the page, and a third segment measured at 1440px
+    wrapped `.card h2` onto a second line, growing that card taller than its
+    row-mates.
+
+    A third chart factory moves `plots` and fails here whichever way it goes,
+    which is the point: the next card has to decide, rather than inherit
+    either answer by omission.
+
+    Reads `js_code`, not `js`, and that is the difference between a guard and
+    a decoration: commenting out the one `peakSuffix` call leaves its text in
+    the raw file, so the raw counts stay (2, 1) while the shipped dashboard
+    renders no peak at all. Measured — raw (2, 1), stripped (2, 0).
+    """
+    plots = len(re.findall(r"\bnew uPlot\(", js_code))
+    renders = len(re.findall(r"(?<!function )\bpeakSuffix\(", js_code))
+    assert plots == 2, (
+        f"{plots} chart factories, expected 2 — does the new one report a "
+        "range peak in its card header (#116)?"
+    )
+    assert renders == 1, (
+        f"{renders} peakSuffix() calls, expected exactly 1 (the metric-card "
+        "factory). A card with no peak reports no range extreme at all; a "
+        "peak on the precipitation card wraps its header."
+    )
+
+
+def _params(js, name):
+    match = re.search(r"function " + name + r"\(([^)]*)\)", js)
+    assert match, f"no `function {name}(...)` definition"
+    return [p.strip() for p in match.group(1).split(",") if p.strip()]
+
+
+def _call_args(js, name):
+    match = re.search(
+        r"(?<!function )\b" + name + r"\(([^()]*(?:\[[^\]]*\][^()]*)*)\)", js
+    )
+    assert match, f"no call to `{name}(...)`"
+    return [a.strip() for a in match.group(1).split(",") if a.strip()]
+
+
+def test_the_peak_is_handed_to_the_factory_in_the_slot_it_declares(js_code):
+    """POSITION, not membership — the same hazard as the overlay data columns.
+
+    `makePlot(card, metric, series, outdoorTemp, peak)` ends with two
+    arguments of different shapes and no way to tell them apart at runtime.
+    Swap them at the call site and JavaScript says nothing: `outdoorTemp`
+    becomes a number, `Array.isArray(38000)` is false, and the outdoor trace
+    silently vanishes from a card whose stylesheet still reserves a legend row
+    for it — while `peak` becomes an array that `fmt` renders through
+    `Number([...])` as `NaN`. A membership assertion over the argument list
+    cannot see any of it. (`makeOutdoorPlot` has no peak slot by design; its
+    fourth argument is `allMetrics`, and the count test above is what keeps
+    that a decision.)
+
+    Also pins the peak's *source*: it is the server's `peaks`, keyed by this
+    card's metric. Deriving it in the browser from `series.max` would pass a
+    position check and re-introduce the second conversion path `/api/series`
+    exists to avoid.
+    """
+    factory, payload = "makePlot", "seriesPayload"
+    params = _params(js_code, factory)
+    args = _call_args(js_code, factory)
+    assert len(args) == len(params), (
+        f"{factory} declares {params} and is called with {args}"
+    )
+    assert params[-1] == "peak", (
+        f"{factory}'s last parameter is no longer `peak`: {params}"
+    )
+    assert args[params.index("peak")] == f"{payload}.peaks[metric]", (
+        f"{factory} is handed {args[params.index('peak')]!r} in its `peak` "
+        f"slot — it must be `{payload}.peaks[metric]`, the server-computed "
+        "peak for THIS card's metric (#116)"
+    )
+    assert args[params.index("metric")] == "metric", (
+        f"{factory}'s `metric` slot is {args[params.index('metric')]!r}"
+    )

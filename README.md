@@ -104,6 +104,25 @@ ingestion, so a wrong URL or 401 just gets logged.)
   score over today, 7d or 30d, opening on today (#108). "Today" is since local
   midnight, not the last 24 h. Detected events overlay as shaded spans.
   LAN-only by default (no auth).
+- **Each card's range peak** (#116) — the header carries two numbers: the
+  current reading, and `peak N`, the highest single reading over the range on
+  screen. It exists because the card previously had no way to tell you that.
+  The drawn line is the per-bucket **average**, so a spike inside one bucket is
+  flattened into it; and uPlot's legend is *live*, so the `low`/`high` it shows
+  are the extremes of the one bucket under the cursor — on `today` that is two
+  samples of a 30-second poll. #116 reported the consequence: a TVOC line
+  topping out near 35,000 beside a legend reading `high: 8,410`. Both numbers
+  were right and neither was the range's extreme, and the 60-second bucket that
+  set the visible peak was a few pixels wide, so hovering could not get it
+  either. The peak is read off the bucket **maxima**, not the averages, because
+  that is invariant under bucket size — pressing "7 days" re-buckets the same
+  readings and must not move a number about the readings. It is therefore the
+  top of the shaded band, which sits at or above the top of the averaged line.
+  On five of the six cards that is also where the Y axis was scaled to; the
+  temp card is the exception, because it shares its axis with the outdoor trace
+  (#109) and in summer the axis top is the outdoor line. The composite
+  precipitation card has no peak — its header already carries two numbers of
+  two different quantities, and a third wrapped it onto a second line.
 - **One temperature chart, indoors and out** (#109) — the outdoor trace is
   drawn on the indoor temp card rather than on a card of its own, **sharing its
   Y axis**: both are a temperature in the same unit, and the distance between

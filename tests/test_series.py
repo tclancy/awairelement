@@ -2,7 +2,7 @@
 
 from typing import ClassVar
 
-from awair.series import bucket, carry_forward
+from awair.series import bucket, carry_forward, peak
 
 BUCKET = 300  # 5 min
 
@@ -153,3 +153,67 @@ class TestCarryForward:
         poller that has never run has to produce a full-length run of None.
         """
         assert carry_forward([], self.GRID, 600) == [None] * len(self.GRID)
+
+
+class TestPeak:
+    """`peak` is the highest single reading in a bucketed series (#116).
+
+    Tom read a TVOC chart whose line topped out near 35,000 against a legend
+    reading "high: 8,410" and filed it as a legend defect. The legend was
+    right and it was answering a different question: uPlot's live legend reads
+    every series at the *cursor*, so `low` and `high` there are one bucket's
+    extremes. On `today` that bucket is 60 s against a 30 s poll — exactly two
+    samples, and (7594 + 8410) / 2 == 8002.0, which is the `avg` the same
+    legend showed. Nothing on the card reported the extreme of the *range*.
+
+    Read off `max` rather than `avg`, which is the property the invariance
+    test below pins: the maximum bucket average shrinks as buckets get wider,
+    so a peak derived from it would change every time the range button moved
+    while the underlying readings did not.
+    """
+
+    def test_peak_is_the_highest_reading_in_the_series(self):
+        assert peak(bucket(points(600, [10, 20, 80, 30]), BUCKET)) == 80.0
+
+    def test_peak_reads_the_bucket_maxima_not_the_bucket_averages(self):
+        # One 300 s bucket of ten 30 s samples: nine 10s and one 80. The
+        # bucket's avg is 17.0 and its max is 80.0 — a peak taken off `avg`
+        # would report 17.0 and understate the spike by a factor of nearly 5.
+        series = bucket(points(600, [10] * 9 + [80]), BUCKET)
+        assert series["avg"] == [17.0]
+        assert peak(series) == 80.0
+
+    def test_peak_is_the_same_number_at_every_bucket_size(self):
+        # The invariance that makes this number safe to print in a card
+        # header: the same readings, re-bucketed by the range button, must
+        # not move it. Maximum bucket *average* fails this — 80.0 at 30 s
+        # buckets, 17.0 at 300 s, 12.75 at 3600 s — which is the whole
+        # argument for deriving the peak from `max`.
+        readings = points(600, [10] * 9 + [80] + [10] * 110)
+        peaks = {size: peak(bucket(readings, size)) for size in (30, 60, 300, 3600)}
+        assert set(peaks.values()) == {80.0}, peaks
+
+    def test_peak_ignores_empty_buckets(self):
+        # A gap carries None, which is "nothing landed in this window" — not
+        # a value, and not something max() may be handed.
+        series = bucket([(600, 1.0), (1230, 3.0)], BUCKET)
+        assert series["max"] == [1.0, None, 3.0]
+        assert peak(series) == 3.0
+
+    def test_peak_of_an_empty_series_is_none(self):
+        assert peak(bucket([], BUCKET)) is None
+
+    def test_peak_of_an_all_gap_series_is_none(self):
+        # Every bucket empty is the same "no readings" answer as no buckets
+        # at all, and must not raise on max() of an empty sequence.
+        assert (
+            peak(
+                {
+                    "t": [0, 60],
+                    "avg": [None] * 2,
+                    "min": [None] * 2,
+                    "max": [None, None],
+                }
+            )
+            is None
+        )

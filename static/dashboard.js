@@ -83,8 +83,38 @@ const METRICS = {
     return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
   }
 
+  // Thousands-grouped, because uPlot groups the numbers this one sits beside:
+  // the axis reads "40,000" and the legend "8,410", so a header reading
+  // "38400 ppb" is the same quantity written two ways on one card (#116).
+  // `navigator.language`, not the ICU default, because that is the locale
+  // uPlot constructs its own `Intl.NumberFormat` with -- resolving the two
+  // separately is how they would come to group differently.
   function fmt(value, digits) {
-    return value == null ? "–" : Number(value).toFixed(digits);
+    return value == null
+      ? "–"
+      : Number(value).toLocaleString(navigator.language || "en-US", {
+          minimumFractionDigits: digits,
+          maximumFractionDigits: digits,
+        });
+  }
+
+  // The header's second number: the highest single reading in the visible
+  // range, which before #116 the card had no way to tell you.
+  //
+  // The drawn line is `avg` and uPlot's legend is LIVE — its `low`/`high` are
+  // the extremes of the one bucket under the cursor, not of the range — so
+  // reading the peak off the chart meant hovering the exact bucket that set
+  // it. On `today` that bucket is 60 s wide and a spike is one of them, a few
+  // pixels across. Tom's report was a 35,000-topping TVOC line against a
+  // legend saying "high: 8,410": both numbers correct, neither one the answer.
+  //
+  // Computed in `awair.series.peak` and shipped on the payload rather than
+  // derived here, so it is unit-tested and converted exactly once, with the
+  // series it summarises. Bare of its unit on purpose — the header states the
+  // unit once already, and this segment has to fit beside the overlay
+  // suffixes on the temp and precipitation cards at phone widths.
+  function peakSuffix(peak, digits) {
+    return peak == null ? "" : " · peak " + fmt(peak, digits);
   }
 
   // Wash alert-event spans onto a chart, clipped to the plotting area.
@@ -296,7 +326,7 @@ const METRICS = {
     };
   }
 
-  function makePlot(card, metric, series, outdoorTemp) {
+  function makePlot(card, metric, series, outdoorTemp, peak) {
     const meta = METRICS[metric];
     const color = cssVar(`--series-${metric}`);
     const plotEl = card.querySelector(".plot");
@@ -398,6 +428,8 @@ const METRICS = {
     card.querySelector(".dot").style.background = color;
     const latest = [...series.avg].reverse().find((v) => v != null);
     let nowText = fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    // Before the overlay suffix, so this card's own two numbers stay adjacent.
+    nowText += peakSuffix(peak, meta.digits);
     if (overlayOutdoor) {
       const latestOutdoor = [...outdoorTemp].reverse().find((v) => v != null);
       // Prefixed rather than bare: two numbers in the same unit side by side
@@ -561,6 +593,17 @@ const METRICS = {
     card.querySelector(".dot").style.background = color;
     const latest = [...series.avg].reverse().find((v) => v != null);
     let nowText = fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
+    // Deliberately NO peak on this card, and it is a layout fact rather than a
+    // preference (#116). This is the composite storm-signal card: its header
+    // already carries two numbers of two different quantities (rain
+    // accumulation and the pressure trace's latest + trend arrow, #42), under
+    // the longest card name on the page. Measured at 1440px, a third segment
+    // wrapped `.card h2` onto a second line, which grows this card taller than
+    // its row-mates -- the same "a populated row is taller than an idle one"
+    // shift `--legend-rows` exists to prevent, one element up. The peak is a
+    // metric-card feature; `test_the_range_peak_is_rendered_on_the_metric_
+    // cards_and_only_there` is what makes a third chart factory decide rather
+    // than inherit.
     if (overlayPressure) {
       const summary = pressureSummary(pressureSeries);
       if (summary != null) {
@@ -590,7 +633,8 @@ const METRICS = {
         card,
         metric,
         seriesPayload.metrics[metric],
-        seriesPayload.outdoor_temp
+        seriesPayload.outdoor_temp,
+        seriesPayload.peaks[metric]
       );
     }
     for (const card of document.querySelectorAll(".card[data-outdoor]")) {
