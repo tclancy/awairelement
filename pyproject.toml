@@ -64,9 +64,11 @@ combine-as-imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# -ra so skipped tests are visible in CI output: tests/test_radon_gate.py
-# skips its two meaningful cases when uvx is absent, and a silent skip there
-# restores exactly the "green because nothing ran" state #57 was about.
+# -ra so skipped tests are visible in CI output: tests/test_radon_gate.py guards
+# its gate-executing cases on the binary each one actually resolves — `uvx` for
+# the fallback-branch test, `uv` for the two that run from the repo root (#112)
+# — and a silent skip on any of them restores exactly the "green because
+# nothing ran" state #57 was about.
 addopts = "-ra --cov=awair --cov-report=term-missing"
 
 [tool.coverage.run]

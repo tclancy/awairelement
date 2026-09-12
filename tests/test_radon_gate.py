@@ -82,7 +82,12 @@ def _pkg_dirs():
 def _locked_radon_version():
     """The radon `uv.lock` pins — the version #112 says must do the grading."""
     lines = (REPO / "uv.lock").read_text().splitlines()
-    stanza = lines.index('name = "radon"')
+    stanza = next((i for i, line in enumerate(lines) if line == 'name = "radon"'), None)
+    assert stanza is not None, (
+        "uv.lock names no radon package — the gate's own resolver test "
+        "(grep '^name = \"radon\"$') reads the same line, so it has fallen "
+        "back to uvx and #112 has regressed"
+    )
     key, _, value = lines[stanza + 1].partition("=")
     assert key.strip() == "version", (
         f"uv.lock radon stanza shape changed: {lines[stanza + 1]!r}"
@@ -94,8 +99,11 @@ def _gate_over(tmp_path, probe_dir):
     """A copy of the installed gate, repointed at `probe_dir` and executable.
 
     A copy rather than an env override on purpose: the thing under test is the
-    script this repo commits, and the canonical copy deliberately refuses a
-    plain environment override of its own scope (metaframework #596).
+    script this repo commits, and the canonical copy exposes no scope override
+    at all — `PKG_DIRS` is a literal assignment. (canvasoptimizer's divergent
+    copy does have one, deliberately namespaced and self-announcing, because a
+    plain `${PKG_DIRS-...}` would let an ambient export silently narrow a
+    `language: system` hook's scope. That reasoning lives there, not upstream.)
     """
     gate = tmp_path / "radon-gate.sh"
     scope = _pkg_dir_assignment()
@@ -144,6 +152,15 @@ def test_gate_exits_non_zero_on_a_grade_c_block(tmp_path):
     Runs the installed script with its scope repointed at a throwaway package,
     so the assertion is about this repo's copy of the gate rather than about
     whatever `awair/` happens to score today.
+
+    `cwd=tmp_path` is deliberate and is what makes this the **fallback-branch**
+    test: there is no `uv.lock` beside the probe package, so the gate resolves
+    `uvx $RADON_PIN` rather than the `uv run --frozen radon` this repo actually
+    uses. That branch is otherwise untested here, and it is the one every
+    project without a locked radon depends on. The branch this repo takes is
+    covered by `test_gate_measures_with_the_radon_the_lockfile_pins`, which
+    runs from the repo root for exactly that reason — so the `skipif` on `uvx`
+    below is a real requirement of this test and not boilerplate.
     """
     pkg = tmp_path / "probe_pkg"
     pkg.mkdir()
@@ -162,9 +179,15 @@ def test_gate_exits_non_zero_on_a_grade_c_block(tmp_path):
     assert "grade C or worse" in result.stderr
 
 
-@pytest.mark.skipif(shutil.which("uvx") is None, reason="gate needs uvx to measure")
+@pytest.mark.skipif(shutil.which("uv") is None, reason="gate needs uv to measure")
 def test_gate_passes_on_this_repo_as_committed():
-    """The other half: a clean tree is not blocked. Both halves or neither."""
+    """The other half: a clean tree is not blocked. Both halves or neither.
+
+    Guarded on `uv`, not `uvx`: run from the repo root the gate takes the
+    `uv run --frozen radon` branch, so a box with `uv` and no `uvx` would have
+    skipped a test it could have run — and a silent skip on this file is the
+    "green because nothing ran" state #57 was about, arriving by a new route.
+    """
     result = subprocess.run(
         [str(GATE)], cwd=REPO, capture_output=True, text=True, check=False
     )
@@ -194,6 +217,12 @@ def test_gate_measures_with_the_radon_the_lockfile_pins(tmp_path):
     )
 
     assert result.returncode != 0, result.stdout + result.stderr
+    # WHICH failure, before which radon. `fail()` prints the resolver line on
+    # every exit path, so the three assertions below also pass for a gate that
+    # died at "no Python found" without grading a block — demonstrated in
+    # review against an existing-but-empty scope, four assertions out of four.
+    # This one is what makes the rest a statement about the measurement.
+    assert "grade C or worse" in result.stderr, result.stderr
     assert "uv run --frozen radon" in result.stderr, result.stderr
     assert f"radon {_locked_radon_version()}" in result.stderr, result.stderr
     assert "uvx" not in result.stderr, result.stderr
