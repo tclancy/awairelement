@@ -269,12 +269,15 @@ ingestion, so a wrong URL or 401 just gets logged.)
   would read as those.
 
   **Nothing on this side acts on those two clocks diverging, and that is
-  deliberate (#114).** A failing NWS fetch logs a WARNING every 15 minutes and
-  stops there: it does not feed `OutdoorHealth`, which pages at *high* priority
-  for `unreachable` and keeps one open `alert_events` row per metric. Escalating
-  through it would wake someone for a fault on a third party's box and would
-  contend with the Open-Meteo tracker's own open row — the one-row-per-metric
-  collision #94 records for `device` against `outdoor`.
+  deliberate (#114).** A failing NWS fetch logs a WARNING every 15 minutes,
+  stamps `last_attempt_at`, and stops there: its status never reaches
+  `OutdoorHealth`, and `outdoor.main` discards the alert poll's return value on
+  purpose. Feeding it in would escalate through `handle_outdoor_health`, which
+  notifies at *high* priority for `unreachable` — waking someone for a fault on
+  a third party's box — and would contend with the Open-Meteo tracker's own
+  open row, since `db.get_open_events` returns at most one open event per
+  metric (the collision #94 records for `device` against `outdoor`; it is a
+  read-side property, not a constraint on the table).
   `tests/test_outdoor.py::test_an_nws_outage_does_not_escalate_the_outdoor_poller_to_unreachable`
   pins that: an NWS outage sends no notification and opens no `outdoor` event.
 
