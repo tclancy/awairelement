@@ -268,6 +268,26 @@ ingestion, so a wrong URL or 401 just gets logged.)
   both a year older, and `/api/alerts` beside `/api/latest`'s `open_events`
   would read as those.
 
+  **Nothing on this side acts on those two clocks diverging, and that is
+  deliberate (#114).** A failing NWS fetch logs a WARNING every 15 minutes and
+  stops there: it does not feed `OutdoorHealth`, which pages at *high* priority
+  for `unreachable` and keeps one open `alert_events` row per metric. Escalating
+  through it would wake someone for a fault on a third party's box and would
+  contend with the Open-Meteo tracker's own open row — the one-row-per-metric
+  collision #94 records for `device` against `outdoor`.
+  `tests/test_outdoor.py::test_an_nws_outage_does_not_escalate_the_outdoor_poller_to_unreachable`
+  pins that: an NWS outage sends no notification and opens no `outdoor` event.
+
+  **So detection of a *sustained* outage belongs to the consumer**, as the
+  divergence between `last_attempt_at` and `last_success_at`. That is a
+  contract, not a hope, and it has a failure mode worth naming: if the hub
+  never implements the comparison, a permanently failing NWS fetch is silent
+  everywhere except this app's log. The endpoint publishes everything the check
+  needs and nothing here will notice it going unused. Read that as the price of
+  keeping two upstreams' verdicts apart, and re-read it the day a card colour
+  actually hangs off the alert feed — at which point the absent check becomes
+  testable from the hub's side, which is the better place to decide it.
+
 ## Running as a systemd user service
 
 The `systemd/` directory ships two unit files you can drop into
