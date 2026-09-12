@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from flask import Flask, abort, jsonify, render_template, request
 
 from awair import db, outdoor, solar, spikes, units, weather_alerts
-from awair.series import bucket, carry_forward
+from awair.series import bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 
@@ -431,6 +431,13 @@ def create_app(db_path=None):
             {
                 "bucket_seconds": bucket_seconds,
                 "metrics": metrics,
+                # The highest single reading per metric over this range (#116),
+                # for the card header. Taken from the series AFTER the unit
+                # conversion above rather than from the stored readings, so
+                # there is exactly one conversion path and the header cannot
+                # print a Celsius peak beside a Fahrenheit line. See
+                # `series.peak` for why it reads `max` and not `avg`.
+                "peaks": {name: peak(data) for name, data in metrics.items()},
                 # #109. A flat list, not a `{t, avg, min, max}` block, because
                 # its x values ARE `metrics["temp"]["t"]` -- shipping a second
                 # `t` beside it would be the same value published twice with
@@ -726,6 +733,10 @@ def create_app(db_path=None):
                     "precipitation": precip_series,
                     "pressure": pressure_series,
                 },
+                # No `peaks` here, unlike `/api/series` (#116): the one card
+                # this endpoint draws is the composite storm card, whose header
+                # has no room for a third number. Shipping a block nothing
+                # renders would be a second, untested conversion path.
                 "temp_unit_symbol": units.symbol(unit),
                 "daily_events": solar.daily_events(since, datetime.now(UTC)),
             }
