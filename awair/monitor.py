@@ -172,6 +172,47 @@ def check_metrics(conn, notifier, now):
         apply(_Notice(conn, notifier, name, decision, event, now, temp_unit))
 
 
+def adopt_open_event(health, conn, metric):
+    """Seed a starting health tracker from an alert event left open on disk.
+
+    Both trackers keep `alerted` in memory while the row that mirrors it lives
+    in the database, so a poller that restarts mid-outage came back with the
+    latch clear and opened a *second* row for the same metric (#100).
+    `db.get_open_events` returns at most one row per metric and the later one
+    wins, so the earlier row then became unreachable: recovery closed the new
+    one and the original stayed open on the dashboard forever.
+
+    Called once at startup, after the connection is open and before the poll
+    loop. Returns the tier adopted, or None when nothing was open -- which is
+    the ordinary case and is why this logs nothing then.
+
+    **It restores the latch, not the run counter**, and that is the whole of
+    what it can do: a process that died *before* its threshold opened no row,
+    so there is nothing on disk to read. A crash-loop shorter than the
+    threshold therefore still never alerts, which is the other half of #100's
+    "worse outdoors" argument and is out of that issue's Done-when.
+
+    Adopting the tier rather than a bare flag matters because `alerted` is read
+    as a tier, not as a boolean -- and because a mid-outage tier change is not
+    something either tracker records *within* one process either: `observe`
+    only reports a tier while `alerted is None`. So a poller that adopts
+    "degraded" and then starts erroring stays "degraded" until it recovers,
+    exactly as an un-restarted one would.
+    """
+    event = db.get_open_events(conn).get(metric)
+    if event is None:
+        return None
+    health.alerted = event["tier"]
+    log.info(
+        "resuming the open %s alert (%s) opened at %s -- a previous process "
+        "left it open",
+        metric,
+        event["tier"],
+        event["opened_at"].isoformat(),
+    )
+    return event["tier"]
+
+
 class DeviceHealth:
     """Consecutive-status tracker for the two device failure modes.
 

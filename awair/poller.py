@@ -21,7 +21,7 @@ from awair.fans import (
     config_from_env as fans_config_from_env,
     run_fan_test,
 )
-from awair.monitor import DeviceHealth, check_metrics
+from awair.monitor import DeviceHealth, adopt_open_event, check_metrics
 from awair.shutdown import install_handler
 
 log = logging.getLogger("awair.poller")
@@ -222,6 +222,10 @@ def main(argv=None) -> None:
         finally:
             conn.close()
         return
+
+    # A restart mid-outage must not open a second alert_event (#100): the row
+    # outlives the process, so the latch that mirrors it has to as well.
+    adopt_open_event(health, conn, "device")
 
     fetch = make_fetch(url)
     log.info(

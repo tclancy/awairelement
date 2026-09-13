@@ -32,7 +32,7 @@ from datetime import UTC, date, datetime
 
 from awair import db, weather_alerts
 from awair.alerts import Notifier
-from awair.monitor import OutdoorHealth
+from awair.monitor import OutdoorHealth, adopt_open_event
 from awair.shutdown import install_handler
 
 # A trailing ISO zone designator, stripped before the date-only test in
@@ -573,6 +573,10 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
+
+    # A restart mid-outage must not open a second alert_event (#100). Sharper
+    # here than indoors: this unit is Restart=always/RestartSec=30.
+    adopt_open_event(health, conn, "outdoor")
 
     fetch_weather = make_fetch(_build_url(weather_base, lat, lon, WEATHER_FIELDS))
     fetch_air_quality = make_fetch(
