@@ -807,11 +807,19 @@ def events_since(conn, since) -> list:
 
 
 def get_open_events(conn) -> dict:
-    """Open alert events keyed by metric (at most one open per metric)."""
+    """Open alert events keyed by metric (at most one open per metric).
+
+    `ORDER BY id` so that "at most one" degrades predictably when it is not
+    true. The invariant is maintained by `monitor.adopt_open_event` (#100), but
+    a database written by a poller older than that fix can hold several open
+    rows for one metric, and the dict comprehension below keeps whichever
+    arrives last. Without the sort that was the rowid scan order -- an artefact,
+    not a promise, and #100's adoption order now rests on it.
+    """
     rows = conn.execute(
         "SELECT id, metric, tier, opened_at, renotified_at, peak_value,"
         " baseline, threshold, notified_value, fans_engaged"
-        " FROM alert_events WHERE closed_at IS NULL"
+        " FROM alert_events WHERE closed_at IS NULL ORDER BY id"
     )
     return {
         row[1]: {

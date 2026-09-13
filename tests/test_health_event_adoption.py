@@ -26,6 +26,7 @@ restart not double-open and that recovery close the row that is open.
 import json
 import os
 import signal
+from datetime import UTC, datetime
 
 import pytest
 
@@ -33,8 +34,12 @@ from awair import db, monitor, outdoor, poller
 from awair.monitor import DeviceHealth, OutdoorHealth
 from tests._helpers import FakeNotifier
 
-DEVICE = "device"
-OUTDOOR = "outdoor"
+DEVICE = DeviceHealth.METRIC
+OUTDOOR = OutdoorHealth.METRIC
+
+
+def _t():
+    return datetime(2026, 9, 13, 9, 0, tzinfo=UTC)
 
 
 # --------------------------------------------------------------------------
@@ -103,12 +108,6 @@ def test_adopt_carries_the_tier_rather_than_a_flag(conn):
     health = OutdoorHealth()
     monitor.adopt_open_event(health, conn, OUTDOOR)
     assert health.alerted == "stale"
-
-
-def _t():
-    from datetime import UTC, datetime
-
-    return datetime(2026, 9, 13, 9, 0, tzinfo=UTC)
 
 
 # --------------------------------------------------------------------------
@@ -335,3 +334,74 @@ def test_outdoor_recovery_after_a_restart_closes_the_row_that_is_open(
     assert rows[0][0] == opened_id
     assert rows[0][2] == opened_at
     assert rows[0][3] is not None
+
+
+# --------------------------------------------------------------------------
+# Two properties the docstrings claim and nothing else pinned
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("health", "adopted", "outage_status"),
+    [
+        (DeviceHealth(), "stale", "error"),
+        (OutdoorHealth(), "degraded", "error"),
+    ],
+)
+def test_an_adopted_tier_does_not_drift_when_the_outage_changes_shape(
+    health, adopted, outage_status
+):
+    """An adopted latch behaves exactly like an un-restarted one that alerted.
+
+    Neither tracker escalates a tier *within* one process either -- `observe`
+    reports a tier only while `alerted is None` -- so adopting "degraded" and
+    then erroring must stay "degraded" rather than re-announcing. The
+    `adopt_open_event` docstring says so; without this, loosening that guard in
+    `observe` would re-open a second row on the next poll and nothing would go
+    red.
+    """
+    health.alerted = adopted
+    verdicts = [health.observe(outage_status) for _ in range(10)]
+
+    assert verdicts == [None] * 10
+    assert health.alerted == adopted
+    assert health.observe("inserted") == "recovered"
+
+
+def test_orphans_already_on_disk_drain_one_per_restart(conn):
+    """Retires the ticket's option 3: no prune job is owed.
+
+    This bug has been live, so the real database can hold several open rows for
+    one metric. Adoption closes them one per restart-plus-recovery cycle rather
+    than stranding them -- at the cost of one spurious "recovered" notification
+    each, which is the thing to know before the deploy rather than after.
+    """
+    for _ in range(2):
+        db.open_event(
+            conn,
+            metric=DEVICE,
+            tier="unreachable",
+            opened_at=_t(),
+            value=None,
+            baseline=None,
+            threshold=None,
+            notified=True,
+        )
+
+    def cycle():
+        """One process lifetime: start, adopt, see one healthy poll."""
+        health = DeviceHealth()
+        adopted = monitor.adopt_open_event(health, conn, DEVICE)
+        notifier = FakeNotifier()
+        poller.handle_device_health(conn, notifier, health, "inserted", _t())
+        still_open = conn.execute(
+            "SELECT id FROM alert_events WHERE closed_at IS NULL ORDER BY id"
+        ).fetchall()
+        return adopted, len(notifier.sent), [row[0] for row in still_open]
+
+    # (tier adopted, notifications sent, rows still open)
+    assert cycle() == ("unreachable", 1, [1])
+    assert cycle() == ("unreachable", 1, [])
+    # Nothing left to adopt, so the latch stays clear, the healthy poll is not
+    # read as a recovery, and the pings stop. Two per two orphans, not forever.
+    assert cycle() == (None, 0, [])

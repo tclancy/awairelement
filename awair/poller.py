@@ -153,7 +153,7 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
         )
         db.open_event(
             conn,
-            metric="device",
+            metric=DeviceHealth.METRIC,
             tier=verdict,
             opened_at=now,
             value=None,
@@ -162,7 +162,7 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
             notified=notified,
         )
     elif verdict == "recovered":
-        event = db.get_open_events(conn).get("device")
+        event = db.get_open_events(conn).get(DeviceHealth.METRIC)
         notified = notifier.send(
             "Awair Element recovered", title="Awair device recovered"
         )
@@ -225,7 +225,7 @@ def main(argv=None) -> None:
 
     # A restart mid-outage must not open a second alert_event (#100): the row
     # outlives the process, so the latch that mirrors it has to as well.
-    adopt_open_event(health, conn, "device")
+    adopt_open_event(health, conn, DeviceHealth.METRIC)
 
     fetch = make_fetch(url)
     log.info(
