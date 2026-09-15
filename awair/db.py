@@ -120,6 +120,13 @@ CREATE TABLE IF NOT EXISTS weather_alert_poll (
     last_attempt_at TEXT,
     last_success_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS health_state (
+    metric TEXT PRIMARY KEY,
+    last_status TEXT NOT NULL,
+    run_length INTEGER NOT NULL,
+    observed_at TEXT NOT NULL
+);
 """
 # Concatenated rather than interpolated: `str.format` and f-strings both treat
 # `{` as a placeholder, and SQL is full of braceable syntax (a future CHECK or a
@@ -1035,6 +1042,61 @@ def set_fan_run(conn, fan_id: int, started_at, capped: bool) -> None:
             started_at.isoformat() if started_at else None,
             int(capped),
         ),
+    )
+    conn.commit()
+
+
+def get_health_state(conn, metric: str) -> dict | None:
+    """The health run one poller last persisted for `metric`, or None.
+
+    None means "nothing has ever been written for this metric" and is the
+    ordinary state of a fresh install — distinct from a row saying `("inserted",
+    0)`, which is a poller actively reporting health. Callers must not conflate
+    them: the first says we have no observation, the second says we have one and
+    it is good.
+
+    `observed_at` comes back as an aware datetime, like `fan_state`'s clocks, so
+    the caller's staleness arithmetic cannot hit a naive/aware TypeError.
+    """
+    row = conn.execute(
+        "SELECT last_status, run_length, observed_at FROM health_state"
+        " WHERE metric = ?",
+        (metric,),
+    ).fetchone()
+    if row is None:
+        return None
+    last_status, run_length, observed_at = row
+    return {
+        "metric": metric,
+        "last_status": last_status,
+        "run_length": run_length,
+        "observed_at": datetime.fromisoformat(observed_at),
+    }
+
+
+def upsert_health_state(
+    conn, metric: str, last_status: str, run_length: int, observed_at
+) -> None:
+    """Persist one metric's health run, overwritten in place (#124).
+
+    The `fan_state` shape — one row per key, holding only *now* — rather than
+    the `alert_events` shape. `alert_events` was considered and is the wrong
+    home: its rows only exist once a threshold has already fired, and the whole
+    window this exists to cover is strictly *before* that.
+
+    No `fan_events` counterpart, deliberately. This table is a resumption point
+    for a restarting process, not a history: the durable record of a health
+    outage is the `alert_events` row the threshold opens, and a second
+    append-only table would write a row per poll to say nothing new.
+    """
+    conn.execute(
+        "INSERT INTO health_state (metric, last_status, run_length, observed_at)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(metric) DO UPDATE SET"
+        " last_status = excluded.last_status,"
+        " run_length = excluded.run_length,"
+        " observed_at = excluded.observed_at",
+        (metric, last_status, run_length, observed_at.isoformat()),
     )
     conn.commit()
 

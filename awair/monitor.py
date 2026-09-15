@@ -188,9 +188,10 @@ def adopt_open_event(health, conn, metric):
 
     **It restores the latch, not the run counter**, and that is the whole of
     what it can do: a process that died *before* its threshold opened no row,
-    so there is nothing on disk to read. A crash-loop shorter than the
-    threshold therefore still never alerts, which is the other half of #100's
-    "worse outdoors" argument and is out of that issue's Done-when.
+    so there is nothing on disk to read. That other half -- the crash-loop
+    shorter than the threshold, which is #100's "worse outdoors" argument and
+    was out of that issue's Done-when -- is `adopt_health_run` (#124), and both
+    are called at startup. Neither is sufficient alone: see that function.
 
     **What it does to the orphans this bug has already left on disk**, measured
     rather than reasoned: they drain, one per restart-plus-recovery cycle, and
@@ -223,6 +224,106 @@ def adopt_open_event(health, conn, metric):
     return event["tier"]
 
 
+#: Poll intervals of silence after which a persisted health run stops being
+#: evidence about now (#124). Two, matching `web._OUTDOOR_CARRY_INTERVALS` --
+#: both answer the same question, "how old may an observation be before holding
+#: onto it asserts something nobody measured". One interval would discard a run
+#: on the ordinary restart this exists to survive; the systemd budget is far
+#: smaller than a poll on both units (`RestartSec=10` against 30 s indoors,
+#: `RestartSec=30` against 900 s outdoors).
+HEALTH_RUN_MAX_AGE_INTERVALS = 2
+
+
+def health_run_max_age_seconds(interval_seconds):
+    """How stale a persisted health run may be and still be adopted (#124).
+
+    A function rather than a module constant for the reason
+    `web._outdoor_carry_max_age_seconds` is one: bound at import, `2 * 900` and
+    a literal `1800` are indistinguishable to every test that can be written,
+    and the claim being made is that this window *tracks* the poll cadence
+    rather than restating a number that happens to match it today. Read per
+    call, a test can move the cadence and watch the window follow.
+
+    A non-positive cadence yields a non-positive window, so every persisted run
+    is stale and adoption becomes a no-op. That is the safe direction -- it
+    degrades to the pre-#124 behaviour rather than to a wrong one -- and it is
+    reachable only from a deliberately degenerate `AWAIR_POLL_SECONDS=0`.
+    """
+    return HEALTH_RUN_MAX_AGE_INTERVALS * interval_seconds
+
+
+def adopt_health_run(health, conn, metric, now, interval_seconds):
+    """Seed a starting health tracker's run counter from the last poll on disk.
+
+    The companion to `adopt_open_event`, and the half it cannot do. That one
+    restores the `alerted` **latch** from an open `alert_events` row; a process
+    that died *before* its threshold opened no row, so there is nothing to
+    adopt and the run counter restarts at zero (#124). Outdoors that is a lost
+    alert rather than a cosmetic one: `Restart=always` / `RestartSec=30` against
+    4 polls x 900 s means a crash-loop never accumulates four consecutive bad
+    polls, and a sustained upstream outage is silent.
+
+    Called once at startup, beside `adopt_open_event`. Returns the run length
+    adopted, or 0 -- which covers all three ordinary cases (nothing persisted,
+    a healthy run, a run too old to be evidence) because none of them changes
+    the tracker.
+
+    **Both adoptions are needed and neither is sufficient.** Restoring the run
+    without the latch makes every restart past the threshold open another row,
+    since the run is already there and nothing says it has been announced.
+    Restoring the latch without the run is `main` today.
+    """
+    state = db.get_health_state(conn, metric)
+    if state is None:
+        return 0
+    age = (now - state["observed_at"]).total_seconds()
+    max_age = health_run_max_age_seconds(interval_seconds)
+    if age > max_age:
+        log.info(
+            "discarding the persisted %s health run (%s x%d): last observed %.0fs "
+            "ago, past the %.0fs window -- nothing was watching in between",
+            metric,
+            state["last_status"],
+            state["run_length"],
+            age,
+            max_age,
+        )
+        return 0
+    adopted = health.restore(state["last_status"], state["run_length"])
+    if adopted:
+        log.info(
+            "resuming a run of %d %s %s poll(s) from a previous process",
+            adopted,
+            metric,
+            state["last_status"],
+        )
+    return adopted
+
+
+def record_health_run(health, conn, metric, now):
+    """Persist this poller's run so the next process can resume it (#124).
+
+    Called after `observe`, every poll. Returns whether it wrote.
+
+    **It skips a run it has already written**, which is what keeps the ticket's
+    stated cost ("it makes every poll a write") from being true. The run moves
+    on every non-inserting poll, so an outage does write per poll -- those are
+    the polls that matter, and on the indoor poller `"error"` and `"duplicate"`
+    write nothing at all today. Steady health settles on one unchanged row and
+    then writes nothing, forever.
+
+    Skipping leaves `observed_at` ageing on that healthy row, which is
+    deliberate and harmless: the staleness rule discards it, and adopting a run
+    of zero is indistinguishable from not adopting.
+    """
+    snapshot = health.snapshot()
+    if snapshot == health.persisted:
+        return False
+    db.upsert_health_state(conn, metric, snapshot[0], snapshot[1], now)
+    health.persisted = snapshot
+    return True
+
+
 class DeviceHealth:
     """Consecutive-status tracker for the two device failure modes.
 
@@ -237,11 +338,54 @@ class DeviceHealth:
     #: no-op -- adoption would find nothing and the #100 bug would be back.
     METRIC: ClassVar[str] = "device"
 
+    #: The one status that is health. `observe` still reaches its healthy branch
+    #: through a bare `else` -- that is safe here and only here, because the
+    #: indoor `poll_once` returns exactly three statuses (see `OutdoorHealth`,
+    #: where a fourth made the same `else` a defect). Named so `snapshot` has
+    #: something to say when there is no run, rather than a bare literal.
+    HEALTHY: ClassVar[str] = "inserted"
+
     def __init__(self, threshold=10):
         self.threshold = threshold
         self.errors = 0
         self.duplicates = 0
         self.alerted = None  # None | "unreachable" | "stale"
+        #: The snapshot `record_health_run` last wrote, so an unchanged run is
+        #: not re-written. None until this process has written or adopted one:
+        #: seeding it with the healthy no-op instead would let a *stale* row
+        #: left by an earlier process survive a healthy poller indefinitely,
+        #: because every poll would match the seed and none would correct the
+        #: record. One write per process start buys that invariant back.
+        self.persisted = None
+
+    def snapshot(self):
+        """`(last_status, run_length)` -- the run a restart would resume (#124).
+
+        `last_status` is *derived* rather than stored. The two counters are
+        mutually exclusive by construction (each branch of `observe` zeroes the
+        other), so a non-zero one names the status on its own, and this class's
+        documented absence of a `last_status` field survives the feature.
+        """
+        if self.errors:
+            return ("error", self.errors)
+        if self.duplicates:
+            return ("duplicate", self.duplicates)
+        return (self.HEALTHY, 0)
+
+    def restore(self, last_status, run_length):
+        """Put a persisted run back on the counter its status names.
+
+        Restoring onto the wrong counter would be worse than not restoring at
+        all: it would announce `stale` for a device that is unreachable, which
+        sends a human to the wrong box. Anything that is not a failure status
+        restores nothing, which is the same no-op as a fresh tracker.
+        """
+        if last_status not in ("error", "duplicate"):
+            return 0
+        self.errors = run_length if last_status == "error" else 0
+        self.duplicates = run_length if last_status == "duplicate" else 0
+        self.persisted = (last_status, run_length)
+        return run_length
 
     def observe(self, status):
         if status == "error":
@@ -329,6 +473,35 @@ class OutdoorHealth:
         self.threshold = threshold
         self.unhealthy = 0  # consecutive non-inserting polls, of any mix
         self.alerted = None  # None | "unreachable" | "degraded" | "stale"
+        #: The newest *classified* status, stored rather than derived (#124).
+        #: `DeviceHealth` can derive its own from which counter is non-zero;
+        #: this one cannot, because `unhealthy` deliberately counts a mixed run
+        #: and one integer cannot say which tier it ended in. Only ever
+        #: `HEALTHY` or a `TIERS` key -- an unrecognised status is not evidence
+        #: and must not overwrite the last thing that was.
+        self.last_status = self.HEALTHY
+        #: See `DeviceHealth.persisted`.
+        self.persisted = None
+
+    def snapshot(self):
+        """`(last_status, run_length)` -- the run a restart would resume (#124)."""
+        return (self.last_status, self.unhealthy)
+
+    def restore(self, last_status, run_length):
+        """Put a persisted run back, or decline to.
+
+        Only a `TIERS` status carries a run. `HEALTHY` restores nothing because
+        there is nothing to restore, and an unrecognised status restores nothing
+        for the same reason `observe` ignores one: it is not evidence either way,
+        and this class exists because a fail-open branch once read a fourth
+        status as health.
+        """
+        if last_status not in self.TIERS:
+            return 0
+        self.unhealthy = run_length
+        self.last_status = last_status
+        self.persisted = (last_status, run_length)
+        return run_length
 
     def observe(self, status):
         """Fold one poll status in; return a verdict to announce, or None.
@@ -342,6 +515,7 @@ class OutdoorHealth:
         """
         if status == self.HEALTHY:
             self.unhealthy = 0
+            self.last_status = status
             if self.alerted is not None:
                 self.alerted = None
                 return "recovered"
@@ -349,6 +523,7 @@ class OutdoorHealth:
         if status not in self.TIERS:
             return None
         self.unhealthy += 1
+        self.last_status = status
         if self.unhealthy >= self.threshold and self.alerted is None:
             self.alerted = self.TIERS[status]
             return self.alerted

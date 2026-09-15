@@ -32,7 +32,12 @@ from datetime import UTC, date, datetime
 
 from awair import db, weather_alerts
 from awair.alerts import Notifier
-from awair.monitor import OutdoorHealth, adopt_open_event
+from awair.monitor import (
+    OutdoorHealth,
+    adopt_health_run,
+    adopt_open_event,
+    record_health_run,
+)
 from awair.shutdown import install_handler
 
 # A trailing ISO zone designator, stripped before the date-only test in
@@ -492,6 +497,11 @@ def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None
     a channel gets muted.
     """
     verdict = health.observe(status)
+    # Persist the run before announcing anything (#124) -- see the note on
+    # `poller.handle_device_health`. Sharper here: the threshold is ~1h of
+    # polls against a `RestartSec=30` unit, so a crash-loop that loses the
+    # count never alerts at all.
+    record_health_run(health, conn, OutdoorHealth.METRIC, now)
     if verdict in health.TIERS.values():
         notified = notifier.send(
             f"Outdoor poller {verdict} (~{_health_window(health, interval)} of polls)",
@@ -581,6 +591,10 @@ def main() -> None:
     # (4 x 900s) against the indoor ~5 min, so a restart is far likelier to land
     # inside it.
     adopt_open_event(health, conn, OutdoorHealth.METRIC)
+    # The other half, and the one that bites hardest here (#124): a crash-loop
+    # shorter than 4 x 900 s opened no row, so there was nothing to adopt and
+    # the run restarted at zero every 30 seconds.
+    adopt_health_run(health, conn, OutdoorHealth.METRIC, datetime.now(UTC), interval)
 
     fetch_weather = make_fetch(_build_url(weather_base, lat, lon, WEATHER_FIELDS))
     fetch_air_quality = make_fetch(
