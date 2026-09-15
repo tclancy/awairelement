@@ -244,8 +244,8 @@ def health_run_max_age_seconds(interval_seconds):
     rather than restating a number that happens to match it today. Read per
     call, a test can move the cadence and watch the window follow.
 
-    A non-positive cadence yields a non-positive window, so every persisted run
-    is stale and adoption becomes a no-op. That is the safe direction -- it
+    A cadence of 0 yields a window of 0, which admits only a row written at
+    exactly `now` and discards every other. That is the safe direction -- it
     degrades to the pre-#124 behaviour rather than to a wrong one -- and it is
     reachable only from a deliberately degenerate `AWAIR_POLL_SECONDS=0`.
     """
@@ -278,7 +278,12 @@ def adopt_health_run(health, conn, metric, now, interval_seconds):
         return 0
     age = (now - state["observed_at"]).total_seconds()
     max_age = health_run_max_age_seconds(interval_seconds)
-    if age > max_age:
+    # Bounded both ways. A bare `age > max_age` admits every *negative* age, so
+    # a host that comes up behind real time -- no RTC, a saved timestamp, a
+    # timesyncd correction still pending -- adopts a row from any distance in
+    # the past and then jumps forward. Ordinary NTP slew stays inside the
+    # window in both directions.
+    if not -max_age <= age <= max_age:
         log.info(
             "discarding the persisted %s health run (%s x%d): last observed %.0fs "
             "ago, past the %.0fs window -- nothing was watching in between",
@@ -300,6 +305,17 @@ def adopt_health_run(health, conn, metric, now, interval_seconds):
     return adopted
 
 
+# `record_health_run` and `adopt_health_run` take any object with the three
+# members below. `DeviceHealth` and `OutdoorHealth` deliberately share no base
+# class (see `OutdoorHealth`'s docstring for why reusing one was a defect), so
+# the contract is stated here rather than inherited from anywhere:
+#
+#   snapshot()  -> (last_status, run_length) for the run as it stands
+#   restore(last_status, run_length) -> the run length taken, or 0 if declined
+#   persisted   -> the snapshot last written, or None if this process has not
+#                  written or adopted one
+#
+# A third tracker must ship all three; two of the three is a silent no-op.
 def record_health_run(health, conn, metric, now):
     """Persist this poller's run so the next process can resume it (#124).
 
@@ -308,9 +324,9 @@ def record_health_run(health, conn, metric, now):
     **It skips a run it has already written**, which is what keeps the ticket's
     stated cost ("it makes every poll a write") from being true. The run moves
     on every non-inserting poll, so an outage does write per poll -- those are
-    the polls that matter, and on the indoor poller `"error"` and `"duplicate"`
-    write nothing at all today. Steady health settles on one unchanged row and
-    then writes nothing, forever.
+    the polls that matter, and on the indoor poller neither `"error"` nor
+    `"duplicate"` writes a row of its own today. Steady health settles on one
+    unchanged row and then writes nothing, forever.
 
     Skipping leaves `observed_at` ageing on that healthy row, which is
     deliberate and harmless: the staleness rule discards it, and adopting a run
@@ -330,6 +346,14 @@ class DeviceHealth:
     'error' = fetch failed; 'duplicate' = HTTP 200 but device timestamp
     unchanged (the wedged-but-serving failure mode). Either one sustained
     for `threshold` polls is an alert; any fresh insert is recovery.
+
+    `>= threshold`, not `== threshold`, and the difference only became
+    reachable with #124. `record_health_run` commits before `db.open_event`
+    runs, so a process that dies in between resumes with the run already *past*
+    the threshold and an equality test would never fire again for the rest of
+    that outage -- silence where the pre-#124 reset produced an alert ten polls
+    later. The `alerted is None` latch, not the equality, is what keeps this to
+    one alert per outage, so the two are identical on every un-adopted path.
     """
 
     #: The `alert_events.metric` this tracker's handler opens under. Named here
@@ -391,13 +415,13 @@ class DeviceHealth:
         if status == "error":
             self.errors += 1
             self.duplicates = 0
-            if self.errors == self.threshold and self.alerted is None:
+            if self.errors >= self.threshold and self.alerted is None:
                 self.alerted = "unreachable"
                 return "unreachable"
         elif status == "duplicate":
             self.duplicates += 1
             self.errors = 0
-            if self.duplicates == self.threshold and self.alerted is None:
+            if self.duplicates >= self.threshold and self.alerted is None:
                 self.alerted = "stale"
                 return "stale"
         else:  # inserted

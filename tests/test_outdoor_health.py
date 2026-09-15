@@ -278,13 +278,20 @@ def test_the_window_renders_the_configured_cadence(threshold, interval, expected
 
 
 def test_the_notification_carries_the_window(conn):
+    """The count AND the window it implies, with the window labelled as such.
+
+    It read "~1h of polls" until #124, which was a claim about elapsed time
+    that stopped being true once a run could outlive the process: four bad
+    polls across four `RestartSec=30` restarts span about two minutes.
+    """
     notifier = _RecordingNotifier()
     health = OutdoorHealth(threshold=4)
     for _ in range(3):
         handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
     assert notifier.calls == []
     handle_outdoor_health(conn, notifier, health, "error", _now(), 900)
-    assert "~1h of polls" in notifier.calls[0]["message"]
+    assert "4 consecutive polls" in notifier.calls[0]["message"]
+    assert "~1h at this cadence" in notifier.calls[0]["message"]
 
 
 # --------------------------------------------------------------------------

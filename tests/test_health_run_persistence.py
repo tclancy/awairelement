@@ -223,6 +223,16 @@ def _open_rows(db_path):
     return [row for row in _rows(db_path) if row[3] is None]
 
 
+def _persisted(db_path, metric):
+    """`(last_status, run_length)` on disk, for asserting what a control reached."""
+    conn = db.connect(db_path)
+    try:
+        state = db.get_health_state(conn, metric)
+    finally:
+        conn.close()
+    return (state["last_status"], state["run_length"])
+
+
 @pytest.fixture
 def indoor_crash(monkeypatch, tmp_path):
     """Run one indoor `main()` lifetime of exactly `polls` failing polls.
@@ -321,6 +331,10 @@ def test_the_same_outdoor_crash_loop_alerts_zero_times_without_the_fix(
         db_path = outdoor_crash()
 
     assert _rows(db_path) == []
+    # And for the right reason. An empty table is also what a scenario that
+    # quietly stopped reaching its threshold produces, so assert the state the
+    # control is named for: every lifetime started its count from zero.
+    assert _persisted(db_path, OUTDOOR) == ("error", 1)
 
 
 def test_an_indoor_crash_loop_through_an_outage_alerts(
@@ -342,6 +356,7 @@ def test_the_same_indoor_crash_loop_alerts_zero_times_without_the_fix(
         db_path = indoor_crash()
 
     assert _rows(db_path) == []
+    assert _persisted(db_path, DEVICE) == ("error", 1)
 
 
 def test_a_healthy_poll_after_the_crash_loop_clears_the_persisted_run(
@@ -374,3 +389,110 @@ def test_the_crash_loop_alerts_once_and_not_once_per_restart(
         db_path = outdoor_crash()
 
     assert len(_rows(db_path)) == 1, _rows(db_path)
+
+
+# --------------------------------------------------------------------------
+# Regressions this change could introduce, found in review
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["error", "duplicate"])
+def test_an_indoor_run_restored_at_the_threshold_still_alerts(conn, status):
+    """`DeviceHealth.observe` tested `== threshold`, which restoring can skip past.
+
+    Reachable, and it is a regression this change would otherwise *introduce*:
+    `record_health_run` commits before `db.open_event` runs, so a process that
+    dies in between leaves the run at the threshold with no row to adopt. The
+    counter then resumes at 10 and every later poll is 11, 12, ... — never
+    equal — so the indoor `unreachable` alert is unreachable for the rest of
+    the outage. Before this change the same crash reset the counter and the
+    alert fired ten polls later.
+
+    `OutdoorHealth` already tested `>=`; this is the asymmetry closing.
+    """
+    health = DeviceHealth()
+    db.upsert_health_state(conn, DEVICE, status, health.threshold, _t())
+    monitor.adopt_health_run(health, conn, DEVICE, _t(), INDOOR_INTERVAL)
+
+    assert health.observe(status) is not None
+
+
+def test_a_healthy_indoor_run_restores_nothing(conn):
+    """`("inserted", 0)` is exactly what steady indoor health persists.
+
+    Any restart within the staleness window of a healthy poll takes this
+    branch, and it is the branch that governs whether `persisted` stays None —
+    which is what makes the next poll correct the record.
+    """
+    db.upsert_health_state(conn, DEVICE, "inserted", 0, _t())
+    health = DeviceHealth()
+
+    assert monitor.adopt_health_run(health, conn, DEVICE, _t(), INDOOR_INTERVAL) == 0
+    assert (health.errors, health.duplicates, health.persisted) == (0, 0, None)
+
+
+def test_a_clock_that_has_run_backwards_does_not_adopt_an_ancient_run(conn):
+    """A host without an RTC comes up behind real time, then jumps forward.
+
+    A bare `age > max_age` admits every negative age, so a row from any
+    distance in the past is adopted as though it were current.
+    """
+    db.upsert_health_state(conn, OUTDOOR, "error", 3, _t() + timedelta(days=3))
+    health = OutdoorHealth()
+
+    assert monitor.adopt_health_run(health, conn, OUTDOOR, _t(), OUTDOOR_INTERVAL) == 0
+
+
+def test_the_run_reaches_disk_even_when_announcing_it_fails(conn):
+    """Two docstrings and a GLOSSARY entry call this ordering load-bearing.
+
+    Nothing pinned it: moving `record_health_run` below `db.open_event` left
+    the whole suite green. The hazard is real — `db.open_event` can raise, and
+    the pre-threshold polls this whole issue is about are never announced at
+    all, so the run is the only evidence there is.
+    """
+
+    class Exploding:
+        def send(self, message, title="", priority="default"):
+            raise OSError("ntfy is down and so, probably, is everything else")
+
+    health = OutdoorHealth(threshold=1)
+    with pytest.raises(OSError):
+        outdoor.handle_outdoor_health(
+            conn, Exploding(), health, "error", _t(), OUTDOOR_INTERVAL
+        )
+
+    state = db.get_health_state(conn, OUTDOOR)
+    assert (state["last_status"], state["run_length"]) == ("error", 1)
+
+
+def test_the_alert_names_the_poll_count_and_not_just_a_wall_clock_span(conn):
+    """A run may now outlive the process, so `threshold x interval` is not elapsed time.
+
+    Four bad polls across four 30-second restarts span about two minutes and
+    used to page "~1h of polls" — wrong by an order of magnitude, in the first
+    thing a human reads when deciding how urgent this is. The window is still
+    worth stating; it is a property of the threshold, not a measurement, and
+    the message now says so.
+    """
+
+    class Recording:
+        def __init__(self):
+            self.messages = []
+
+        def send(self, message, title="", priority="default"):
+            self.messages.append(message)
+            return True
+
+        def close(self):
+            pass
+
+    notifier = Recording()
+    health = OutdoorHealth(threshold=4)
+    monitor.adopt_health_run(health, conn, OUTDOOR, _t(), OUTDOOR_INTERVAL)
+    db.upsert_health_state(conn, OUTDOOR, "error", 3, _t())
+    health.restore("error", 3)
+
+    outdoor.handle_outdoor_health(conn, notifier, health, "error", _t(), 900)
+    assert "4 consecutive polls" in notifier.messages[0]
+    assert "~1h at this cadence" in notifier.messages[0]

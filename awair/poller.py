@@ -153,15 +153,18 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
 
     The run is persisted on the way through (#124) so a process that dies
     before reaching the threshold does not take the count with it. Written
-    after `observe` and before anything is announced, because the count is a
-    fact about the poll either way -- an exception out of the notifier must not
-    cost the next process its evidence.
+    after `observe` and before anything else, because the count is a fact about
+    the poll either way and `db.open_event` below can raise. Not because of the
+    notifier -- `alerts.Notifier.send` never raises into the poll loop. The
+    pre-threshold polls this issue is about announce nothing at all, so the
+    persisted run is the only evidence they leave.
     """
     verdict = health.observe(status)
     record_health_run(health, conn, DeviceHealth.METRIC, now)
     if verdict in ("unreachable", "stale"):
         notified = notifier.send(
-            f"Awair Element {verdict} (~5 min of polls)",
+            f"Awair Element {verdict} ({health.threshold} consecutive polls,"
+            f" ~5 min at the default cadence)",
             title=f"Awair device {verdict}",
             priority="high",
         )

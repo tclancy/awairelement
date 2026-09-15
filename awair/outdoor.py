@@ -501,10 +501,18 @@ def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None
     # `poller.handle_device_health`. Sharper here: the threshold is ~1h of
     # polls against a `RestartSec=30` unit, so a crash-loop that loses the
     # count never alerts at all.
+    #
+    # Unguarded, like `monitor._refresh_peak`'s write and unlike `poll_once`'s:
+    # a `sqlite3.Error` here unwinds `main()`. That is a deliberate no-change --
+    # the two conditions that can raise are a locked database past
+    # `busy_timeout` and a full disk, neither of which a swallowed write would
+    # survive either, and a poller silently failing to persist its run is the
+    # #124 defect wearing a handler.
     record_health_run(health, conn, OutdoorHealth.METRIC, now)
     if verdict in health.TIERS.values():
         notified = notifier.send(
-            f"Outdoor poller {verdict} (~{_health_window(health, interval)} of polls)",
+            f"Outdoor poller {verdict} ({health.threshold} consecutive polls,"
+            f" ~{_health_window(health, interval)} at this cadence)",
             title=f"Outdoor {verdict}",
             priority="high" if verdict == "unreachable" else "default",
         )
@@ -531,6 +539,17 @@ def _health_window(health, interval) -> str:
     The poll count on its own is meaningless without the cadence beside it, and
     the cadence differs from the indoor poller's by 30x — so the message says
     the duration, as `poller.handle_device_health`'s does.
+
+    **It is a property of the threshold, not a measurement of the outage**, and
+    since #124 the message says so out loud. A run can now outlive the process,
+    so `threshold x interval` stopped being the elapsed span in either
+    direction: four bad polls across four `RestartSec=30` restarts take about
+    two minutes and used to page "~1h of polls", while a two-interval gap on
+    each adoption stretches the same four polls towards two hours. The alert is
+    right either way — the poller really is unhealthy — but the duration is the
+    first thing a human reads when deciding how urgent this is, so it now
+    appears beside the poll count and labelled as the cadence rather than as
+    the outage.
 
     Takes `interval` rather than re-reading `AWAIR_OUTDOOR_POLL_SECONDS`: a pure
     formatter reaching into the environment is a second source of truth for a
