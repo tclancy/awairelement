@@ -32,7 +32,7 @@ from datetime import UTC, date, datetime
 
 from awair import db, weather_alerts
 from awair.alerts import Notifier
-from awair.monitor import OutdoorHealth
+from awair.monitor import OutdoorHealth, adopt_open_event
 from awair.shutdown import install_handler
 
 # A trailing ISO zone designator, stripped before the date-only test in
@@ -500,7 +500,7 @@ def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None
         )
         db.open_event(
             conn,
-            metric="outdoor",
+            metric=OutdoorHealth.METRIC,
             tier=verdict,
             opened_at=now,
             value=None,
@@ -509,7 +509,7 @@ def handle_outdoor_health(conn, notifier, health, status, now, interval) -> None
             notified=notified,
         )
     elif verdict == "recovered":
-        event = db.get_open_events(conn).get("outdoor")
+        event = db.get_open_events(conn).get(OutdoorHealth.METRIC)
         notified = notifier.send("Outdoor poller recovered", title="Outdoor recovered")
         if event:
             db.close_event(conn, event["id"], closed_at=now, notified=notified)
@@ -573,6 +573,14 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
+
+    # A restart mid-outage must not open a second alert_event (#100). Sharper
+    # here than indoors, but NOT because of the restart policy -- both units are
+    # Restart=always and the indoor one comes back faster (RestartSec=10 against
+    # 30). It is the exposure window: the threshold is ~1h of polls here
+    # (4 x 900s) against the indoor ~5 min, so a restart is far likelier to land
+    # inside it.
+    adopt_open_event(health, conn, OutdoorHealth.METRIC)
 
     fetch_weather = make_fetch(_build_url(weather_base, lat, lon, WEATHER_FIELDS))
     fetch_air_quality = make_fetch(

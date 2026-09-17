@@ -21,7 +21,7 @@ from awair.fans import (
     config_from_env as fans_config_from_env,
     run_fan_test,
 )
-from awair.monitor import DeviceHealth, check_metrics
+from awair.monitor import DeviceHealth, adopt_open_event, check_metrics
 from awair.shutdown import install_handler
 
 log = logging.getLogger("awair.poller")
@@ -153,7 +153,7 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
         )
         db.open_event(
             conn,
-            metric="device",
+            metric=DeviceHealth.METRIC,
             tier=verdict,
             opened_at=now,
             value=None,
@@ -162,7 +162,7 @@ def handle_device_health(conn, notifier, health, status, now) -> None:
             notified=notified,
         )
     elif verdict == "recovered":
-        event = db.get_open_events(conn).get("device")
+        event = db.get_open_events(conn).get(DeviceHealth.METRIC)
         notified = notifier.send(
             "Awair Element recovered", title="Awair device recovered"
         )
@@ -222,6 +222,10 @@ def main(argv=None) -> None:
         finally:
             conn.close()
         return
+
+    # A restart mid-outage must not open a second alert_event (#100): the row
+    # outlives the process, so the latch that mirrors it has to as well.
+    adopt_open_event(health, conn, DeviceHealth.METRIC)
 
     fetch = make_fetch(url)
     log.info(

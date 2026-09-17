@@ -172,6 +172,57 @@ def check_metrics(conn, notifier, now):
         apply(_Notice(conn, notifier, name, decision, event, now, temp_unit))
 
 
+def adopt_open_event(health, conn, metric):
+    """Seed a starting health tracker from an alert event left open on disk.
+
+    Both trackers keep `alerted` in memory while the row that mirrors it lives
+    in the database, so a poller that restarts mid-outage came back with the
+    latch clear and opened a *second* row for the same metric (#100).
+    `db.get_open_events` returns at most one row per metric and the later one
+    wins, so the earlier row then became unreachable: recovery closed the new
+    one and the original stayed open on the dashboard forever.
+
+    Called once at startup, after the connection is open and before the poll
+    loop. Returns the tier adopted, or None when nothing was open -- which is
+    the ordinary case and is why this logs nothing then.
+
+    **It restores the latch, not the run counter**, and that is the whole of
+    what it can do: a process that died *before* its threshold opened no row,
+    so there is nothing on disk to read. A crash-loop shorter than the
+    threshold therefore still never alerts, which is the other half of #100's
+    "worse outdoors" argument and is out of that issue's Done-when.
+
+    **What it does to the orphans this bug has already left on disk**, measured
+    rather than reasoned: they drain, one per restart-plus-recovery cycle, and
+    no prune job is needed (which retires the ticket's option 3). Seeded with
+    two open `device` rows, cycle 0 adopts and closes the newer, cycle 1 adopts
+    and closes the older, cycle 2 finds nothing. The cost is one spurious
+    "recovered" notification per drained row, because adoption sets the latch
+    and the first healthy poll then reads as recovery. Bounded at N pings over N
+    restarts and then silent forever -- but expect a small burst on the deploy
+    that first carries this, and do not read it as a live incident.
+
+    Adopting the tier rather than a bare flag matters because `alerted` is read
+    as a tier, not as a boolean -- and because a mid-outage tier change is not
+    something either tracker records *within* one process either: `observe`
+    only reports a tier while `alerted is None`. So a poller that adopts
+    "degraded" and then starts erroring stays "degraded" until it recovers,
+    exactly as an un-restarted one would.
+    """
+    event = db.get_open_events(conn).get(metric)
+    if event is None:
+        return None
+    health.alerted = event["tier"]
+    log.info(
+        "resuming the open %s alert (%s) opened at %s -- a previous process "
+        "left it open",
+        metric,
+        event["tier"],
+        event["opened_at"].isoformat(),
+    )
+    return event["tier"]
+
+
 class DeviceHealth:
     """Consecutive-status tracker for the two device failure modes.
 
@@ -179,6 +230,12 @@ class DeviceHealth:
     unchanged (the wedged-but-serving failure mode). Either one sustained
     for `threshold` polls is an alert; any fresh insert is recovery.
     """
+
+    #: The `alert_events.metric` this tracker's handler opens under. Named here
+    #: rather than spelled at each call site because a divergence between
+    #: `handle_device_health` and `main`'s `adopt_open_event` would be a silent
+    #: no-op -- adoption would find nothing and the #100 bug would be back.
+    METRIC: ClassVar[str] = "device"
 
     def __init__(self, threshold=10):
         self.threshold = threshold
@@ -248,6 +305,12 @@ class OutdoorHealth:
     silence here. Four polls is about one hour, which is roughly Open-Meteo's
     publish cycle: one missed publish cannot trip it, a stuck endpoint does.
     """
+
+    #: The `alert_events.metric` this tracker's handler opens under. Not
+    #: `DeviceHealth.METRIC`: the two pollers are separate processes against one
+    #: DB, and a shared key means an outdoor recovery closes the indoor poller's
+    #: open row and sends a false all-clear (#94).
+    METRIC: ClassVar[str] = "outdoor"
 
     #: poll status -> the tier a sustained run ending in it opens.
     TIERS: ClassVar[dict[str, str]] = {
