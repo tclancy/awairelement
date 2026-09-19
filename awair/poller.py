@@ -21,7 +21,13 @@ from awair.fans import (
     config_from_env as fans_config_from_env,
     run_fan_test,
 )
-from awair.monitor import DeviceHealth, adopt_open_event, check_metrics
+from awair.monitor import (
+    DeviceHealth,
+    adopt_health_run,
+    adopt_open_event,
+    check_metrics,
+    record_health_run,
+)
 from awair.shutdown import install_handler
 
 log = logging.getLogger("awair.poller")
@@ -143,11 +149,22 @@ def make_fetch(url: str):
 
 
 def handle_device_health(conn, notifier, health, status, now) -> None:
-    """Map a DeviceHealth verdict onto an alert event + notification."""
+    """Map a DeviceHealth verdict onto an alert event + notification.
+
+    The run is persisted on the way through (#124) so a process that dies
+    before reaching the threshold does not take the count with it. Written
+    after `observe` and before anything else, because the count is a fact about
+    the poll either way and `db.open_event` below can raise. Not because of the
+    notifier -- `alerts.Notifier.send` never raises into the poll loop. The
+    pre-threshold polls this issue is about announce nothing at all, so the
+    persisted run is the only evidence they leave.
+    """
     verdict = health.observe(status)
+    record_health_run(health, conn, DeviceHealth.METRIC, now)
     if verdict in ("unreachable", "stale"):
         notified = notifier.send(
-            f"Awair Element {verdict} (~5 min of polls)",
+            f"Awair Element {verdict} ({health.threshold} consecutive polls,"
+            f" ~5 min at the default cadence)",
             title=f"Awair device {verdict}",
             priority="high",
         )
@@ -226,6 +243,9 @@ def main(argv=None) -> None:
     # A restart mid-outage must not open a second alert_event (#100): the row
     # outlives the process, so the latch that mirrors it has to as well.
     adopt_open_event(health, conn, DeviceHealth.METRIC)
+    # And a restart *before* the threshold must not reset the count (#124),
+    # which is the half above cannot reach -- no row exists yet to adopt.
+    adopt_health_run(health, conn, DeviceHealth.METRIC, datetime.now(UTC), interval)
 
     fetch = make_fetch(url)
     log.info(
