@@ -1,7 +1,9 @@
 """Ceiling-fan mitigation: run the fans while CO2 is high, off otherwise.
 
-Mitigation was retired in #61 and is **live again as of ADR-002**, on a different
-trigger. The retired design fired off co2/voc *spike events* — thresholds
+Mitigation was retired in #61, un-retired by ADR-002 on a different trigger, and
+is **off in code again** as shipped — see README's "Shipped state:" line, which
+`MITIGATION_RETIRED` below is pinned to (#132). The retired design fired off
+co2/voc *spike events* — thresholds
 relative to a rolling baseline, latched by the Awair score. Measured over 303 h
 that ran the fans 32% of the time, because a voc-ceiling event in this house
 stays open for half a day. See
