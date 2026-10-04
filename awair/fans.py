@@ -115,7 +115,7 @@ DEFAULT_FAN_IDS = (1, 2)
 # retirement, because it is the kill switch ADR-001 established: one edit here
 # takes the fans out of the loop and makes the poller release them.
 # See docs/decisions/002-co2-only-fan-mitigation.md.
-MITIGATION_RETIRED = False
+MITIGATION_RETIRED = True
 # Recorded when a *disabled* poller commands a fan off. Deliberately not a
 # verdict about the air like "no co2/voc spike" — it is the poller letting go of
 # a fan it has stopped managing.
