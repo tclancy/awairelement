@@ -6,6 +6,17 @@
 **Supersedes:** the retirement in [ADR-001](001-retire-automatic-fan-mitigation.md)
 (the kill switch it introduced is kept)
 
+> **Amended 2026-10-04 (#132).** The decision stands; two statements about the
+> shipped state no longer do. Tom flipped the kept kill switch to
+> `MITIGATION_RETIRED = True` in `52a8e4d` ("Shut off fans for now"), so
+> "Mitigation is live again" below records the decision as made rather than what
+> runs today — README's "Shipped state:" line is the current-state source, and a
+> test pins the constant to it. And the reversal mechanism in item 8 / ADR-001's
+> "three edits" no longer includes a test edit: `test_fan_mitigation_ships_live`
+> pinned the literal and so turned `main` red the first time the kill switch was
+> used as a kill switch, which is a guard charging an operational price it was
+> never meant to charge.
+
 ## Context
 
 ADR-001 retired automatic fan mitigation because the trigger's *duration*, not

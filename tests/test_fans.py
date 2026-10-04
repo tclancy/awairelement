@@ -7,6 +7,7 @@ are unchanged from the versions written against the spike-event trigger.
 """
 
 import pathlib
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -832,18 +833,94 @@ def test_config_from_env_reads_fan_host(monkeypatch):
     assert fans.config_from_env().fan_host == "10.0.0.10"
 
 
-def test_fan_mitigation_ships_live(monkeypatch):
-    """The as-shipped default, asserted through behaviour and not monkeypatched.
+def test_the_shipped_kill_switch_pairs_with_the_enable_flag(monkeypatch):
+    """Whatever ships, `enabled` is the switch's inverse when the env asks for fans.
 
-    The inverse of #61's `test_fan_mitigation_ships_retired`, and load-bearing
-    for the same reason: every other test sets `MITIGATION_RETIRED` explicitly,
-    which would leave the shipped value unpinned. Retiring mitigation again
-    should have to edit this test on purpose, in the same diff, where a
-    reviewer will see it — exactly as un-retiring had to.
+    Replaces #61's `test_fan_mitigation_ships_retired` and ADR-002's
+    `test_fan_mitigation_ships_live`, both of which pinned the literal and so
+    went red the moment the kill switch was used as a kill switch (#132). This
+    assertion holds at either value, which is the point: flipping the switch is
+    an operational act and must not require a test edit.
+
+    It does not pin the shipped value — `test_the_declared_shipped_state_matches
+    _the_kill_switch` does that, against README rather than against a literal
+    here. Both are needed; neither alone is the guard #61 asked for.
     """
     monkeypatch.setenv("AWAIR_FAN_MITIGATION_ENABLED", "true")
-    assert fans.MITIGATION_RETIRED is False
-    assert fans.config_from_env().enabled is True
+    assert fans.config_from_env().enabled is (not fans.MITIGATION_RETIRED)
+
+
+# The shipped value of the kill switch lives in exactly two places: the constant
+# in `awair/fans.py`, and the bolded declaration at the top of README's "Fan
+# mitigation" section. The test below is the stricture that keeps them equal, so
+# the pin #61 wanted survives without the suite being the thing you have to edit
+# to turn the fans off.
+_SHIPPED_STATE_RE = re.compile(
+    r"^\*\*Shipped state: `MITIGATION_RETIRED = (True|False)`\.\*\*", re.MULTILINE
+)
+README = pathlib.Path(__file__).resolve().parent.parent / "README.md"
+
+
+def _parse_shipped_state(readme_text: str) -> bool:
+    """The kill-switch value README declares, as a bool.
+
+    Raises on a missing or repeated marker rather than defaulting: a declaration
+    that has been reworded away must fail loudly, not quietly agree with
+    whatever the constant happens to be.
+    """
+    found = _SHIPPED_STATE_RE.findall(readme_text)
+    if len(found) != 1:
+        raise AssertionError(
+            "README's 'Fan mitigation' section must declare the shipped kill-switch"
+            f" state exactly once as '**Shipped state: `MITIGATION_RETIRED = ...`.**',"
+            f" found {len(found)} such lines"
+        )
+    return found[0] == "True"
+
+
+def test_the_declared_shipped_state_matches_the_kill_switch():
+    """README and the constant must agree, so a flip cannot be silent.
+
+    This is #61's reviewer-visible pin, moved off the literal in this file and
+    onto the operator-facing doc. Flipping `MITIGATION_RETIRED` turns the suite
+    red until README's declaration is flipped in the same diff — which is one
+    line, in the place somebody debugging "why aren't the fans running" actually
+    reads, rather than a test assertion they would have to understand first.
+    """
+    assert fans.MITIGATION_RETIRED is _parse_shipped_state(README.read_text())
+
+
+@pytest.mark.parametrize(("declared", "expected"), [("True", True), ("False", False)])
+def test_the_shipped_state_reader_reads_both_values(declared, expected):
+    # The pin above is only as good as this parser: one hard-wired to either
+    # bool would agree with today's constant and catch nothing. Drive it both
+    # ways against synthetic text so that cannot hide.
+    text = f"### Fan mitigation\n\n**Shipped state: `MITIGATION_RETIRED = {declared}`.** x\n"
+    assert _parse_shipped_state(text) is expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("### Fan mitigation\n\nno declaration here\n", id="missing"),
+        pytest.param(
+            "**Shipped state: `MITIGATION_RETIRED = True`.**\n"
+            "**Shipped state: `MITIGATION_RETIRED = False`.**\n",
+            id="duplicated",
+        ),
+        pytest.param(
+            "  **Shipped state: `MITIGATION_RETIRED = True`.**\n", id="indented"
+        ),
+        pytest.param(
+            "**Shipped state: MITIGATION_RETIRED = True.**\n", id="unbackticked"
+        ),
+    ],
+)
+def test_the_shipped_state_reader_refuses_an_unreadable_declaration(text):
+    # Loud failure, not a default. A reworded README must stop the suite rather
+    # than let the pin evaporate.
+    with pytest.raises(AssertionError, match="exactly once"):
+        _parse_shipped_state(text)
 
 
 def test_the_kill_switch_still_overrides_the_enable_flag(monkeypatch, caplog):
