@@ -1,7 +1,9 @@
 """Ceiling-fan mitigation: run the fans while CO2 is high, off otherwise.
 
-Mitigation was retired in #61 and is **live again as of ADR-002**, on a different
-trigger. The retired design fired off co2/voc *spike events* — thresholds
+Mitigation was retired in #61, un-retired by ADR-002 on a different trigger, and
+is **off in code again** as shipped — see README's "Shipped state:" line, which
+`MITIGATION_RETIRED` below is pinned to (#132). The retired design fired off
+co2/voc *spike events* — thresholds
 relative to a rolling baseline, latched by the Awair score. Measured over 303 h
 that ran the fans 32% of the time, because a voc-ceiling event in this house
 stays open for half a day. See
@@ -109,11 +111,13 @@ FAN_MAX_RUN = timedelta(minutes=_env_float("AWAIR_FAN_MAX_RUN_MINUTES", 90.0))
 FAN_CMD_TIMEOUT_SECONDS = 5
 DEFAULT_FAN_HOST = "192.168.68.68"
 DEFAULT_FAN_IDS = (1, 2)
-# Automatic fan mitigation was retired in #61 and is live again as of ADR-002 on a
-# different trigger — absolute co2 rather than baseline-relative co2/voc spike
-# events. This constant stays, rather than being deleted along with the
-# retirement, because it is the kill switch ADR-001 established: one edit here
-# takes the fans out of the loop and makes the poller release them.
+# The kill switch ADR-001 established and ADR-002 kept: one edit here takes the
+# fans out of the loop and makes the poller release them. Retired in #61, live
+# again under ADR-002 on an absolute-co2 trigger, and off in code again since
+# `52a8e4d` ("Shut off fans for now") — so this value is the switch being used as
+# designed, not a leftover of the retirement. Flipping it means flipping README's
+# "Shipped state:" line in the same diff; no test edit is needed or wanted, and
+# `test_the_declared_shipped_state_matches_the_kill_switch` is what insists (#132).
 # See docs/decisions/002-co2-only-fan-mitigation.md.
 MITIGATION_RETIRED = True
 # Recorded when a *disabled* poller commands a fan off. Deliberately not a
@@ -173,8 +177,9 @@ def config_from_env() -> FansConfig:
     While `MITIGATION_RETIRED` is set the enable flag cannot turn mitigation on.
     It is logged rather than silently dropped: a deploy whose env still asks for
     fans should say so out loud, so nobody debugs "why aren't the fans running"
-    against a variable that no longer has any power. That switch is off as
-    shipped (ADR-002) — this path is what a future retirement would use.
+    against a variable that no longer has any power. That switch is **on** as
+    shipped (#132), so this is the live path rather than the hypothetical
+    future-retirement branch it was under ADR-002.
     """
     requested = (
         os.environ.get("AWAIR_FAN_MITIGATION_ENABLED", "false").lower() == "true"

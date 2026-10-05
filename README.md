@@ -345,9 +345,23 @@ and `ExecStart=` in each unit before symlinking.
 
 ### Fan mitigation
 
-With `AWAIR_FAN_MITIGATION_ENABLED=true` the poller runs the ceiling fans while
-CO2 is high. **On at 1000 ppm, off below 900**, one speed, and never for more
-than 90 minutes at a stretch.
+**Shipped state: `MITIGATION_RETIRED = True`.**
+
+That line is the declared kill-switch state, and it is not prose:
+`tests/test_fans.py::test_the_declared_shipped_state_matches_the_kill_switch`
+reads it and fails if it disagrees with `awair/fans.py`. So flipping the kill
+switch is two one-line edits — the constant and that line — and **no test
+edit**: the suite still refuses a silent flip, but it refuses it where an
+operator can fix it in the same breath, rather than demanding a test change in
+the middle of turning the fans off.
+
+While it reads `True`, automatic mitigation is **disabled in code**: the poller
+releases the fans and `AWAIR_FAN_MITIGATION_ENABLED` has no power whatever it
+says. While it reads `False`, the rules below are what runs.
+
+With `AWAIR_FAN_MITIGATION_ENABLED=true` and the kill switch off, the poller
+runs the ceiling fans while CO2 is high. **On at 1000 ppm, off below 900**, one
+speed, and never for more than 90 minutes at a stretch.
 
 Three rules, in precedence order:
 
