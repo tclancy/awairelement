@@ -14,13 +14,21 @@ already fetches the head's status every cycle, so reading its `/status` costs no
 API call and no new credential — and it is loopback-only, so this poller must
 run on the same box as the bridge.
 
-**Every row is keyed on the head's own power-report window close**, never on our
-poll clock. The device reports on its own cadence — windows of 220 s and 800 s
-were measured against the bridge's 300 s cycle on 2026-10-26 — so most polls
-re-read a window that is already stored, and `ON CONFLICT(ts) DO NOTHING` makes
-that write nothing. A payload whose window cannot be dated is **unkeyed**: it is
-dropped with a warning rather than stored under a clock we made up, which is the
-same refusal `aq_ts` records for an undateable AQI.
+**Every row is keyed on the bridge cycle's own clock** (`last_decision.at`),
+never on our poll clock and never on the device's power-report window. One row
+per bridge cycle, so a re-poll inside one cycle writes nothing — that is what
+the dedup is for — while the head's room temperature, which the bridge reads
+fresh every cycle, is never suppressed by a power-report window that has not
+moved. The window's own bounds ride along in nullable columns, which is the
+shape `outdoor_readings` and `aq_ts` already use for a slow auxiliary beside a
+fast key. A payload with no datable cycle is **unkeyed**: dropped rather than
+stored under a clock we made up, the same refusal `aq_ts` records for an
+undateable AQI.
+
+The practical half of that choice: `last_decision.at` is published by the
+bridge **already on `origin/main`**, so this feed starts recording the dining
+head's temperature on the bridge deployed today and the draw columns fill in
+when parsons-pulse #182 lands.
 """
 
 import http.client
@@ -141,7 +149,7 @@ def metered_watts(delta_wh, window_start, window_end) -> float | None:
     to 45, 54 and 65 W. A chart of the spot value alone is a flat line.
 
     None rather than a fallback whenever the window cannot be measured — no
-    energy, no start, or a start at-or-after the close. The observed windows
+    energy, a negative energy, no start, or a start at-or-after the close. The observed windows
     differ by a factor of nearly four, so there is no default length close
     enough to be harmless, and a fabricated mean is a wrong answer where None
     is a missing one.
@@ -150,6 +158,12 @@ def metered_watts(delta_wh, window_start, window_end) -> float | None:
     device's `deltaEnergy` in watt-hours over exactly that window.
     """
     if delta_wh is None or window_start is None or window_end is None:
+        return None
+    # A head cannot draw negative power, so a negative `deltaEnergy` is
+    # upstream garbage or a counter rollover. Plotted, it would autoscale the
+    # whole axis to a number that never happened -- the same harm `_finite`
+    # exists to prevent one function up, arriving as a finite value.
+    if delta_wh < 0:
         return None
     seconds = (window_end - window_start).total_seconds()
     if seconds <= 0:
@@ -160,24 +174,23 @@ def metered_watts(delta_wh, window_start, window_end) -> float | None:
 def parse_reading(payload, received_at: str) -> dict | None:
     """One `/status` payload as a `minisplit_readings` row, or None if unkeyed.
 
-    None means the payload carries no datable report window — `head` is null
-    because the bridge has not completed a cycle, or the bridge predates the
-    draw fields, or the head reported a draw this bridge could not date. All
-    three are ordinary states rather than errors, and all three are refusals to
-    store: the row's whole identity is the window's close, so there is nothing
-    to key the reading on and our poll clock is not a substitute.
+    None means the bridge has not completed a cycle, so there is no observation
+    clock and no head reading to attach to one. That is an ordinary state
+    rather than an error, and it is a refusal to store: the row's identity is
+    the cycle's own clock, and our poll clock is not a substitute.
 
     **A payload that is not this contract raises instead**, so `poll_once`
-    reports it as an error. `payload["head"]` rather than `.get("head")` is
-    what draws that line: a body with no `head` key at all, or one that is
-    neither an object nor null, is a different endpoint or a broken bridge, and
-    answering it with the one status that means "nothing is wrong yet" would
-    hide a fault behind the state this feed expects to be in for now.
+    reports it as an error. `payload["last_decision"]` rather than
+    `.get(...)` is what draws that line: a body with no `last_decision` key at
+    all, or a `head` that is neither an object nor null, is a different
+    endpoint or a broken bridge, and answering it with the one status that
+    means "nothing is wrong yet" would hide a fault.
 
-    Note what is *not* required: a window with a close but no energy still
-    produces a row. The close is what makes the reading identifiable, and the
-    head's own temperature — the half of #139 that works today — travels on
-    the same row.
+    Note what is *not* required: the power-report window. A cycle with a
+    temperature and no datable window still produces a row, which is the whole
+    reason the key is the cycle rather than the window — on the bridge
+    deployed today that is *every* row, and keyed the other way this feed would
+    store nothing at all.
 
     Temperature is converted Fahrenheit → Celsius **here**, which makes this
     the one conversion in this project that runs into storage rather than out
@@ -185,19 +198,29 @@ def parse_reading(payload, received_at: str) -> dict | None:
     every other temperature is Celsius, which is the silent 30-degree error
     `web` names as its reason for publishing units as literals.
     """
+    decision = payload["last_decision"]
     head = payload["head"]
-    if head is None:
+    if decision is None or head is None:
+        # Both are `None` exactly when the bridge has not completed a cycle --
+        # `status()` derives them from the same `self._last`. Either one alone
+        # would do; both are read so a bridge that ever decouples them is
+        # unkeyed rather than half-stored.
         return None
-    if not isinstance(head, dict):
-        raise TypeError(f"`head` is a {type(head).__name__}, not an object or null")
-    window_end = _moment(head.get("watts_at"))
-    if window_end is None:
+    if not isinstance(decision, dict) or not isinstance(head, dict):
+        raise TypeError(
+            "`last_decision` and `head` must each be an object or null, got "
+            f"{type(decision).__name__} and {type(head).__name__}"
+        )
+    cycle_at = _moment(decision["at"])
+    if cycle_at is None:
         return None
     window_start = _moment(head.get("watts_from"))
+    window_close = _moment(head.get("watts_at"))
     return {
-        "ts": window_end.isoformat(),
+        "ts": cycle_at.isoformat(),
         "received_at": received_at,
         "window_start": None if window_start is None else window_start.isoformat(),
+        "window_close": None if window_close is None else window_close.isoformat(),
         "delta_wh": _finite(head.get("delta_wh")),
         "watts_spot": _finite(head.get("watts")),
         "temp": units.to_celsius(_finite(head.get("temperature")), BRIDGE_UNIT),
@@ -211,11 +234,14 @@ def poll_once(conn, fetch) -> str:
 
     Returns one of: 'inserted', 'duplicate', 'unkeyed', 'error'.
 
-    'unkeyed' is the status that matters here, and it is deliberately not
-    'error': until parsons-pulse #182 is merged **and** deployed, the bridge on
-    the box publishes no draw fields at all, so every poll is legitimately
-    unkeyed and a run of them says the dependency has not landed yet — not that
-    anything is broken. 'error' is reserved for a fetch, a payload or an insert
+    'unkeyed' is deliberately not 'error': a bridge that has not completed a
+    cycle yet — just restarted, or waiting out a SmartThings 429 — publishes
+    `last_decision: null`, and that is a state to wait through rather than a
+    fault. 'error' is reserved for a fetch, a payload or an insert that failed.
+
+    Note what 'unkeyed' is **not** any more: a bridge predating the draw
+    fields. Those rows now store, carrying the head's temperature and null
+    draw columns. See `parse_reading`. 'error' is reserved for a fetch, a payload or an insert
     that failed.
     """
     try:

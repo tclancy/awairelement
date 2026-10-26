@@ -1954,15 +1954,20 @@ def test_every_outdoor_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
 
 
 def _seed_minisplit(db_path, samples):
-    """samples: [(close, start_or_None, delta_wh, celsius, spot_watts)]."""
+    """samples: [(cycle_at, start_or_None, delta_wh, celsius, spot_watts)].
+
+    `cycle_at` is the row's key — the bridge cycle that read the head. The
+    window it reports closed earlier, which is why both stamps are stored.
+    """
     conn = db.connect(db_path)
-    for close, start, delta_wh, celsius, spot in samples:
+    for cycle_at, start, delta_wh, celsius, spot in samples:
         db.insert_minisplit_reading(
             conn,
             {
-                "ts": close.isoformat(),
-                "received_at": close.isoformat(),
+                "ts": cycle_at.isoformat(),
+                "received_at": cycle_at.isoformat(),
                 "window_start": None if start is None else start.isoformat(),
+                "window_close": cycle_at.isoformat(),
                 "delta_wh": delta_wh,
                 "watts_spot": spot,
                 "temp": celsius,
@@ -1974,8 +1979,9 @@ def _seed_minisplit(db_path, samples):
 
 
 def _one_window(now, *, minutes_ago=10, length=800, delta_wh=10.0, celsius=15.0):
-    close = now - timedelta(minutes=minutes_ago)
-    return [(close, close - timedelta(seconds=length), delta_wh, celsius, 30.0)]
+    """One cycle whose report window closed at the cycle and ran `length` long."""
+    cycle_at = now - timedelta(minutes=minutes_ago)
+    return [(cycle_at, cycle_at - timedelta(seconds=length), delta_wh, celsius, 30.0)]
 
 
 def test_series_ships_both_mini_split_traces_on_the_indoor_temp_grid(client, tmp_path):
@@ -2046,7 +2052,7 @@ def test_the_mini_split_carry_window_is_two_report_windows_wide(client, tmp_path
     """
     window = web._MINISPLIT_CARRY_INTERVALS * minisplit.MAX_REPORT_WINDOW_SECONDS
     temps, watts = web._minisplit_on_grid(
-        [(0, 4.0, 10.0, None)], [window, window + 1], "C"
+        [(0, 4.0, 10.0, None, None)], [window, window + 1], "C"
     )
     assert temps == [4.0, None], (
         f"an observation exactly {web._MINISPLIT_CARRY_INTERVALS} report "
@@ -2089,3 +2095,24 @@ def test_no_mini_split_rows_still_ships_two_full_length_runs_of_null(client):
     grid = payload["metrics"]["temp"]["t"]
     assert payload["minisplit_temp"] == [None] * len(grid)
     assert payload["minisplit_watts"] == [None] * len(grid)
+
+
+def test_an_unparseable_stored_window_costs_that_rows_draw_and_not_the_page(
+    client, tmp_path
+):
+    """`/api/series` has no handler, so a raise here blanks every card.
+
+    Three processes share this database and the column carries no CHECK, so the
+    temperature trace — and the six indoor ones, which have nothing to do with
+    this feed — must survive one bad stamp.
+    """
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now))
+    conn = db.connect(tmp_path / "web.db")
+    conn.execute("UPDATE minisplit_readings SET window_start = 'not a timestamp'")
+    conn.commit()
+    conn.close()
+    payload = client.get("/api/series?range=7d").get_json()
+    assert set(payload["minisplit_watts"]) == {None}
+    assert 15.0 in payload["minisplit_temp"]
+    assert payload["metrics"]["co2"]["avg"], "the unrelated indoor cards went blank"

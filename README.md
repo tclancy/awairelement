@@ -20,9 +20,18 @@ going down cannot wedge the others:
   15 minutes, plus NWS alerts for the parcel. Needs `AWAIR_LAT` / `AWAIR_LON`.
 - **Mini split** (`awair.minisplit`) — the dining room Samsung head's own room
   temperature and metered power draw, read from the parsons-pulse climate
-  bridge's loopback `/status` (#139). One row per power-report *window*, keyed
-  on the window's close rather than on our poll clock. Loopback-only, so it
-  runs on the bridge's box or not at all.
+  bridge's loopback `/status` (#139). One row per bridge *cycle*, keyed on the
+  cycle's own clock rather than on our poll clock. Loopback-only, so it runs on
+  the bridge's box or not at all.
+
+  Two things to expect on a box today. **The draw columns stay NULL until
+  parsons-pulse #182 is merged and deployed** — the bridge before it publishes
+  no `watts`/`deltaEnergy` at all, so rows carry the head's temperature and
+  nothing else; that is working, not broken. And **this feed has no health
+  escalation**: unlike the outdoor poller it opens no alert event and sends no
+  ntfy, so a bridge that stops answering shows up only as `error` lines in
+  `journalctl --user -u awairelement-minisplit`. Deliberate for a first cut,
+  and the reason the log line is worth watching after a deploy.
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).

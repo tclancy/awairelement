@@ -349,8 +349,10 @@ _MINISPLIT_CARRY_INTERVALS = 2
 
 # The mini split columns `_minisplit_on_grid` reads, in the order it unpacks
 # them. `ts` is not here: `db.minisplit_readings_since` always returns it first,
-# as epoch seconds.
-_MINISPLIT_SERIES_COLUMNS = ("temp", "delta_wh", "window_start")
+# as epoch seconds -- and `ts` is the bridge CYCLE's clock, which is why the
+# window's own bounds have to be read as columns. The draw is measured over the
+# window; the row is drawn at the cycle that reported it.
+_MINISPLIT_SERIES_COLUMNS = ("temp", "delta_wh", "window_start", "window_close")
 
 
 def _minisplit_carry_max_age_seconds():
@@ -377,9 +379,9 @@ def _minisplit_on_grid(rows, grid, unit):
 
     `rows` is `db.minisplit_readings_since(conn, _MINISPLIT_SERIES_COLUMNS, ...)`
     and `grid` is `metrics["temp"]["t"]`, the stamps the indoor temperature
-    chart is already drawn against. Returns `(temperature, watts)`, two
-    flat lists each exactly as long as `grid` -- the same shape, and for the
-    same uPlot reason, as `_outdoor_temp_on_grid`.
+    chart is already drawn against. Returns `(temperature, watts)`, two flat
+    lists each exactly as long as `grid` -- the same shape, and for the same
+    uPlot reason, as `_outdoor_temp_on_grid`.
 
     **The draw published here is the metered mean over each report window, not
     the head's spot reading.** The spot value read 30.0 W across three
@@ -388,39 +390,56 @@ def _minisplit_on_grid(rows, grid, unit):
     `minisplit.metered_watts`, which owns the refusal to derive one from the
     other.
 
-    The two series carry different quantities and so are carried separately,
-    but they share one bound and one set of source rows: a row with a
-    temperature and no energy holds its temperature and contributes no draw,
-    and `series.carry_forward` drops the Nones rather than holding them.
+    Both series are drawn at the row's `ts`, which is the bridge cycle that
+    reported the reading. For the temperature that is its observation time. For
+    the draw it is up to one cycle later than the window it measures, and
+    consecutive cycles re-reporting one window repeat its mean -- a hold, which
+    is what `carry_forward` would do with the gap anyway.
 
-    `datetime.fromisoformat` is allowed to raise on `window_start`, unlike
-    `_alert_clock`'s third-party stamps: every value in this column was written
-    by `minisplit.parse_reading` from a datetime, so an unparseable one is our
-    own bug and should not be rendered as a quiet gap.
+    The two carry separately but share one bound and one set of rows: a row
+    with a temperature and no datable window holds its temperature and
+    contributes no draw, which is **every** row until parsons-pulse #182
+    deploys.
+
+    A stored stamp that will not parse costs that row's draw and nothing else.
+    Letting it raise was the first shape of this function, and the blast radius
+    was wrong: `/api/series` has no handler, so one bad `window_start` would
+    blank every card on the page -- including the indoor readings, which have
+    nothing to do with this feed. Three processes share this file and the
+    column carries no CHECK, so "we wrote it, therefore it parses" is a
+    guarantee this function is not the right place to bet the dashboard on.
     """
     temps = []
     watts = []
-    for epoch, temp, delta_wh, window_start in rows:
+    max_age = _minisplit_carry_max_age_seconds()
+    for epoch, temp, delta_wh, window_start, window_close in rows:
         if unit != "C":
             temp = units.from_celsius(temp, unit)
         temps.append((epoch, temp))
-        watts.append(
-            (
-                epoch,
-                minisplit.metered_watts(
-                    delta_wh,
-                    None
-                    if window_start is None
-                    else datetime.fromisoformat(window_start),
-                    datetime.fromtimestamp(epoch, UTC),
-                ),
-            )
-        )
-    max_age = _minisplit_carry_max_age_seconds()
+        watts.append((epoch, _metered_watts_of(delta_wh, window_start, window_close)))
     return (
         carry_forward(temps, grid, max_age),
         carry_forward(watts, grid, max_age),
     )
+
+
+def _metered_watts_of(delta_wh, window_start, window_close):
+    """`minisplit.metered_watts` over two stored ISO stamps, or None.
+
+    `TypeError` covers the naive/aware mix a hand-edited stamp could produce
+    (`datetime - datetime` raises rather than returning something wrong), and
+    `ValueError` covers an unparseable one. Both answer None, which is the same
+    answer an undatable window gets from the parser -- a missing draw, not a
+    broken page.
+    """
+    try:
+        return minisplit.metered_watts(
+            delta_wh,
+            None if window_start is None else datetime.fromisoformat(window_start),
+            None if window_close is None else datetime.fromisoformat(window_close),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _bootstrap_schema(db_path, logger) -> None:

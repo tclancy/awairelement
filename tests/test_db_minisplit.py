@@ -1,5 +1,9 @@
 """`minisplit_readings` storage: the key, the dedup, and the range read (#139).
 
+The key is the BRIDGE CYCLE's own clock, not the device's power-report window
+and not our poll clock -- see `db.MINISPLIT_COLUMNS_DDL` for why the obvious
+choice was the wrong one.
+
 The table is introduced whole, so it needs no entry in `_migrate` — but it does
 need the two guarantees the older two tables had to be repaired to get: a `ts`
 that cannot be null, and a conflict clause that names its target so a NOT NULL
@@ -22,6 +26,7 @@ def row(ts, **overrides):
         "ts": ts,
         "received_at": RECEIVED,
         "window_start": "2026-10-26T07:11:14+00:00",
+        "window_close": "2026-10-26T07:24:34+00:00",
         "delta_wh": 10.0,
         "watts_spot": 30.0,
         "temp": 15.0,
@@ -55,7 +60,7 @@ def test_the_physical_columns_are_the_published_list_in_order(conn):
     assert physical == db.MINISPLIT_COLUMNS
 
 
-def test_the_window_close_cannot_be_null(conn):
+def test_the_cycle_clock_cannot_be_null(conn):
     """SQLite gives a non-INTEGER primary key no implicit NOT NULL (#98).
 
     Without the explicit constraint two null-`ts` rows both insert and the
@@ -105,11 +110,11 @@ def test_the_range_read_returns_epoch_stamps_ascending(conn):
     assert rows[0][1:] == (15.0, 10.0)
 
 
-def test_the_range_read_is_bounded_by_the_window_close(conn):
-    """A window that opened before `since` and closed inside it is included.
+def test_the_range_read_is_bounded_by_the_cycle_clock(conn):
+    """A window that opened before `since` is included if its cycle is inside it.
 
-    That is the honest rule for a metered quantity: the energy is only known
-    once the device closes the window, so the close is when the reading exists.
+    The row exists when the bridge read it, so that is what the range filter
+    answers -- and a window that closed earlier still travels on it.
     """
     db.insert_minisplit_reading(
         conn,

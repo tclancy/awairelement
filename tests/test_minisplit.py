@@ -25,6 +25,10 @@ RECEIVED = "2026-10-26T07:30:00+00:00"
 STATUS = {
     "target": {"value": 68.0, "source": "schedule"},
     "awair": {"temp_f": 66.9, "age_s": 44},
+    # The bridge cycle that produced this snapshot, and the row's key. Published
+    # on `origin/main` as well as on #182's branch, which is what lets this feed
+    # record anything at all before #182 deploys.
+    "last_decision": {"at": "2026-10-26T07:25:00+00:00", "reason": "hold"},
     "head": {
         "power": "on",
         "mode": "cool",
@@ -49,6 +53,21 @@ def status(**head_overrides):
     return {**STATUS, "head": head}
 
 
+def at_cycle(at):
+    """`STATUS` with a different cycle clock -- the row's key."""
+    return {**STATUS, "last_decision": {"at": at, "reason": "hold"}}
+
+
+# The payload `parsons-pulse origin/main` serves: no draw fields at all, which
+# is the state of the bridge on the box until #182 is merged AND deployed.
+DEPLOYED_BRIDGE_STATUS = {
+    "target": {"value": 68.0, "source": "schedule"},
+    "awair": {"temp_f": 66.9, "age_s": 44},
+    "last_decision": {"at": "2026-10-26T07:25:00+00:00", "reason": "hold"},
+    "head": {"power": "on", "mode": "cool", "setpoint": 50.0, "temperature": 59.0},
+}
+
+
 def fetcher(payload):
     """A `make_fetch`-shaped callable returning `payload` as a JSON body."""
 
@@ -61,71 +80,131 @@ def fetcher(payload):
 # -- keying -------------------------------------------------------------------
 
 
-def test_the_row_is_keyed_on_the_report_window_close_not_the_poll_clock():
+def test_the_row_is_keyed_on_the_bridge_cycle_not_the_poll_clock():
+    """One row per bridge cycle: its own clock, never ours.
+
+    The window's bounds ride along as columns, because the two quantities move
+    at different rates -- the head's temperature is read every cycle, a power
+    report closes when the device feels like it.
+    """
     reading = minisplit.parse_reading(STATUS, received_at=RECEIVED)
-    assert reading["ts"] == "2026-10-26T07:24:34+00:00"
+    assert reading["ts"] == "2026-10-26T07:25:00+00:00"
     assert reading["received_at"] == RECEIVED
     assert reading["window_start"] == "2026-10-26T07:11:14+00:00"
+    assert reading["window_close"] == "2026-10-26T07:24:34+00:00"
 
 
-def test_a_window_close_is_normalised_to_utc_so_stored_keys_sort_together():
-    """`ts` is compared lexicographically by SQL, so one spelling or no dedup.
+def test_the_bridge_deployed_today_produces_a_row_with_a_temperature_and_no_draw():
+    """The half of #139 that works before parsons-pulse #182 lands.
 
-    A head in a non-UTC offset is not hypothetical for a timestamp that
-    originates at Samsung; two spellings of one instant would both insert and
-    then sort against each other by text.
+    This is the test the first draft of this feed could not pass: keyed on the
+    window close, `DEPLOYED_BRIDGE_STATUS` stored nothing at all and the 59 F
+    reading was discarded on every poll.
     """
+    reading = minisplit.parse_reading(DEPLOYED_BRIDGE_STATUS, RECEIVED)
+    assert reading["ts"] == "2026-10-26T07:25:00+00:00"
+    assert reading["temp"] == 15.0
+    assert reading["window_start"] is None
+    assert reading["window_close"] is None
+    assert reading["delta_wh"] is None
+    assert reading["watts_spot"] is None
+
+
+def test_a_fresher_temperature_is_not_suppressed_by_a_window_that_has_not_moved():
+    """The whole reason the key is the cycle and not the window.
+
+    The device's windows ran 220 s and 800 s against a 300 s cycle, so a window
+    that has not closed again is the *normal* case -- and under the window key
+    every one of these later readings was a duplicate and thrown away.
+    """
+    rows = [
+        minisplit.parse_reading(
+            {**at_cycle(at), "head": {**STATUS["head"], "temperature": temp_f}},
+            RECEIVED,
+        )
+        for at, temp_f in [
+            ("2026-10-26T07:25:00+00:00", 59.0),
+            ("2026-10-26T07:30:00+00:00", 62.0),
+            ("2026-10-26T07:35:00+00:00", 65.0),
+        ]
+    ]
+    assert [r["ts"] for r in rows] == [
+        "2026-10-26T07:25:00+00:00",
+        "2026-10-26T07:30:00+00:00",
+        "2026-10-26T07:35:00+00:00",
+    ]
+    assert [r["temp"] for r in rows] == [15.0, 16.67, 18.33]
+    # All three carry the same unmoved window, which is the truth about it.
+    assert {r["window_close"] for r in rows} == {"2026-10-26T07:24:34+00:00"}
+
+
+def test_a_cycle_clock_is_normalised_to_utc_so_stored_keys_sort_together():
+    """`ts` is compared lexicographically by SQL, so one spelling or no dedup."""
     reading = minisplit.parse_reading(
-        status(watts_at="2026-10-26T03:24:34-04:00"), received_at=RECEIVED
+        at_cycle("2026-10-26T03:25:00-04:00"), received_at=RECEIVED
     )
-    assert reading["ts"] == "2026-10-26T07:24:34+00:00"
+    assert reading["ts"] == "2026-10-26T07:25:00+00:00"
 
 
 @pytest.mark.parametrize(
-    "watts_at",
+    "at",
     [
         None,
-        ...,
-        "2026-10-26T07:24:34",  # naive: an instant we cannot place
+        "2026-10-26T07:25:00",  # naive: an instant we cannot place
         "2026-10-26",  # date-only
         "2026-10-26+05:00",  # reads back NAIVE on 3.13 -- the offset parses as a time
         "20261026",
         "not a timestamp",
-        1761463474,  # the device has been seen to send an integer stamp
+        1761463500,  # the device has been seen to send an integer stamp
     ],
 )
-def test_a_draw_this_bridge_cannot_date_is_unkeyed_and_stores_nothing(watts_at):
-    assert minisplit.parse_reading(status(watts_at=watts_at), RECEIVED) is None
+def test_a_cycle_this_bridge_cannot_date_is_unkeyed_and_stores_nothing(at):
+    assert minisplit.parse_reading(at_cycle(at), RECEIVED) is None
 
 
-def test_a_null_head_is_unkeyed_but_a_payload_that_is_not_this_contract_is_not():
-    """`head: null` is the bridge before its first cycle -- an ordinary state.
+@pytest.mark.parametrize(
+    "watts_at",
+    [None, ..., "2026-10-26T07:24:34", "2026-10-26", "not a timestamp", 1761463474],
+)
+def test_an_undatable_window_costs_the_window_and_not_the_row(watts_at):
+    """The reading is still a reading; only its draw loses its bounds."""
+    reading = minisplit.parse_reading(status(watts_at=watts_at), RECEIVED)
+    assert reading["ts"] == "2026-10-26T07:25:00+00:00"
+    assert reading["window_close"] is None
+    assert reading["temp"] == 15.0
 
-    A body with no `head` key, or one that is neither an object nor null, is a
-    different endpoint or a broken bridge. Answering that with 'unkeyed' would
-    hide a fault behind the status this feed sits in until #182 deploys, so it
-    raises into `POLL_FAILURES` instead and `poll_once` calls it an error.
+
+def test_a_bridge_with_no_completed_cycle_is_unkeyed():
+    """`head` and `last_decision` are both null until the first cycle lands.
+
+    `status()` derives them from one attribute, so they are null together; both
+    are read so a bridge that ever decouples them is unkeyed rather than
+    half-stored.
     """
+    assert (
+        minisplit.parse_reading(
+            {**STATUS, "head": None, "last_decision": None}, RECEIVED
+        )
+        is None
+    )
     assert minisplit.parse_reading({**STATUS, "head": None}, RECEIVED) is None
+    assert minisplit.parse_reading({**STATUS, "last_decision": None}, RECEIVED) is None
+
+
+def test_a_payload_that_is_not_this_contract_raises_rather_than_reading_unkeyed():
+    """Answering a broken bridge with the benign status would hide the fault."""
     with pytest.raises(KeyError):
         minisplit.parse_reading({"target": {}}, RECEIVED)
+    with pytest.raises(KeyError):
+        minisplit.parse_reading({"head": STATUS["head"]}, RECEIVED)
     with pytest.raises(TypeError):
-        minisplit.parse_reading({"head": "on"}, RECEIVED)
-
-
-def test_a_window_with_a_close_but_no_energy_still_produces_a_row():
-    """The close is what makes a reading identifiable; the energy is a value.
-
-    This row is the half of #139 that works on the bridge deployed today: the
-    head's own room temperature travels on it with no draw at all.
-    """
-    reading = minisplit.parse_reading(
-        status(delta_wh=None, watts=None), received_at=RECEIVED
-    )
-    assert reading is not None
-    assert reading["delta_wh"] is None
-    assert reading["watts_spot"] is None
-    assert reading["temp"] == 15.0
+        minisplit.parse_reading({**STATUS, "head": "on"}, RECEIVED)
+    with pytest.raises(TypeError):
+        minisplit.parse_reading({**STATUS, "last_decision": "07:25"}, RECEIVED)
+    with pytest.raises(KeyError):
+        minisplit.parse_reading(
+            {**STATUS, "last_decision": {"reason": "hold"}}, RECEIVED
+        )
 
 
 # -- values -------------------------------------------------------------------
@@ -201,8 +280,10 @@ def moment(text):
 def test_the_metered_mean_is_the_energy_over_the_windows_own_length():
     """The three windows measured on 2026-10-26, as the device reported them.
 
-    Each pairs a constant 30.0 W spot reading with a different real draw, which
-    is the whole argument for plotting this number instead of that one.
+    Each of these windows carried a 30.0 W spot reading, and this function
+    never sees it -- that the spot value is the one kept off the chart is
+    asserted end-to-end in `tests/test_web.py`'s
+    `test_the_draw_on_the_chart_is_the_metered_mean_not_the_spot_reading`.
     """
     cases = [
         ("2026-10-26T06:46:24+00:00", "2026-10-26T06:59:44+00:00", 12.0, 54.0),
@@ -261,27 +342,28 @@ def test_a_fresh_window_inserts_and_a_re_read_of_it_is_a_duplicate(conn):
     assert conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 1
 
 
-def test_a_later_window_inserts_beside_the_earlier_one(conn):
+def test_a_later_cycle_inserts_beside_the_earlier_one(conn):
     assert minisplit.poll_once(conn, fetcher(STATUS)) == "inserted"
-    later = status(
-        watts_at="2026-10-26T07:37:54+00:00",
-        watts_from="2026-10-26T07:24:34+00:00",
-        delta_wh=14.0,
-    )
+    later = at_cycle("2026-10-26T07:30:00+00:00")
     assert minisplit.poll_once(conn, fetcher(later)) == "inserted"
     stored = [row[0] for row in conn.execute("SELECT ts FROM minisplit_readings")]
-    assert stored == ["2026-10-26T07:24:34+00:00", "2026-10-26T07:37:54+00:00"]
+    assert stored == ["2026-10-26T07:25:00+00:00", "2026-10-26T07:30:00+00:00"]
 
 
-def test_an_undatable_payload_reports_unkeyed_not_error(conn):
-    """The distinction is the whole status: 'unkeyed' is the expected state.
-
-    Until parsons-pulse #182 is merged AND deployed, the bridge on the box
-    publishes no draw fields, so every poll is legitimately unkeyed. Reporting
-    that as an error would make a run of them look like a fault.
-    """
-    assert minisplit.poll_once(conn, fetcher(status(watts_at=...))) == "unkeyed"
+def test_a_bridge_with_no_cycle_yet_reports_unkeyed_not_error(conn):
+    """'unkeyed' is a state to wait through -- a restart, or a 429 backoff."""
+    no_cycle = {**STATUS, "head": None, "last_decision": None}
+    assert minisplit.poll_once(conn, fetcher(no_cycle)) == "unkeyed"
     assert conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 0
+
+
+def test_the_deployed_bridge_stores_a_row_rather_than_reporting_unkeyed(conn):
+    """The feed is useful before its dependency lands, not inert until then."""
+    assert minisplit.poll_once(conn, fetcher(DEPLOYED_BRIDGE_STATUS)) == "inserted"
+    stored = conn.execute(
+        "SELECT ts, temp, delta_wh FROM minisplit_readings"
+    ).fetchall()
+    assert stored == [("2026-10-26T07:25:00+00:00", 15.0, None)]
 
 
 @pytest.mark.parametrize(
@@ -380,7 +462,7 @@ def test_main_polls_once_then_exits_cleanly_on_sigterm(
         stored = conn.execute("SELECT ts FROM minisplit_readings").fetchall()
     finally:
         conn.close()
-    assert stored == [("2026-10-26T07:24:34+00:00",)]
+    assert stored == [("2026-10-26T07:25:00+00:00",)]
 
 
 def test_main_reads_the_url_it_is_configured_with(
@@ -409,3 +491,15 @@ def test_main_reads_the_url_it_is_configured_with(
     monkeypatch.setattr(minisplit, "make_fetch", fake_make_fetch)
     minisplit.main()
     assert urls == ["http://bridge.test:9999/status"]
+
+
+def test_a_negative_energy_has_no_mean_rather_than_a_negative_draw():
+    """A head cannot draw negative power: a rollover must not autoscale the axis."""
+    assert (
+        minisplit.metered_watts(
+            -5.0,
+            moment("2026-10-26T07:11:14+00:00"),
+            moment("2026-10-26T07:24:34+00:00"),
+        )
+        is None
+    )

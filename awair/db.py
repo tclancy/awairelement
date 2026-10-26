@@ -139,13 +139,27 @@ SCHEMA += (
 # `OUTDOOR_COLUMNS_DDL` above -- though only `SCHEMA` creates this table today,
 # because a table introduced whole needs no rebuild migration.
 #
-# `ts` is the device's own power-report window CLOSE, not our poll clock, so the
-# conflict clause makes the poll loop idempotent exactly as it does for
-# `outdoor_readings`: the head reports on its own cadence (windows of 220 s and
-# 800 s measured against the bridge's 300 s cycle), so most polls re-read a
-# window already stored and write nothing. `ts TEXT NOT NULL PRIMARY KEY` for
-# the #98 reason spelled out above -- a non-INTEGER primary key gets no implicit
-# NOT NULL, and two null-`ts` rows would both insert.
+# `ts` is the BRIDGE CYCLE's own clock (`/status`'s `last_decision.at`), not our
+# poll clock and not the device's power-report window. That choice is the one
+# worth reading the rest of this comment for.
+#
+# The window close was the obvious key and is wrong, because the two quantities
+# on this row move at different rates: the head's temperature is read fresh
+# every bridge cycle (300 s) while a power-report window closes when the device
+# feels like it (220 s and 800 s measured) -- and on the bridge deployed today
+# there are no window fields at all. Keyed on the window, this table stores
+# NOTHING until parsons-pulse #182 deploys, and two thirds of temperature
+# readings after it.
+#
+# This is the shape `outdoor_readings` already uses and `aq_ts` already records:
+# key on the source's own clock for the quantity that moves every poll, and
+# carry the slow auxiliary's own stamps in nullable columns beside it. A
+# re-poll inside one cycle still writes nothing, which is the whole of what the
+# dedup is for.
+#
+# `ts TEXT NOT NULL PRIMARY KEY` for the #98 reason spelled out above -- a
+# non-INTEGER primary key gets no implicit NOT NULL, and two null-`ts` rows
+# would both insert.
 #
 # `temp` is CELSIUS, like every other temperature column in this database, and
 # the bridge publishes FAHRENHEIT (`climatesidecar.devices.BRIDGE_UNIT`). The
@@ -165,6 +179,7 @@ MINISPLIT_COLUMNS_DDL = """
     ts TEXT NOT NULL PRIMARY KEY,
     received_at TEXT NOT NULL,
     window_start TEXT,
+    window_close TEXT,
     delta_wh REAL,
     watts_spot REAL,
     temp REAL,
@@ -179,14 +194,19 @@ SCHEMA += (
 MINISPLIT_COLUMNS = (
     "ts",
     "received_at",
-    # The report window's OPEN. Nullable, and null means the window could not be
-    # dated at its start -- `metered_watts` then refuses to divide rather than
-    # guessing a length, because the measured windows differ by a factor of
-    # nearly four and no default is close enough to be harmless.
+    # The power-report window's own bounds, as the device published them. Both
+    # nullable and both meaning the same thing when null: this reading has a
+    # room temperature and no datable draw -- either the bridge predates the
+    # draw fields, or the head reported one this bridge could not date.
+    # `metered_watts` refuses to divide rather than guessing a length, because
+    # the measured windows differ by a factor of nearly four.
     "window_start",
-    # The energy the device metered over [window_start, ts], in watt-hours
-    # (SmartThings `deltaEnergy`). This is the quantity to plot: see
-    # `minisplit.metered_watts`.
+    "window_close",
+    # The energy the device metered over [window_start, window_close], in
+    # watt-hours (SmartThings `deltaEnergy`). This is the quantity to plot: see
+    # `minisplit.metered_watts`. Consecutive cycles re-reporting one window
+    # repeat it, which is a hold rather than new energy -- the window bounds
+    # beside it are what say so.
     "delta_wh",
     # The head's own spot claim, in watts (SmartThings `power`). Stored because
     # it is what the device says, NOT because it is usable: measured 30.0 W
