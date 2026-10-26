@@ -493,11 +493,24 @@ def test_main_reads_the_url_it_is_configured_with(
     assert urls == ["http://bridge.test:9999/status"]
 
 
-def test_a_negative_energy_has_no_mean_rather_than_a_negative_draw():
-    """A head cannot draw negative power: a rollover must not autoscale the axis."""
+@pytest.mark.parametrize("delta_wh", [-0.01, -0.5, -1.0, -5.0])
+def test_a_negative_energy_has_no_mean_rather_than_a_negative_draw(delta_wh):
+    """A head cannot draw negative power: a rollover must not autoscale the axis.
+
+    Parametrized down to the boundary on purpose. A single -5.0 left the
+    guard's *threshold* unpinned — a mutation round widened `< 0` to `< -1`
+    and the test stayed green while every draw between -1 and 0 Wh reached the
+    chart (#139 review round 2). The zero case is the other side of the same
+    boundary and has its own test above: 0.0 is a reading, not a refusal.
+
+    Pinned to 0.01 Wh and no finer, deliberately. `< -0.001` still survives
+    this round and the regress has no end — what the smallest case buys is a
+    bound on the harm rather than an exact threshold, and a draw of -0.0005 Wh
+    over a real window rounds to -0.0 W, which cannot move an axis.
+    """
     assert (
         minisplit.metered_watts(
-            -5.0,
+            delta_wh,
             moment("2026-10-26T07:11:14+00:00"),
             moment("2026-10-26T07:24:34+00:00"),
         )
