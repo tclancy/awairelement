@@ -56,10 +56,13 @@ DEFAULT_POLL_SECONDS = 300
 # authentication, so it is reachable only from the box it runs on.
 DEFAULT_STATUS_URL = "http://127.0.0.1:8100/status"
 
-# The unit the bridge works in: `climatesidecar.devices.BRIDGE_UNIT` is `"F"`,
-# and the bridge refuses to range-check a setpoint for a head reporting anything
-# else rather than guessing. Named here rather than inlined because it is the
-# input to the one conversion in this project that runs *into* storage.
+# The unit the bridge works in: `climatesidecar.devices.BRIDGE_UNIT` is `"F"`.
+# Since parsons-pulse#182 the bridge enforces it on the head's temperature as
+# well as its setpoint: a head reporting any other unit (or none) publishes
+# `temperature: null`, never a number in the wrong scale, so this constant is
+# a contract the bridge keeps rather than an assumption. Named here rather than
+# inlined because it is the input to the one conversion in this project that
+# runs *into* storage.
 BRIDGE_UNIT = "F"
 
 # The longest power-report window observed on the dining head: 800 s, against
