@@ -3,7 +3,7 @@
 Continuous local logging, spike alerting, and a small trend dashboard for an
 [Awair Element](https://uk.getawair.com/products/element) air quality monitor.
 
-Two long-running processes:
+Two long-running processes, plus two optional feeds:
 
 - **Poller** — hits the Awair Element's Local API every 30 seconds, stores every
   reading in SQLite, runs spike detection, and fires [ntfy](https://ntfy.sh)
@@ -12,6 +12,17 @@ Two long-running processes:
 - **Dashboard** — a small Flask app that renders today / 7d / 30d
   small-multiple charts of every metric, with detected spikes overlaid. It
   opens on **today** (`web.DEFAULT_RANGE`).
+
+Each feed is its own process writing into the same SQLite file, so one source
+going down cannot wedge the others:
+
+- **Outdoor** (`awair.outdoor`) — Open-Meteo weather and air quality every
+  15 minutes, plus NWS alerts for the parcel. Needs `AWAIR_LAT` / `AWAIR_LON`.
+- **Mini split** (`awair.minisplit`) — the dining room Samsung head's own room
+  temperature and metered power draw, read from the parsons-pulse climate
+  bridge's loopback `/status` (#139). One row per power-report *window*, keyed
+  on the window's close rather than on our poll clock. Loopback-only, so it
+  runs on the bridge's box or not at all.
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).
@@ -79,6 +90,8 @@ omitted entirely to run without alerts.
 | `AWAIR_FAN_MAX_RUN_MINUTES` | `90` | Longest single fan run, regardless of CO2. |
 | `AWAIR_PM25_SUPPRESS` | `100` | pm25 (µg/m³) at or above which fans are blocked outright. |
 | `AWAIR_PM25_NEAR_MISS` | `50` | pm25 at or above which a watchpoint line is logged. Behaviour-neutral. |
+| `AWAIR_MINISPLIT_URL` | `http://127.0.0.1:8100/status` | The parsons-pulse climate bridge's status endpoint. Loopback-only, so the mini split poller has to run on the bridge's box. |
+| `AWAIR_MINISPLIT_POLL_SECONDS` | `300` | Seconds between mini split polls. The bridge's own control cycle — polling faster re-reads one report window. |
 
 To disable ntfy entirely, leave `AWAIR_NTFY_TOKEN` unset and pick a topic
 nobody's listening on — the poller will still POST but no one will see the
@@ -312,15 +325,19 @@ ingestion, so a wrong URL or 401 just gets logged.)
 
 ## Running as a systemd user service
 
-The `systemd/` directory ships two unit files you can drop into
+The `systemd/` directory ships four unit files you can drop into
 `~/.config/systemd/user/`. They assume the checkout lives at
 `~/sources/awairelement` and read environment from
 `~/.config/awairelement/environment`.
 
 ```bash
 mkdir -p ~/.config/systemd/user ~/.config/awairelement
-ln -sf "$PWD/systemd/awairelement.service"     ~/.config/systemd/user/
-ln -sf "$PWD/systemd/awairelement-web.service" ~/.config/systemd/user/
+ln -sf "$PWD/systemd/awairelement.service"       ~/.config/systemd/user/
+ln -sf "$PWD/systemd/awairelement-web.service"   ~/.config/systemd/user/
+# Optional feeds. The outdoor one needs AWAIR_LAT/AWAIR_LON; the mini split one
+# only makes sense on the box running the parsons-pulse climate bridge.
+ln -sf "$PWD/systemd/awairelement-outdoor.service"   ~/.config/systemd/user/
+ln -sf "$PWD/systemd/awairelement-minisplit.service" ~/.config/systemd/user/
 
 cat > ~/.config/awairelement/environment <<'EOF'
 AWAIR_URL=http://192.168.1.42/air-data/latest
@@ -444,6 +461,8 @@ awair/
 ├── monitor.py   # device health checks (unreachable, stale)
 ├── alerts.py    # ntfy client
 ├── series.py    # server-side bucketing for the dashboard
+├── minisplit.py # the mini split feed: one row per power-report window
+├── units.py     # temperature conversion, in both directions
 └── web.py       # Flask app + JSON endpoints
 ```
 

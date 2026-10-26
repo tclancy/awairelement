@@ -1,0 +1,26 @@
+# Dev reference copy — canonical unit is templated by the native-apps Ansible
+# role in the homelab repo (awairelement-minisplit.service.j2). Sibling of the
+# other two pollers so a bridge outage doesn't wedge either of them, and vice
+# versa.
+#
+# It polls the parsons-pulse climate bridge on LOOPBACK, so this unit only
+# makes sense on the box the bridge runs on. The bridge is a separate service
+# with its own lifecycle: `After=` orders a boot, nothing more, and the poller
+# reports `error` and carries on while the bridge is down.
+#
+# Manual install (non-Ansible boxes):
+#   ln -sf ~/sources/awairelement/systemd/awairelement-minisplit.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now awairelement-minisplit
+[Unit]
+Description=Awair Element mini split (climate bridge) poller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/sources/awairelement
+ExecStart=%h/sources/awairelement/.venv/bin/python -m awair.minisplit
+EnvironmentFile=-%h/.config/awairelement/environment
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

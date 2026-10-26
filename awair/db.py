@@ -135,6 +135,69 @@ SCHEMA += (
     "\nCREATE TABLE IF NOT EXISTS outdoor_readings (" + OUTDOOR_COLUMNS_DDL + ");\n"
 )
 
+# The mini split column list (#139), same one-definition rule as
+# `OUTDOOR_COLUMNS_DDL` above -- though only `SCHEMA` creates this table today,
+# because a table introduced whole needs no rebuild migration.
+#
+# `ts` is the device's own power-report window CLOSE, not our poll clock, so the
+# conflict clause makes the poll loop idempotent exactly as it does for
+# `outdoor_readings`: the head reports on its own cadence (windows of 220 s and
+# 800 s measured against the bridge's 300 s cycle), so most polls re-read a
+# window already stored and write nothing. `ts TEXT NOT NULL PRIMARY KEY` for
+# the #98 reason spelled out above -- a non-INTEGER primary key gets no implicit
+# NOT NULL, and two null-`ts` rows would both insert.
+#
+# `temp` is CELSIUS, like every other temperature column in this database, and
+# the bridge publishes FAHRENHEIT (`climatesidecar.devices.BRIDGE_UNIT`). The
+# conversion happens once, at ingest, in `minisplit.parse_reading` -- see that
+# function for why this is the one place in the project that converts INTO
+# storage rather than out of it.
+#
+# `switch` is the head's on/off state, which the bridge calls `power`. Renamed
+# deliberately: beside `watts_spot` a column called `power` reads as a number,
+# and the bridge's own `HeadState` docstring names that confusion as the reason
+# it keeps the two apart. See GLOSSARY.md: `switch`.
+#
+# No `setpoint`. It is the bridge's control value in Fahrenheit, parsons-pulse
+# is its system of record, and a second temperature in a second unit in this
+# database is the silent-30-degree trap the `temp` note above exists to avoid.
+MINISPLIT_COLUMNS_DDL = """
+    ts TEXT NOT NULL PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    window_start TEXT,
+    delta_wh REAL,
+    watts_spot REAL,
+    temp REAL,
+    mode TEXT,
+    switch TEXT
+"""
+
+SCHEMA += (
+    "\nCREATE TABLE IF NOT EXISTS minisplit_readings (" + MINISPLIT_COLUMNS_DDL + ");\n"
+)
+
+MINISPLIT_COLUMNS = (
+    "ts",
+    "received_at",
+    # The report window's OPEN. Nullable, and null means the window could not be
+    # dated at its start -- `metered_watts` then refuses to divide rather than
+    # guessing a length, because the measured windows differ by a factor of
+    # nearly four and no default is close enough to be harmless.
+    "window_start",
+    # The energy the device metered over [window_start, ts], in watt-hours
+    # (SmartThings `deltaEnergy`). This is the quantity to plot: see
+    # `minisplit.metered_watts`.
+    "delta_wh",
+    # The head's own spot claim, in watts (SmartThings `power`). Stored because
+    # it is what the device says, NOT because it is usable: measured 30.0 W
+    # across three consecutive windows whose metered energy implied 45, 54 and
+    # 65 W. Neither number is derivable from the other.
+    "watts_spot",
+    "temp",
+    "mode",
+    "switch",
+)
+
 OUTDOOR_COLUMNS = (
     "ts",
     "received_at",
@@ -631,6 +694,62 @@ def outdoor_readings_since(conn, columns, since) -> list:
         raise ValueError(f"unknown outdoor columns {unknown}")
     rows = conn.execute(
         f"SELECT ts, {', '.join(columns)} FROM outdoor_readings"
+        f" WHERE ts >= ? ORDER BY ts",
+        (since.isoformat(),),
+    )
+    return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
+
+
+def insert_minisplit_reading(conn: sqlite3.Connection, reading: dict) -> bool:
+    """Insert one mini split reading. False if this report window is stored.
+
+    `ts` is the head's own power-report window close (#139), so this is the
+    same idempotency the two older pollers have and it does more work here: the
+    bridge cycles every 300 s while the device's windows ran 220 s and 800 s
+    when they were measured, so a *majority* of polls legitimately re-read a
+    window that is already stored and must write nothing.
+
+    `ON CONFLICT(ts) DO NOTHING` rather than `INSERT OR IGNORE`, for the reason
+    written out at length on `insert_outdoor_reading`: `OR IGNORE` swallows
+    every constraint violation, so a null `ts` would come back as rowcount 0
+    and this function would report it as a duplicate -- the one status that
+    means nothing is wrong. Naming the conflict target keeps the dedup and lets
+    a NOT NULL violation raise, where `minisplit.poll_once` reports it as an
+    error. A row that *cannot* be keyed never reaches here at all; see
+    `minisplit.parse_reading`.
+    """
+    placeholders = ", ".join(f":{col}" for col in MINISPLIT_COLUMNS)
+    try:
+        cursor = conn.execute(
+            f"INSERT INTO minisplit_readings ({', '.join(MINISPLIT_COLUMNS)})"
+            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            reading,
+        )
+    except sqlite3.Error:
+        # Three writers now share one AWAIR_DB, so an unresolved implicit
+        # transaction here holds the write lock against both pollers, not just
+        # against the next mini split poll. Same reasoning as the two siblings
+        # above, one degree worse.
+        conn.rollback()
+        raise
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def minisplit_readings_since(conn, columns, since) -> list:
+    """[(epoch_seconds, col1, col2, ...)] ascending for mini split columns.
+
+    `since` is compared against `ts`, the report window's close, so a window
+    that OPENED before `since` and closed inside it is included and a window
+    still open is not here yet. That is the same rule `outdoor_readings_since`
+    applies to a publish time and it is the honest one for a metered quantity:
+    the energy is only known once the device closes the window.
+    """
+    unknown = set(columns) - set(MINISPLIT_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown mini split columns {unknown}")
+    rows = conn.execute(
+        f"SELECT ts, {', '.join(columns)} FROM minisplit_readings"
         f" WHERE ts >= ? ORDER BY ts",
         (since.isoformat(),),
     )
