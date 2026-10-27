@@ -7,7 +7,10 @@ cd "$(dirname "$0")"
 export PATH="$HOME/.local/bin:$PATH"
 
 uv sync --frozen
-for unit in awairelement awairelement-web awairelement-outdoor; do
+# Derived from systemd/, not listed: a unit added to the repo and installed on
+# the box but missing from a hand-kept list here is a process that never picks
+# up a deploy -- it keeps running the code it started with, silently, for ever.
+for unit in $(cd systemd && printf '%s\n' *.service | sed 's/\.service$//'); do
   if systemctl --user cat "$unit" >/dev/null 2>&1; then
     systemctl --user restart "$unit"
     echo "$unit: $(systemctl --user is-active "$unit")"

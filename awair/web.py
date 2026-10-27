@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, outdoor, solar, spikes, units, weather_alerts
+from awair import db, minisplit, outdoor, solar, spikes, units, weather_alerts
 from awair.series import bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -334,6 +334,114 @@ def _outdoor_temp_on_grid(outdoor_rows, grid, unit):
     return carry_forward(points, grid, _outdoor_carry_max_age_seconds())
 
 
+# How many of the head's own report windows a mini split observation stays on
+# the temperature chart after the one that should have replaced it never
+# arrived (#139).
+#
+# Two, for the same reason `_OUTDOOR_CARRY_INTERVALS` is two: at one, a single
+# missed report punches a hole in the trace, and this source misses for
+# ordinary reasons -- the bridge restarting, a SmartThings 429 -- that are not
+# an outage. The bound itself is what matters, and it is the same argument #109
+# makes: held indefinitely, a dead bridge renders as a flat draw and a frozen
+# room temperature beside a moving indoor line, which is a wrong answer rather
+# than a missing one.
+_MINISPLIT_CARRY_INTERVALS = 2
+
+# The mini split columns `_minisplit_on_grid` reads, in the order it unpacks
+# them. `ts` is not here: `db.minisplit_readings_since` always returns it first,
+# as epoch seconds -- and `ts` is the bridge CYCLE's clock, which is why the
+# window's own bounds have to be read as columns. The draw is measured over the
+# window; the row is drawn at the cycle that reported it.
+_MINISPLIT_SERIES_COLUMNS = ("temp", "delta_wh", "window_start", "window_close")
+
+
+def _minisplit_carry_max_age_seconds():
+    """How long one mini split observation may be held onto the chart grid (#139).
+
+    A function rather than a module constant for the reason #109's review gave
+    for its sibling: bound at import, `2 * 800` and a literal `1600` are
+    indistinguishable to every test that can be written, and the claim being
+    made is that this window tracks the source's report cadence rather than
+    restating a number. Read per call, a test can move
+    `minisplit.MAX_REPORT_WINDOW_SECONDS` and watch the bound follow.
+
+    That constant is the longest window *measured* (800 s), not a published
+    cadence -- the device reports when it likes. So this bound is empirical on
+    both sides, and if the head starts reporting on a slower schedule the trace
+    will break where it used to hold. That is the honest failure: a break says
+    "no fresh report", which is exactly what would be true.
+    """
+    return _MINISPLIT_CARRY_INTERVALS * minisplit.MAX_REPORT_WINDOW_SECONDS
+
+
+def _minisplit_on_grid(rows, grid, unit):
+    """The mini split's room temperature and metered draw, on the indoor x-grid.
+
+    `rows` is `db.minisplit_readings_since(conn, _MINISPLIT_SERIES_COLUMNS, ...)`
+    and `grid` is `metrics["temp"]["t"]`, the stamps the indoor temperature
+    chart is already drawn against. Returns `(temperature, watts)`, two flat
+    lists each exactly as long as `grid` -- the same shape, and for the same
+    uPlot reason, as `_outdoor_temp_on_grid`.
+
+    **The draw published here is the metered mean over each report window, not
+    the head's spot reading.** The spot value read 30.0 W across three
+    consecutive windows whose metered energy implied 45, 54 and 65 W, so a
+    chart of it is a flat line that happens to be drawn from live data. See
+    `minisplit.metered_watts`, which owns the refusal to derive one from the
+    other.
+
+    Both series are drawn at the row's `ts`, which is the bridge cycle that
+    reported the reading. For the temperature that is its observation time. For
+    the draw it is up to one cycle later than the window it measures, and
+    consecutive cycles re-reporting one window repeat its mean -- a hold, which
+    is what `carry_forward` would do with the gap anyway.
+
+    The two carry separately but share one bound and one set of rows: a row
+    with a temperature and no datable window holds its temperature and
+    contributes no draw, which is **every** row until parsons-pulse #182
+    deploys.
+
+    A stored stamp that will not parse costs that row's draw and nothing else.
+    Letting it raise was the first shape of this function, and the blast radius
+    was wrong: `/api/series` has no handler, so one bad `window_start` would
+    blank every card on the page -- including the indoor readings, which have
+    nothing to do with this feed. Three processes share this file and the
+    column carries no CHECK, so "we wrote it, therefore it parses" is a
+    guarantee this function is not the right place to bet the dashboard on.
+    """
+    temps = []
+    watts = []
+    max_age = _minisplit_carry_max_age_seconds()
+    for epoch, temp, delta_wh, window_start, window_close in rows:
+        if unit != "C":
+            temp = units.from_celsius(temp, unit)
+        temps.append((epoch, temp))
+        watts.append((epoch, _metered_watts_of(delta_wh, window_start, window_close)))
+    return (
+        carry_forward(temps, grid, max_age),
+        carry_forward(watts, grid, max_age),
+    )
+
+
+def _metered_watts_of(delta_wh, window_start, window_close):
+    """`minisplit.metered_watts` over two stored ISO stamps, or None.
+
+    `TypeError` covers the naive/aware mix a hand-edited stamp could produce
+    (`datetime - datetime` raises rather than returning something wrong), and
+    `ValueError` covers an unparseable one. Both answer None, which is the same
+    answer an undatable window gets from the parser -- a missing draw, not a
+    broken page.
+    """
+    try:
+        return minisplit.metered_watts(
+            delta_wh,
+            None if window_start is None else datetime.fromisoformat(window_start),
+            None if window_close is None else datetime.fromisoformat(window_close),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _bootstrap_schema(db_path, logger) -> None:
     """Run the schema bootstrap once, at app construction rather than per request.
 
@@ -414,6 +522,14 @@ def create_app(db_path=None):
                 ("temp",),
                 since - timedelta(seconds=_outdoor_carry_max_age_seconds()),
             )
+            # One carry window before `since` as well, and for the identical
+            # reason -- the report that was current at the left edge closed
+            # before it.
+            minisplit_rows = db.minisplit_readings_since(
+                conn,
+                _MINISPLIT_SERIES_COLUMNS,
+                since - timedelta(seconds=_minisplit_carry_max_age_seconds()),
+            )
         finally:
             conn.close()
         unit = temp_unit()
@@ -427,6 +543,9 @@ def create_app(db_path=None):
                         units.from_celsius(v, unit) for v in series_data[key]
                     ]
             metrics[name] = series_data
+        minisplit_temp, minisplit_watts = _minisplit_on_grid(
+            minisplit_rows, metrics["temp"]["t"], unit
+        )
         return jsonify(
             {
                 "bucket_seconds": bucket_seconds,
@@ -446,6 +565,18 @@ def create_app(db_path=None):
                 "outdoor_temp": _outdoor_temp_on_grid(
                     outdoor_rows, metrics["temp"]["t"], unit
                 ),
+                # #139, and flat lists on `metrics["temp"]["t"]` for the same
+                # reason `outdoor_temp` is one. Two keys rather than a nested
+                # block because they are two quantities: `minisplit_temp` is a
+                # temperature in `temp_unit_symbol` and shares the temp card's
+                # axis, while `minisplit_watts` is a draw in watts and cannot.
+                # `minisplit_watts_unit` is named here rather than implied
+                # because every other unit this app publishes is (see
+                # `/api/outdoor-latest`), and an unlabelled number a consumer
+                # has to guess at is how a silent multiply gets in.
+                "minisplit_temp": minisplit_temp,
+                "minisplit_watts": minisplit_watts,
+                "minisplit_watts_unit": "W",
                 "temp_unit_symbol": units.symbol(unit),
             }
         )

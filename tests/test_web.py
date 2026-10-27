@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from awair import db, outdoor, web
+from awair import db, minisplit, outdoor, web
 from awair.web import METRIC_NAMES, create_app
 from tests._helpers import strip_js_comments
 
@@ -1943,3 +1943,176 @@ def test_every_outdoor_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
         f"dashboard.js reads {sorted(read - shipped)} off the "
         "/api/outdoor-series payload and the endpoint does not ship it"
     )
+
+
+# -- the mini split traces (#139) ---------------------------------------------
+# Same alignment problem as the outdoor trace above and the same answer: the
+# indoor grid is decided in `/api/series`, so that is where the mini split's
+# readings are put onto it. Two keys rather than one block because the two
+# quantities differ — one is a temperature that shares the temp card's axis,
+# the other a draw in watts that cannot.
+
+
+def _seed_minisplit(db_path, samples):
+    """samples: [(cycle_at, start_or_None, delta_wh, celsius, spot_watts)].
+
+    `cycle_at` is the row's key — the bridge cycle that read the head. The
+    window it reports closed earlier, which is why both stamps are stored.
+    """
+    conn = db.connect(db_path)
+    for cycle_at, start, delta_wh, celsius, spot in samples:
+        db.insert_minisplit_reading(
+            conn,
+            {
+                "ts": cycle_at.isoformat(),
+                "received_at": cycle_at.isoformat(),
+                "window_start": None if start is None else start.isoformat(),
+                "window_close": cycle_at.isoformat(),
+                "delta_wh": delta_wh,
+                "watts_spot": spot,
+                "temp": celsius,
+                "mode": "cool",
+                "switch": "on",
+            },
+        )
+    conn.close()
+
+
+def _one_window(now, *, minutes_ago=10, length=800, delta_wh=10.0, celsius=15.0):
+    """One cycle whose report window closed at the cycle and ran `length` long."""
+    cycle_at = now - timedelta(minutes=minutes_ago)
+    return [(cycle_at, cycle_at - timedelta(seconds=length), delta_wh, celsius, 30.0)]
+
+
+def test_series_ships_both_mini_split_traces_on_the_indoor_temp_grid(client, tmp_path):
+    """uPlot raises unless every series matches its x array's length."""
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now))
+    payload = client.get("/api/series?range=7d").get_json()
+    grid = payload["metrics"]["temp"]["t"]
+    assert grid, "fixture has no indoor temp grid to align against"
+    assert len(payload["minisplit_temp"]) == len(grid)
+    assert len(payload["minisplit_watts"]) == len(grid)
+    assert payload["minisplit_watts_unit"] == "W"
+
+
+def test_the_draw_on_the_chart_is_the_metered_mean_not_the_spot_reading(
+    client, tmp_path
+):
+    """The whole reason this feed stores a window rather than a number.
+
+    10 Wh over 800 s is 45 W, and the head claimed 30.0 W for that same window
+    — it claimed 30.0 W for two others that metered 54 and 65 W as well, so a
+    chart of its spot reading is a flat line drawn from live data.
+    """
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now, length=800, delta_wh=10.0))
+    payload = client.get("/api/series?range=7d").get_json()
+    assert 45.0 in payload["minisplit_watts"]
+    assert 30.0 not in payload["minisplit_watts"], (
+        "the head's spot reading reached the chart — it does not move"
+    )
+
+
+def test_the_head_temperature_is_converted_for_display_like_every_other(
+    make_client, tmp_path
+):
+    """Stored Celsius, published in `TEMPERATURE_UNIT` — 15 C is the 59 F read
+    off the dining head on 2026-10-26."""
+    now = datetime.now(UTC)
+    # `make_client` keeps a per-unit database, and it is read per request, so
+    # the seed lands after the client exists.
+    fahrenheit = make_client("F")
+    _seed_minisplit(tmp_path / "web-F.db", _one_window(now, celsius=15.0))
+    payload = fahrenheit.get("/api/series?range=7d").get_json()
+    assert 59.0 in payload["minisplit_temp"]
+    assert 15.0 not in payload["minisplit_temp"]
+
+
+def test_a_window_with_no_energy_still_contributes_its_temperature(client, tmp_path):
+    """The half of #139 that works on the bridge deployed today.
+
+    A head that reported a datable window and no `deltaEnergy` has a room
+    temperature worth drawing and no draw to draw, and the two series must
+    disagree about that rather than one of them inventing a zero.
+    """
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now, delta_wh=None))
+    payload = client.get("/api/series?range=7d").get_json()
+    assert 15.0 in payload["minisplit_temp"]
+    assert set(payload["minisplit_watts"]) == {None}
+
+
+def test_the_mini_split_carry_window_is_two_report_windows_wide(client, tmp_path):
+    """The bound's *value*, at its own boundary — the #109-review lesson.
+
+    An end-to-end staleness test seeded two days back passes under any bound
+    shorter than 48 hours, so it cannot tell this window from a 24-hour hold.
+    Straddling the boundary exactly is what can.
+    """
+    window = web._MINISPLIT_CARRY_INTERVALS * minisplit.MAX_REPORT_WINDOW_SECONDS
+    temps, watts = web._minisplit_on_grid(
+        [(0, 4.0, 10.0, None, None)], [window, window + 1], "C"
+    )
+    assert temps == [4.0, None], (
+        f"an observation exactly {web._MINISPLIT_CARRY_INTERVALS} report "
+        "windows old is dropped, or one a second past the bound is still held"
+    )
+    assert watts == [None, None], (
+        "a window with no start has no measurable length and must not be given one"
+    )
+
+
+def test_the_mini_split_carry_window_follows_the_measured_report_window(
+    monkeypatch,
+):
+    """`2 * 800` and a literal `1600` are the same number today.
+
+    What is being claimed is that the bound tracks the longest report window
+    actually measured on the head, so the test moves that constant and watches
+    the bound follow. Bound at import, nothing could tell the two apart.
+    """
+    monkeypatch.setattr(minisplit, "MAX_REPORT_WINDOW_SECONDS", 60)
+    assert web._minisplit_carry_max_age_seconds() == 120
+    monkeypatch.setattr(minisplit, "MAX_REPORT_WINDOW_SECONDS", 1000)
+    assert web._minisplit_carry_max_age_seconds() == 2000
+
+
+def test_a_stale_mini_split_reading_breaks_the_trace_rather_than_flattening_it(
+    client, tmp_path
+):
+    """A dead bridge must render as a gap, not as a frozen room and a flat draw."""
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now, minutes_ago=2 * 24 * 60))
+    payload = client.get("/api/series?range=7d").get_json()
+    assert set(payload["minisplit_temp"]) == {None}
+    assert set(payload["minisplit_watts"]) == {None}
+
+
+def test_no_mini_split_rows_still_ships_two_full_length_runs_of_null(client):
+    """The state every box is in until parsons-pulse #182 merges and deploys."""
+    payload = client.get("/api/series?range=7d").get_json()
+    grid = payload["metrics"]["temp"]["t"]
+    assert payload["minisplit_temp"] == [None] * len(grid)
+    assert payload["minisplit_watts"] == [None] * len(grid)
+
+
+def test_an_unparseable_stored_window_costs_that_rows_draw_and_not_the_page(
+    client, tmp_path
+):
+    """`/api/series` has no handler, so a raise here blanks every card.
+
+    Three processes share this database and the column carries no CHECK, so the
+    temperature trace — and the six indoor ones, which have nothing to do with
+    this feed — must survive one bad stamp.
+    """
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now))
+    conn = db.connect(tmp_path / "web.db")
+    conn.execute("UPDATE minisplit_readings SET window_start = 'not a timestamp'")
+    conn.commit()
+    conn.close()
+    payload = client.get("/api/series?range=7d").get_json()
+    assert set(payload["minisplit_watts"]) == {None}
+    assert 15.0 in payload["minisplit_temp"]
+    assert payload["metrics"]["co2"]["avg"], "the unrelated indoor cards went blank"
