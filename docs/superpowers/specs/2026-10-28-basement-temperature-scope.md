@@ -4,68 +4,74 @@
 place we really do not have any visibility into", and asked to track it "as an
 addition to the temperature graph on the awair". This is a scope document and
 a simple plan, not a design. Temperatures are stored in °C like every other
-temperature in this database; timestamps are UTC.*
+temperature in this database; timestamps are UTC. An independent agent
+reviewed it against the code and the box; its findings are folded in.*
 
 ## Facts this rests on
 
 | Fact | Source |
 |---|---|
-| The sensor is an Apollo ESPHome Starter Kit: an ESP32-C6 with an AHT-family temperature/humidity module at I²C `0x38`. It's at **`192.168.68.50`**, reserved in the Deco by MAC, so the address survives a rename. Hostname `bedroom-temperature` today; Tom will rename it. | set up 2026-10-27 |
-| `GET http://192.168.68.50/sensor/Temperature` → `{"id":"sensor/Temperature","value":15.1268,"state":"15.13 °C"}`. **Celsius. No timestamp.** It's the last *published* value. `/sensor/Humidity` has the same shape. | measured 2026-10-28 |
-| The module publishes every 60 s (ESPHome's default `update_interval`). Wi-Fi power-save makes a ping take 170–340 ms, which doesn't matter to an HTTP read. | measured 2026-10-27 |
-| Against the Awair overnight (2026-10-28, 215 paired readings), it read 0.62 °F high on average (sd 0.31), with correlation 0.98. | parsons-pulse scope, 2026-10-28 |
-| This repo already records an auxiliary temperature from another source: `awair/minisplit.py` polls the climate bridge, stores Celsius rows in `minisplit_readings`, and `/api/series` puts `minisplit_temp` on the temperature grid. **The dashboard doesn't draw it yet.** It draws one overlay, `outdoor_temp`, on the combined temperature card (#109), dispatched on `data-overlay` and carried onto the grid by `web._outdoor_temp_on_grid`. | `awair/minisplit.py`, `awair/web.py`, `static/dashboard.js` |
-| Pollers run as their own systemd units (`systemd/awairelement-*.service`). `restart.sh` derives its unit list from `systemd/`. Installing a unit takes a homelab Ansible change too. | `restart.sh`, homelab `native-apps` |
+| The sensor is an Apollo ESPHome Starter Kit: an ESP32-C6 with an AHT-family temperature/humidity module at I²C `0x38`. It's at **`192.168.68.50`**, reserved in the Deco by MAC. The device is being renamed `esphome-temperature`; the address doesn't change. | set up 2026-10-27 |
+| `GET http://192.168.68.50/sensor/Temperature` → `{"id":"sensor/Temperature","value":15.1268,"state":"15.13 °C"}`. **Celsius. No timestamp.** It's the last *published* value. The path is keyed on the **entity** name (`Temperature`), not the device, so renaming the device is safe and renaming the entity is a 404. | measured 2026-10-28 |
+| The module publishes every 60 s (ESPHome's default `update_interval`). | ESPHome default |
+| **The pattern this would copy has never been deployed.** `awair/minisplit.py` (#140) is on `main`, but the box is at `6fc847d`, before #140. There's no `awairelement-minisplit` unit on the box, no `minisplit_readings` table there, and no homelab template for it. | box, 2026-10-28 |
+| The dashboard draws one overlay, `outdoor_temp`, on the temperature card (#109). That's single-valued throughout: `METRIC_OVERLAYS = {"temp": "outdoor-temp"}`, `card.dataset.overlay === "outdoor-temp"` (`dashboard.js`), and `makePlot(…, outdoorTemp, …)`. The legend reservation `.card[data-overlay] .u-legend { --legend-rows: 3 }` matches *any* card with the attribute, precipitation's `pressure` overlay included. `/api/series` already serves `minisplit_temp`, but nothing draws it. | `web.py`, `dashboard.js`, `dashboard.html` |
+| awair units in homelab deliberately have **no `OnFailure=`**: it would page on graceful stops (`awairelement.service.j2`). A new awair unit needs a `.j2` template, a task in `native-apps/tasks/main.yml`, a handler, its env key in `awair.env.j2`, `SuccessExitStatus=143`, and `uv run --frozen`. The repo's own `systemd/` copies differ from homelab's (`.venv/bin/python`). | homelab `native-apps` |
 
 ## Goals
 
-1. **Record the basement temperature**, and humidity since it's the same read,
-   every 60 s, in its own table.
-2. **Draw it on the combined temperature card** as a second overlay line,
-   "Basement", beside outdoor. It uses the same server-side carry onto the
-   grid and the same rule: the browser resamples nothing.
+1. **Record the basement temperature** in its own table, one row per published
+   minute.
+2. **Draw it on the temperature card** as a second overlay line, "Basement",
+   beside outdoor. The server aligns it to the grid; the browser resamples
+   nothing.
 
 ## Non-goals
 
-- **Alerts.** A basement freeze or damp alert ("below 40 °F, tell me") is the
-  obvious next thing, and it's why visibility matters, but it's a separate
-  decision about thresholds. Recording comes first.
-- **Drawing the dining head's `minisplit_temp`.** It would be nearly free once
-  the second-overlay machinery exists, but Tom didn't ask for it.
-- **A parsons-pulse hub card.**
-- **Home Assistant, Matter, Thread.** Plain HTTP on the LAN, like everything
-  else here.
+- **Humidity.** It's a second GET with its own failures and clock, and nobody
+  asked to see it.
+- **Alerts.** A basement freeze/damp alert is the obvious next step, and it's
+  why visibility matters, but it's a separate decision about thresholds.
+- **Drawing the dining head's `minisplit_temp`.** It becomes cheap once
+  overlays are a list. Not asked for.
+- **Correcting the sensor.** The 0.62 °F gap against the Awair was measured in
+  a different room, and no sensor in the house is "true". The line shows what
+  the sensor reads.
+- **A parsons-pulse hub card; Home Assistant / Matter.**
 
 ## Decisions the design must make
 
-| Question | Why it matters | Lean |
-|---|---|---|
-| **Which clock keys a row?** | The payload has no timestamp. `minisplit.py` refuses to key on its own poll clock because the bridge publishes a better one. Here there is no better one. | The poll clock, said out loud. It's a direct read of a sensor that republishes every 60 s, so "when we asked" is within a minute of "when it was measured". |
-| **What counts as no reading?** | ESPHome serves the last published value. A failed read, `NaN` (`"state":"NA"`) or a non-finite number must store **nothing**, not a repeat. A stalled component that keeps serving a finite stale value can't be detected from this payload. | No row for failure or non-finite values. Name the stalled-value gap. The fix, if it ever matters, is an `uptime` sensor on the device. |
-| **Units** | Every temperature column here is Celsius, converted once at ingest. | The sensor is already °C; store as is, and validate the unit from `state`'s suffix. |
-| **Address** | Hostname resolution happens outside the socket timeout (the same reasoning as parsons-pulse's `AIR_URL`). | IP literal, `AWAIR_BASEMENT_URL=http://192.168.68.50/sensor/Temperature`. Renaming the device then changes nothing here. |
-| **Poll rate** | Faster than 60 s re-reads the same value. | 60 s. |
-| **Carry onto the chart grid** | The outdoor overlay holds a reading for 2 source intervals (`_OUTDOOR_CARRY_INTERVALS`). | The same rule, derived from the basement interval: hold for 2 × 60 s. A gap in the line means the sensor was gone, which is the honest picture. |
-| **Separate unit or fold into an existing poller?** | A hung basement read must not stall the Awair or outdoor pollers. | Its own unit, `awairelement-basement.service`, the same shape as `-minisplit`. |
-| **Legend and colour** | The temperature card reserves one extra legend row today (#109). | A second reserved row, keyed off the same `data-overlay` marker, now a list. |
+| Question | Lean |
+|---|---|
+| **Deploy minisplit first, alongside, or not at all?** It's merged code that isn't running, and it's the template this copies. | Its homelab unit PR goes first. It's a known-good shape to copy, and it ends the gap where `main` and the box disagree. Tom to confirm. |
+| **Row key.** There's no timestamp in the payload, and a raw poll clock is unique every time, so dedup could never fire. Polling every 60 s plus fetch time also drifts against a 60 s publish. | Key on the poll clock **truncated to the minute** (`+00:00` isoformat, like the other tables) with `INSERT OR IGNORE`. One row per publish-minute; a second poll in the same minute writes nothing. |
+| **What counts as no reading.** ESPHome's representation of an unavailable sensor is unconfirmed (probably `"state":"NA"` with `value` null or missing). | Null, missing or non-finite `value` → no row, checked **before** the `°C` unit check so `"NA"` isn't mistaken for a unit error. **Confirm by unplugging the module.** A stalled component serving a finite stale value can't be detected from this payload, so the scope promises gaps on fetch failure only. |
+| **Address.** | IP literal: `AWAIR_BASEMENT_URL=http://192.168.68.50/sensor/Temperature`. |
+| **Separate unit.** | `awairelement-basement.service`, so a hung read can't stall the Awair or outdoor pollers. |
+| **Alignment to the chart grid.** Carry-forward samples one point per grid stamp, so on 7 d and 30 d the line would be single readings, not bucket averages like the indoor line. And the grid only spans the indoor data's range, so an Awair outage hides the basement line too. | **Bucket the basement rows on the same `bucket_seconds` (average) before aligning,** then carry for 2 intervals. State the grid-span behaviour in the code rather than fix it. Read one carry window before `since`, as `/api/series` does for its other feeds. |
+| **Overlays become a list.** | `data-overlay` space-separated, matched with `split(" ").includes(...)`; overlays passed to `makePlot` as a map; `[data-overlay~="basement-temp"] { --legend-rows: 4 }`. Also: the header suffix (`· out X` gains `· bsmt Y`), a colour token in both light and dark blocks, the footer text, and GLOSSARY's "overlay" entry ("Two exist"). |
 
 ## Plan
 
 Each step is its own PR, tests first.
 
+0. **Deploy minisplit** (if confirmed): a homelab PR for the
+   `awairelement-minisplit` unit, then deploy awairelement, then confirm
+   `minisplit_readings` is filling up.
 1. **This scope.** Docs only.
-2. **Record:** `basement_readings` (ts, temp °C, humidity), `awair/basement.py`
+2. **Record:** the `basement_readings` table, `awair/basement.py`
    (`python -m awair.basement`), `systemd/awairelement-basement.service`, and
-   tests for parsing, refusals and dedup. Paired **homelab PR** installing the
-   unit (template, env, enable-and-start, the drift manifest and the OnFailure
-   pairing). Deploy, then confirm rows are arriving.
-3. **Draw:** `basement_temp` on `/api/series` (carried onto the grid in Python,
-   with tests), and the second overlay on the temperature card. Checked in a
-   browser at the desktop and phone widths in `docs/screenshots/`.
+   tests for parsing, the no-reading refusals (null, missing, NaN, `"NA"`) and
+   the per-minute key. Paired homelab PR with the unit pieces listed above.
+   Deploy, confirm rows arrive, then unplug the module once to see the real
+   unavailable payload.
+3. **Draw:** `basement_temp` on `/api/series` (bucketed and carried in Python,
+   tested), overlays as a list, and the second line on the temperature card.
+   Checked in a browser at the desktop and phone widths in `docs/screenshots/`.
 
 ## Done means
 
-- `basement_readings` gains a row about once a minute. A sensor unplugged for
-  five minutes leaves a five-minute gap, not repeated values.
-- The temperature card shows a "Basement" line beside outdoor over today, 7 and
-  30 days, and the screenshots are committed.
+- `basement_readings` gains about one row a minute, and unplugging the sensor
+  for five minutes leaves a five-minute gap.
+- The temperature card shows "Basement" beside outdoor on today, 7 and 30
+  days, and outdoor still draws. Screenshots committed.
