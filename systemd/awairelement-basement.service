@@ -1,0 +1,20 @@
+# Dev reference copy — canonical unit is templated by the native-apps Ansible
+# role in the homelab repo (awairelement-basement.service.j2). Its own unit so a
+# hung sensor read can't stall the Awair or outdoor pollers, and vice versa.
+#
+# Manual install (non-Ansible boxes):
+#   ln -sf ~/sources/awairelement/systemd/awairelement-basement.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now awairelement-basement
+[Unit]
+Description=Awair Element basement (ESPHome) temperature poller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/sources/awairelement
+ExecStart=%h/sources/awairelement/.venv/bin/python -m awair.basement
+EnvironmentFile=-%h/.config/awairelement/environment
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
