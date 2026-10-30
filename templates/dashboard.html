@@ -134,13 +134,20 @@ main {
    three-digit indoor value beside a negative outdoor one needs it at every
    width. `~=` matches one word of the space-separated `data-overlay`. */
 .card[data-overlay~="basement-temp"] .u-legend { --legend-rows: 4; }
-/* The mini split's room temperature is a seventh entry (#139), and the fifth
-   row is measured with the legend populated at 390px: six entries filled four
-   rows to within one entry's width, so the seventh starts a row of its own at
-   every width the card is laid out at. Its own `~=` rule rather than a wider
-   one, for the reason the basement's is its own: the reservation is per-card
-   and the honest number for a card carrying one overlay is still three. */
-.card[data-overlay~="minisplit-temp"] .u-legend { --legend-rows: 5; }
+/* The mini split's room temperature is a seventh entry (#139) and needs the
+   same four rows, not a fifth -- measured against a real database with the
+   legend populated, at 1440/768/430/390/360: natural height 72px against the
+   74.8px four rows reserve, so a fifth row would be ~19px of permanent blank
+   space on this card at every width. Its own rule rather than leaning on the
+   basement's, which is keyed to a different overlay and would take the fourth
+   row away with it if the basement line were ever dropped.
+
+   Below ~330px of card (a 320px viewport) seven entries want six rows and
+   `overflow: hidden` clips them. That is where the paragraph above says the
+   line holds, and it is not new: origin/main's six entries already wanted
+   five rows there. Measured, not assumed -- a baseline checkout was served
+   the same database to check. */
+.card[data-overlay~="minisplit-temp"] .u-legend { --legend-rows: 4; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
