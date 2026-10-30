@@ -19,8 +19,8 @@ METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 # "cleared" (#25). Metrics without an entry in spikes.METRICS get no line.
 CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 
-# Indoor metric cards that carry a second, overlaid series (#109), and the name
-# of the overlay. Rendered onto the card as `data-overlay`, which is the one
+# Indoor metric cards that carry overlaid series (#109), and the names of the
+# overlays. Rendered onto the card as a space-separated `data-overlay`, which is the one
 # marker the CSS legend reservation and `dashboard.js` both read -- so a card
 # cannot end up drawing a fifth legend entry it has not reserved room for.
 #
@@ -28,8 +28,9 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # which is sound exactly when both series are the same quantity in the same
 # unit. Outdoor humidity onto `humid` would be the other honest candidate; an
 # outdoor temperature onto `co2` would not, and this constant is not the place
-# that would stop it -- see `_outdoor_temp_on_grid`.
-METRIC_OVERLAYS = {"temp": "outdoor-temp"}
+# that would stop it -- see `_outdoor_temp_on_grid`. The basement sensor is the
+# second temperature on the same card, in the same unit, for the same reason.
+METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp")}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.
@@ -423,6 +424,50 @@ def _minisplit_on_grid(rows, grid, unit):
     )
 
 
+# How many indoor buckets one basement average stays on the temperature chart
+# after the bucket that should have replaced it came up empty. Two, for the
+# reason `_OUTDOOR_CARRY_INTERVALS` is two: one missed poll is bridged, a
+# longer silence is a break.
+_BASEMENT_CARRY_BUCKETS = 2
+
+
+def _basement_carry_max_age_seconds(bucket_seconds):
+    """How long one basement bucket may be held onto the chart grid.
+
+    Measured in the chart's own buckets rather than the sensor's 60 s publish,
+    because the basement rows are bucketed onto that grid before they are
+    carried: on 30 d one stamp is fifteen minutes of readings, and a bound of
+    two *minutes* would null every stamp that is not an exact bucket start.
+    """
+    return _BASEMENT_CARRY_BUCKETS * bucket_seconds
+
+
+def _basement_temp_on_grid(rows, grid, bucket_seconds, unit):
+    """The basement temperature trace, in display units, on the indoor x-grid.
+
+    `rows` is `db.basement_readings_since(...)`, `[(epoch_seconds, celsius)]`,
+    and `grid` is `metrics["temp"]["t"]`. **Averaged into `bucket_seconds`
+    first**, the same buckets the indoor line is drawn from, so on 7 d and
+    30 d each stamp is the mean of its bucket rather than whichever single
+    minute happened to land at its start. Then held by `carry_forward`, whose
+    stamps line up exactly because `bucket` snaps both series to the same
+    boundaries.
+
+    The grid only spans the indoor temperature's own data range, so an Awair
+    outage hides the basement line over the same stretch. That is a property
+    of drawing onto the indoor card, stated here rather than fixed.
+    """
+    points = list(rows)
+    if unit != "C":
+        points = [(t, units.from_celsius(value, unit)) for t, value in points]
+    bucketed = bucket(points, bucket_seconds)
+    return carry_forward(
+        zip(bucketed["t"], bucketed["avg"], strict=True),
+        grid,
+        _basement_carry_max_age_seconds(bucket_seconds),
+    )
+
+
 def _metered_watts_of(delta_wh, window_start, window_close):
     """`minisplit.metered_watts` over two stored ISO stamps, or None.
 
@@ -530,6 +575,12 @@ def create_app(db_path=None):
                 _MINISPLIT_SERIES_COLUMNS,
                 since - timedelta(seconds=_minisplit_carry_max_age_seconds()),
             )
+            # And again for the basement sensor, whose window is in buckets.
+            basement_rows = db.basement_readings_since(
+                conn,
+                since
+                - timedelta(seconds=_basement_carry_max_age_seconds(bucket_seconds)),
+            )
         finally:
             conn.close()
         unit = temp_unit()
@@ -577,6 +628,12 @@ def create_app(db_path=None):
                 "minisplit_temp": minisplit_temp,
                 "minisplit_watts": minisplit_watts,
                 "minisplit_watts_unit": "W",
+                # The basement ESPHome sensor, a flat list on the same grid
+                # for the same reason as `outdoor_temp`, and on the temp
+                # card's axis because it is a temperature in the same unit.
+                "basement_temp": _basement_temp_on_grid(
+                    basement_rows, metrics["temp"]["t"], bucket_seconds, unit
+                ),
                 "temp_unit_symbol": units.symbol(unit),
             }
         )

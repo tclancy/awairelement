@@ -183,8 +183,8 @@ def test_the_temp_card_is_the_only_card_marked_to_carry_an_overlay(client):
     that names what to draw.
     """
     html = client.get("/").get_data(as_text=True)
-    marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w-]+)"', html)
-    assert marked == [("temp", "outdoor-temp")]
+    marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w -]+)"', html)
+    assert marked == [("temp", "outdoor-temp basement-temp")]
     # The precipitation card carries #42's pressure overlay and must keep the
     # same marker — the reservation rule has no other way to reach it.
     assert 'data-outdoor="precipitation" data-overlay="pressure"' in html
@@ -197,9 +197,10 @@ def test_no_metric_card_is_marked_for_an_overlay_the_page_cannot_draw(client):
     overlay nothing draws costs a card a permanent band of blank space — and
     that is the silent half, because the chart itself still looks right.
     """
-    drawable = set(re.findall(r'dataset\.overlay === "([\w-]+)"', DASHBOARD_JS))
-    assert drawable, "dashboard.js no longer dispatches on dataset.overlay"
-    assert set(web.METRIC_OVERLAYS.values()) <= drawable
+    drawable = set(re.findall(r'key:\s*"([\w-]+)"', DASHBOARD_JS))
+    assert drawable, "dashboard.js no longer lists TEMP_OVERLAYS keys"
+    marked = {key for keys in web.METRIC_OVERLAYS.values() for key in keys}
+    assert marked <= drawable
 
 
 def test_dashboard_page_offers_all_three_range_buttons(client):
@@ -1905,9 +1906,11 @@ def test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
     without an edit here.
     """
     read = set(re.findall(r"seriesPayload\.(\w+)", DASHBOARD_JS))
-    assert "outdoor_temp" in read, (
-        "dashboard.js no longer reads `seriesPayload.outdoor_temp` — if the "
-        "overlay moved, this guard has to move with it"
+    # The overlay traces are read by name through `TEMP_OVERLAYS[].payload`.
+    read |= set(re.findall(r'payload:\s*"(\w+)"', DASHBOARD_JS))
+    assert {"outdoor_temp", "basement_temp"} <= read, (
+        "dashboard.js no longer reads the overlay traces by name — if the "
+        "overlays moved, this guard has to move with them"
     )
     shipped = set(client.get("/api/series?range=7d").get_json())
     assert read <= shipped, (

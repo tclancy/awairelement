@@ -141,10 +141,28 @@ def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
         "selector goes stale the moment another card grows an overlay"
     )
     assert re.search(r"--legend-rows:\s*3\s*;", body)
+    # The basement overlay is a sixth entry and needs a fourth row once the
+    # legend is populated (measured at 375px, and at every width worst-case).
+    both = _rule_body(html, '.card[data-overlay~="basement-temp"] .u-legend')
+    assert both is not None and re.search(r"--legend-rows:\s*4\s*;", both)
     assert not re.search(r'\.card\[data-outdoor="[a-z]+"\]\s*\.u-legend', html), (
         "a legend reservation is still keyed to one named card; key it on "
         "`[data-overlay]` so every overlay card is covered"
     )
+
+
+def _overlay_push_block(js_code):
+    """The one `seriesConfig.push` every temperature overlay goes through."""
+    match = re.search(
+        r"for \(const overlay of overlays\) \{\s*seriesConfig\.push\(\{.*?\}\);",
+        js_code,
+        re.S,
+    )
+    assert match, (
+        "no `for (const overlay of overlays)` loop pushing the temperature "
+        "overlays — if the overlays moved, these guards have to move with them"
+    )
+    return match.group(0)
 
 
 def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
@@ -162,18 +180,9 @@ def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
     are different quantities. Copying that line onto a second temperature is
     the likeliest way this regresses.
     """
-    match = re.search(
-        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
-        js_code,
-        re.S,
-    )
-    assert match, (
-        "no outdoor series pushed with `label: OUTDOOR_METRICS.temp.name` — "
-        "if the overlay moved, this guard has to move with it"
-    )
-    assert not re.search(r"\bscale\s*:", match.group(0)), (
-        "the outdoor temperature series declares its own `scale:`, so the two "
-        "temperatures are drawn against different rulers (#109)"
+    assert not re.search(r"\bscale\s*:", _overlay_push_block(js_code)), (
+        "a temperature overlay declares its own `scale:`, so the temperatures "
+        "are drawn against different rulers (#109)"
     )
 
 
@@ -441,15 +450,9 @@ def test_the_overlay_trace_breaks_rather_than_spanning_a_stale_gap(js_code):
     and false rather than merely absent: an explicit `true` is the regression,
     and "absent" and "present and false" are different edits to review.
     """
-    match = re.search(
-        r"seriesConfig\.push\(\{[^}]*label:\s*OUTDOOR_METRICS\.temp\.name.*?\}\)",
-        js_code,
-        re.S,
-    )
-    assert match, "the outdoor temperature series is no longer pushed here"
-    assert re.search(r"spanGaps:\s*false", match.group(0)), (
-        "the outdoor trace spans its gaps, so an outdoor-poller outage draws "
-        "as a flat line across the outage instead of a break (#109)"
+    assert re.search(r"spanGaps:\s*false", _overlay_push_block(js_code)), (
+        "an overlay trace spans its gaps, so a poller outage draws as a flat "
+        "line across the outage instead of a break (#109)"
     )
 
 
@@ -462,15 +465,9 @@ def test_the_overlay_series_is_actually_given_a_data_column(js_code):
     editing one without the other is the realistic slip. Neither structural
     guard above can see it: both read the series config alone.
     """
-    match = re.search(
-        r"const data = overlayOutdoor\s*\?\s*\[(.*?)\]\s*:\s*\[(.*?)\]", js_code, re.S
-    )
-    assert match, "no `overlayOutdoor` branch building the temp card's data array"
-    columns = [
-        [part.strip() for part in group.split(",") if part.strip()]
-        for group in match.groups()
-    ]
-    with_overlay, without = columns
+    match = re.search(r"const data = \[(.*?)\];", js_code, re.S)
+    assert match, "no `const data = [...]` building the temp card's data array"
+    columns = [part.strip() for part in match.group(1).split(",") if part.strip()]
     # ORDER, not membership. uPlot maps `data[i]` to `series[i]`, so
     # `[series.t, outdoorTemp, series.min, series.max, series.avg]` contains
     # every column, differs by exactly one comma, and silently makes the
@@ -478,14 +475,17 @@ def test_the_overlay_series_is_actually_given_a_data_column(js_code):
     # the overlay — every number on the card wrong, nothing red. A membership
     # assertion cannot see that, and it was the mutant this test missed on
     # its first draft (#109 review).
-    assert without == ["series.t", "series.min", "series.max", "series.avg"], (
-        f"the non-overlay data columns changed shape: {without}"
-    )
-    assert with_overlay == [*without, "outdoorTemp"], (
-        "the overlay branch must be the base columns with `outdoorTemp` "
-        f"appended, in that order — got {with_overlay}. The pushed series is "
-        "appended to `seriesConfig` last, so its data column has to be last "
-        "too, or uPlot pairs every series with the wrong array."
+    assert columns == [
+        "series.t",
+        "series.min",
+        "series.max",
+        "series.avg",
+        "...overlays.map((o) => payload[o.payload])",
+    ], (
+        "the data columns must be the four base columns with the overlays "
+        f"spread after them, in that order — got {columns}. The overlay "
+        "series are pushed onto `seriesConfig` last and in `overlays` order, "
+        "so their columns have to be last and in the same order too."
     )
 
 
