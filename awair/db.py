@@ -218,6 +218,25 @@ MINISPLIT_COLUMNS = (
     "switch",
 )
 
+# The basement ESPHome sensor (`awair.basement`). Its payload carries NO clock,
+# so -- unlike every table above -- `ts` is our poll clock, truncated to the
+# minute so the dedup can fire: the module publishes every 60 s and a raw poll
+# stamp would be unique on every poll. `received_at` keeps the untruncated
+# poll time. `temp` is CELSIUS, as the sensor publishes it, and NOT NULL: an
+# unavailable sensor stores no row rather than a null one, so a gap on the
+# chart is a gap in the table.
+BASEMENT_COLUMNS_DDL = """
+    ts TEXT NOT NULL PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    temp REAL NOT NULL
+"""
+
+SCHEMA += (
+    "\nCREATE TABLE IF NOT EXISTS basement_readings (" + BASEMENT_COLUMNS_DDL + ");\n"
+)
+
+BASEMENT_COLUMNS = ("ts", "received_at", "temp")
+
 OUTDOOR_COLUMNS = (
     "ts",
     "received_at",
@@ -750,6 +769,28 @@ def insert_minisplit_reading(conn: sqlite3.Connection, reading: dict) -> bool:
         # transaction here holds the write lock against both pollers, not just
         # against the next mini split poll. Same reasoning as the two siblings
         # above, one degree worse.
+        conn.rollback()
+        raise
+    conn.commit()
+    return cursor.rowcount == 1
+
+
+def insert_basement_reading(conn: sqlite3.Connection, reading: dict) -> bool:
+    """Insert one basement reading. False if this poll-minute is stored.
+
+    `ON CONFLICT(ts) DO NOTHING`, not `INSERT OR IGNORE`, for the reason on
+    `insert_outdoor_reading`: a NOT NULL violation must raise rather than come
+    back as a duplicate.
+    """
+    placeholders = ", ".join(f":{col}" for col in BASEMENT_COLUMNS)
+    try:
+        cursor = conn.execute(
+            f"INSERT INTO basement_readings ({', '.join(BASEMENT_COLUMNS)})"
+            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            reading,
+        )
+    except sqlite3.Error:
+        # Four writers share one AWAIR_DB; don't hold the write lock open.
         conn.rollback()
         raise
     conn.commit()

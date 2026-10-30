@@ -3,7 +3,7 @@
 Continuous local logging, spike alerting, and a small trend dashboard for an
 [Awair Element](https://uk.getawair.com/products/element) air quality monitor.
 
-Two long-running processes, plus two optional feeds:
+Two long-running processes, plus three optional feeds:
 
 - **Poller** — hits the Awair Element's Local API every 30 seconds, stores every
   reading in SQLite, runs spike detection, and fires [ntfy](https://ntfy.sh)
@@ -32,6 +32,13 @@ going down cannot wedge the others:
   ntfy, so a bridge that stops answering shows up only as `error` lines in
   `journalctl --user -u awairelement-minisplit`. Deliberate for a first cut,
   and the reason the log line is worth watching after a deploy.
+- **Basement** (`awair.basement`) — the basement ESPHome sensor's temperature
+  every 60 s, from `AWAIR_BASEMENT_URL` (default
+  `http://192.168.68.50/sensor/Temperature`). The payload has **no clock**, so
+  rows are keyed on our poll clock truncated to the minute: one row per
+  poll-minute. An unavailable sensor (null/NaN `value`) stores nothing, so a
+  gap in the table is a gap on the chart. Like the mini split feed it has no
+  health escalation; watch `journalctl --user -u awairelement-basement`.
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).
@@ -334,7 +341,7 @@ ingestion, so a wrong URL or 401 just gets logged.)
 
 ## Running as a systemd user service
 
-The `systemd/` directory ships four unit files you can drop into
+The `systemd/` directory ships five unit files you can drop into
 `~/.config/systemd/user/`. They assume the checkout lives at
 `~/sources/awairelement` and read environment from
 `~/.config/awairelement/environment`.
@@ -347,6 +354,7 @@ ln -sf "$PWD/systemd/awairelement-web.service"   ~/.config/systemd/user/
 # only makes sense on the box running the parsons-pulse climate bridge.
 ln -sf "$PWD/systemd/awairelement-outdoor.service"   ~/.config/systemd/user/
 ln -sf "$PWD/systemd/awairelement-minisplit.service" ~/.config/systemd/user/
+ln -sf "$PWD/systemd/awairelement-basement.service"  ~/.config/systemd/user/
 
 cat > ~/.config/awairelement/environment <<'EOF'
 AWAIR_URL=http://192.168.1.42/air-data/latest
@@ -471,6 +479,7 @@ awair/
 ├── alerts.py    # ntfy client
 ├── series.py    # server-side bucketing for the dashboard
 ├── minisplit.py # the mini split feed: one row per power-report window
+├── basement.py  # the basement ESPHome sensor: one row per poll-minute
 ├── units.py     # temperature conversion, in both directions
 └── web.py       # Flask app + JSON endpoints
 ```
