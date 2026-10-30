@@ -53,7 +53,9 @@ being undone by a future edit.
 """
 
 import logging
+import math
 import os
+import re
 from time import perf_counter
 
 from flask import g, request
@@ -77,7 +79,7 @@ SLOW_MS_ENV = "AWAIR_WEB_SLOW_MS"
 SLOW_MS_CONFIG = "AWAIR_WEB_SLOW_MS"
 
 
-def threshold_from_env(logger, environ=None):
+def threshold_from_env(logger):
     """Resolve `AWAIR_WEB_SLOW_MS` once, loudly.
 
     Resolved at app construction rather than per request so a malformed value
@@ -86,11 +88,14 @@ def threshold_from_env(logger, environ=None):
     that survives a level misconfiguration, so falling back in silence would
     lose the backstop and the notice of having lost it.
 
-    Negative values are refused for the same reason from the other side: at
-    `-1` every request is "slow", so the tier stops distinguishing anything.
+    Two spellings are refused rather than used, because each one disarms the
+    tier instead of moving it. At `-1` every request is "slow", so the tier
+    stops distinguishing anything. At `nan` — and at `inf`, and at any literal
+    that overflows to it — *no* request is ever slow, because `x >= nan` is
+    False for every x; that is the worse of the two, because it is the silent
+    direction and `float()` accepts it without complaint.
     """
-    environ = os.environ if environ is None else environ
-    raw = environ.get(SLOW_MS_ENV)
+    raw = os.environ.get(SLOW_MS_ENV)
     if raw is None:
         return DEFAULT_SLOW_MS
     try:
@@ -103,9 +108,9 @@ def threshold_from_env(logger, environ=None):
             DEFAULT_SLOW_MS,
         )
         return DEFAULT_SLOW_MS
-    if value < 0:
+    if value < 0 or not math.isfinite(value):
         logger.warning(
-            "%s=%r is negative, which would mark every request slow — "
+            "%s=%r would disarm the slow tier rather than move it — "
             "using the default %.0f ms",
             SLOW_MS_ENV,
             raw,
@@ -129,13 +134,33 @@ def response_bytes(response):
     return "-" if length is None else str(length)
 
 
+# Bytes re-encoded before the path reaches the log line: everything outside
+# printable ASCII, and the space.
+_UNSAFE_IN_A_LOG_LINE = re.compile(r"[^\x21-\x7e]")
+
+
 def logged_path():
     """`/api/series?range=30d` -- the path with its query, minus a bare `?`.
 
     `request.full_path` appends `?` unconditionally, so `/` would log as `/?`.
+
+    **Percent-re-encoded, because WSGI hands us the path already decoded.**
+    Without this, one unauthenticated GET writes whatever it likes into the
+    journal: `curl --path-as-is 'http://host:8097/%0a%5b...%5d%20WARNING%20in%20timing%3a%20request%20...'`
+    produces a second, fabricated line that both of README's `journalctl`
+    recipes report as a real 99,999 ms `/api/series` (reproduced under gunicorn
+    during review). The record this module exists to create is evidence, and
+    evidence anything on the LAN can author is not evidence. The same decoded
+    bytes also carry ANSI escapes straight into a terminal reading the journal.
+
+    The space is in the class for a reason that needs no attacker: a path
+    containing one -- a crawler, a typo, a pasted URL -- truncates the path
+    field for any reader splitting on whitespace, and attributes the duration
+    to the shorter path rather than dropping it. README's own `sed` does that.
     """
     full = request.full_path
-    return full[:-1] if full.endswith("?") else full
+    trimmed = full[:-1] if full.endswith("?") else full
+    return _UNSAFE_IN_A_LOG_LINE.sub(lambda m: f"%{ord(m.group()):02X}", trimmed)
 
 
 def install(app):
@@ -172,5 +197,3 @@ def install(app):
             request.endpoint,
         )
         return response
-
-    return app

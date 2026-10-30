@@ -16,9 +16,15 @@ Or against a snapshot anywhere::
 
 **What this probe can and cannot see.** It drives the app through Flask's test
 client, so each number is the time the *application* spends on one request,
-start to finish, with nothing else in flight. That is the same quantity
-`awair.timing` logs in production, and it is deliberately the same so the two
-can be compared.
+start to finish, with nothing else in flight. That is very nearly the quantity
+`awair.timing` logs in production -- near enough to compare, and not identical:
+the probe's clock spans the whole test-client call while the log line's stops
+at `after_request`. Measured, they agree to 0.1 ms on `/api/series` and
+disagree by 0.1 ms on `/`, where the request costs almost nothing.
+
+`create_app` bootstraps the schema, so pointing this at the live file opens it
+**read-write** for one idempotent DDL pass -- the same thing the web unit does
+on every boot.
 
 It therefore cannot see the two costs that live outside the app, and neither
 can the production log line:
@@ -36,17 +42,19 @@ can the production log line:
 """
 
 import argparse
+import logging
 import os
 import statistics
 import sys
 from pathlib import Path
 from time import perf_counter
 
-# Lane check: refuse to run against a tree that does not contain this file.
-_HERE = Path(__file__).resolve()
-sys.path.insert(0, str(_HERE.parent.parent.parent))
+# Import `awair` from the checkout this file sits in, so a probe run by path
+# measures its own tree rather than whatever happens to be importable.
+_REPO = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO))
 
-from awair import web  # noqa: E402
+from awair import timing, web  # noqa: E402
 
 # Every request one page load makes, in the order the browser makes them.
 # `dashboard.js` fires the three `/api/*` entries below concurrently; the rest
@@ -132,6 +140,12 @@ def rows_in(db_path):
 
 def probe(db_path, repeat):
     app = web.create_app(db_path)
+    # Quiet the per-request log this repo now installs (#141). 17 requests at
+    # `--repeat 5` is ~85 INFO lines on stderr against a table on stdout, and
+    # in a terminal they interleave and scroll the header away. The slow tier
+    # is left at WARNING so a genuinely slow request still announces itself
+    # while the probe runs.
+    logging.getLogger(timing.LOGGER_NAME).setLevel(logging.WARNING)
     assert_covers_every_route(app)
     client = app.test_client()
     print(f"db      : {db_path} ({os.path.getsize(db_path) / 1e6:.1f} MB)")

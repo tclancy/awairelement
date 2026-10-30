@@ -270,9 +270,11 @@ def test_a_client_error_is_still_timed(seeded, collector):
     """A 400 is a response, and a slow 400 is still a slow request."""
     client = client_for(seeded, collector)
 
-    assert client.get("/api/series?range=nonsense").status_code == 400
+    response = client.get("/api/series?range=nonsense")
+    assert response.status_code == 400
 
     assert collector.matched()[0]["status"] == "400"
+    assert "Server-Timing" in response.headers
 
 
 def test_a_server_error_is_still_timed(tmp_path, collector):
@@ -287,9 +289,11 @@ def test_a_server_error_is_still_timed(tmp_path, collector):
     client = create_app(str(blocker / "awair.db")).test_client()
     collector.records.clear()
 
-    assert client.get("/api/latest").status_code == 500
+    response = client.get("/api/latest")
+    assert response.status_code == 500
 
     assert collector.matched()[0]["status"] == "500"
+    assert "Server-Timing" in response.headers
 
 
 def test_bytes_is_a_dash_when_the_length_is_unknown(seeded, collector):
@@ -408,3 +412,100 @@ def test_web_module_installs_timing_rather_than_reimplementing_it(seeded, monkey
     create_app(seeded)
 
     assert len(calls) == 1
+
+
+def test_a_decoded_path_cannot_forge_a_second_log_line(seeded):
+    """One unauthenticated GET must not be able to author the record.
+
+    WSGI hands the app an already percent-decoded `PATH_INFO`, so without
+    re-encoding, `curl --path-as-is 'http://host:8097/%0a%5b...'` puts a
+    second, well-formed, entirely fabricated line in the journal -- which both
+    of README's `journalctl` recipes then report as a real 99,999 ms request.
+    Reproduced under real gunicorn during review, before this guard existed.
+
+    Driven at the environ rather than through `test_client`, deliberately:
+    the client's URL handling strips a raw newline before the app ever sees
+    it, so a client-level test of this case cannot fail and would be a test of
+    Werkzeug. `PATH_INFO` set directly is exactly the state gunicorn produces.
+    """
+    from werkzeug.test import create_environ
+
+    forged = (
+        "\n[2026-10-30 03:00:00,000] WARNING in timing: request GET "
+        "/api/series?range=30d status=200 dur_ms=99999.0 bytes=1 endpoint=series"
+    )
+    app = create_app(seeded)
+    environ = create_environ(path="/")
+    environ["PATH_INFO"] = "/" + forged
+    environ["QUERY_STRING"] = ""
+
+    with app.request_context(environ):
+        logged = timing.logged_path()
+
+    assert "\n" not in logged
+    assert logged.startswith("/%0A[2026-10-30%2003:00:00,000]%20WARNING")
+    # The forged text survives as inert characters -- that is the point. What
+    # must not survive is its structure: a reader sees one path field, not a
+    # second record claiming a 200 and 99,999 ms. The encoded space does that.
+    assert " " not in logged
+
+
+def test_a_space_in_a_path_does_not_truncate_the_path_field(seeded, collector):
+    """No attacker needed: a crawler or a pasted URL does this.
+
+    A raw space ends the path for any reader splitting on whitespace -- which
+    is what README's `sed` does -- so the duration gets attributed to the
+    shorter path instead of being dropped.
+    """
+    client = client_for(seeded, collector)
+
+    client.get("/api/series OR 1=1?range=today")
+
+    path = collector.matched()[0]["path"]
+    assert " " not in path
+    assert path.startswith("/api/series%20OR%201=1")
+
+
+def test_the_slow_threshold_boundary_is_inclusive(seeded, collector, monkeypatch):
+    """`dur_ms == threshold` is slow -- what README and GLOSSARY both claim.
+
+    Driven with a pinned clock rather than a real duration: at the `0`
+    threshold the other tier tests use, every real duration is strictly
+    greater, so `>` and `>=` are indistinguishable there and a mutation to
+    `>` survived the whole module until this test existed.
+    """
+    monkeypatch.setattr(timing, "perf_counter", iter([0.0, 0.25]).__next__)
+    monkeypatch.setenv(timing.SLOW_MS_ENV, "250")
+    client = client_for(seeded, collector)
+
+    client.get("/api/latest")
+
+    assert collector.matched()[0]["dur_ms"] == "250.0"
+    assert collector.records[0].levelno == logging.WARNING
+
+
+def test_just_under_the_boundary_is_not_slow(seeded, collector, monkeypatch):
+    """The complement, so the boundary test is not passing vacuously."""
+    monkeypatch.setattr(timing, "perf_counter", iter([0.0, 0.25]).__next__)
+    monkeypatch.setenv(timing.SLOW_MS_ENV, "250.1")
+    client = client_for(seeded, collector)
+
+    client.get("/api/latest")
+
+    assert collector.records[0].levelno == logging.INFO
+
+
+@pytest.mark.parametrize("spelling", ["nan", "inf", "1e400", "-inf"])
+def test_a_non_finite_threshold_is_refused(spelling, seeded, collector, monkeypatch):
+    """`float()` accepts these, and each one disarms the tier it configures.
+
+    `x >= nan` is False for every x, so a `nan` threshold means *no* request
+    is ever slow -- the silent direction, and the one a `value < 0` check
+    alone lets through. `1e400` overflows to `inf` on the way in.
+    """
+    monkeypatch.setenv(timing.SLOW_MS_ENV, spelling)
+
+    app = create_app(seeded)
+
+    assert app.config["AWAIR_WEB_SLOW_MS"] == timing.DEFAULT_SLOW_MS
+    assert any(spelling in line for line in collector.lines)
