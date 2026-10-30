@@ -184,7 +184,7 @@ def test_the_temp_card_is_the_only_card_marked_to_carry_an_overlay(client):
     """
     html = client.get("/").get_data(as_text=True)
     marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w -]+)"', html)
-    assert marked == [("temp", "outdoor-temp basement-temp")]
+    assert marked == [("temp", "outdoor-temp basement-temp minisplit-temp")]
     # The precipitation card carries #42's pressure overlay and must keep the
     # same marker — the reservation rule has no other way to reach it.
     assert 'data-outdoor="precipitation" data-overlay="pressure"' in html
@@ -1908,7 +1908,7 @@ def test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
     read = set(re.findall(r"seriesPayload\.(\w+)", DASHBOARD_JS))
     # The overlay traces are read by name through `TEMP_OVERLAYS[].payload`.
     read |= set(re.findall(r'payload:\s*"(\w+)"', DASHBOARD_JS))
-    assert {"outdoor_temp", "basement_temp"} <= read, (
+    assert {"outdoor_temp", "basement_temp", "minisplit_temp"} <= read, (
         "dashboard.js no longer reads the overlay traces by name — if the "
         "overlays moved, this guard has to move with them"
     )

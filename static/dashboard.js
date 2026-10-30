@@ -44,7 +44,16 @@ const METRICS = {
   // no prefix stays out of the header. The basement has none: a fourth number
   // needs ~265px against the ~245px the header has at the card's 330-340px
   // (measured at 1440 and 390), and the wrapped header pushed the temp chart
-  // ~19px below its row-mates' and grew the whole row.
+  // ~19px below its row-mates' and grew the whole row. The mini split has
+  // none for the same measured reason -- it would be the same fourth number,
+  // one overlay later.
+  //
+  // Only the mini split's TEMPERATURE is here. Its metered draw rides the same
+  // `/api/series` payload as `minisplit_watts`, and it is in watts: appended
+  // to this list it would share the card's y axis (see the push loop in
+  // `makePlot`, which declares no `scale:` on purpose) and a 30 W trace beside
+  // a 66 degF one draws both as flat lines. It needs its own axis, which is a
+  // card rather than an entry here (#139).
   const TEMP_OVERLAYS = [
     {
       key: "outdoor-temp",
@@ -58,6 +67,13 @@ const METRICS = {
       payload: "basement_temp",
       label: "Basement",
       colorVar: "--series-basement-temp",
+      prefix: null,
+    },
+    {
+      key: "minisplit-temp",
+      payload: "minisplit_temp",
+      label: "Mini split",
+      colorVar: "--series-minisplit-temp",
       prefix: null,
     },
   ];

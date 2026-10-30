@@ -29,8 +29,15 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # unit. Outdoor humidity onto `humid` would be the other honest candidate; an
 # outdoor temperature onto `co2` would not, and this constant is not the place
 # that would stop it -- see `_outdoor_temp_on_grid`. The basement sensor is the
-# second temperature on the same card, in the same unit, for the same reason.
-METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp")}
+# second temperature on the same card, in the same unit, for the same reason,
+# and the mini split head's own room temperature is the third (#139).
+#
+# `minisplit_watts` is the series this constant is the reason NOT to add. The
+# shared axis is the whole mechanism, and a draw in watts beside a room
+# temperature in degrees would autoscale one of them into a flat line -- the
+# exact harm the paragraph above describes, arriving from the feed whose
+# temperature half is listed here. It needs an axis of its own; see #139.
+METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp", "minisplit-temp")}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.

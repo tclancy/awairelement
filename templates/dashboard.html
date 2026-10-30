@@ -22,6 +22,7 @@
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
   --series-outdoor-pressure: #8b5cbf; --series-basement-temp: #a8327f;
+  --series-minisplit-temp: #1f7a3d;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
 @media (prefers-color-scheme: dark) {
@@ -33,6 +34,7 @@
     --series-temp: #d95926; --series-humid: #e66767; --series-score: #c3c2b7;
     --series-outdoor-temp: #4bb9c3; --series-outdoor-precip: #6a95d8;
     --series-outdoor-pressure: #b494e3; --series-basement-temp: #e07cc0;
+    --series-minisplit-temp: #5fc77f;
   }
 }
 * { box-sizing: border-box; }
@@ -132,6 +134,13 @@ main {
    three-digit indoor value beside a negative outdoor one needs it at every
    width. `~=` matches one word of the space-separated `data-overlay`. */
 .card[data-overlay~="basement-temp"] .u-legend { --legend-rows: 4; }
+/* The mini split's room temperature is a seventh entry (#139), and the fifth
+   row is measured with the legend populated at 390px: six entries filled four
+   rows to within one entry's width, so the seventh starts a row of its own at
+   every width the card is laid out at. Its own `~=` rule rather than a wider
+   one, for the reason the basement's is its own: the reservation is per-card
+   and the honest number for a card carrying one overlay is still three. */
+.card[data-overlay~="minisplit-temp"] .u-legend { --legend-rows: 5; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
@@ -198,7 +207,12 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   temperature on the same axis, from quarter-hourly Open-Meteo readings held
   between publishes — a break in that line is an outdoor-poller gap, not a
   weather event — and the basement sensor's temperature, averaged per bucket;
-  a break in that line is a sensor or basement-poller gap.
+  a break in that line is a sensor or basement-poller gap — and the dining
+  room mini split head's own room temperature, read through the climate
+  bridge; a break in that line is a bridge or mini-split-poller gap. The
+  head's power draw is on the same feed and deliberately not on this card: it
+  is watts, and these four lines share one axis because they are all a
+  temperature in the same unit.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
