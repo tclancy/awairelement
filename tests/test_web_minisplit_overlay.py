@@ -22,7 +22,6 @@ pass that, and neither can any other non-temperature key somebody adds later.
 control for it — an always-passing version of this test looks identical.
 """
 
-import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -98,9 +97,7 @@ def _series(tmp_path, monkeypatch, unit):
 
 def _overlay_payload_keys():
     """The `/api/series` keys `dashboard.js` draws onto the temp card."""
-    block = re.search(
-        r"const TEMP_OVERLAYS = \[(.*?)\n  \];", DASHBOARD_JS, re.DOTALL
-    )
+    block = re.search(r"const TEMP_OVERLAYS = \[(.*?)\n  \];", DASHBOARD_JS, re.DOTALL)
     assert block, "no `const TEMP_OVERLAYS = [...]` in dashboard.js"
     keys = re.findall(r'payload:\s*"(\w+)"', block.group(1))
     assert keys, "TEMP_OVERLAYS lists no payload keys"
@@ -175,7 +172,7 @@ def test_the_unit_guard_would_actually_catch_the_watts_series(tmp_path, monkeypa
 # --- the three surfaces the marker binds together ---
 
 
-def test_the_mini_split_overlay_is_declared_on_all_three_surfaces(tmp_path, monkeypatch):
+def test_the_mini_split_overlay_is_declared_on_all_three_surfaces():
     """`minisplit-temp` in the constant, in the JS, and in the stylesheet.
 
     One missing surface is silent in a different way each time: without the
