@@ -21,7 +21,7 @@
   --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
-  --series-outdoor-pressure: #8b5cbf;
+  --series-outdoor-pressure: #8b5cbf; --series-basement-temp: #a8327f;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
 @media (prefers-color-scheme: dark) {
@@ -32,7 +32,7 @@
     --series-co2: #3987e5; --series-voc: #008300; --series-pm25: #9085e9;
     --series-temp: #d95926; --series-humid: #e66767; --series-score: #c3c2b7;
     --series-outdoor-temp: #4bb9c3; --series-outdoor-precip: #6a95d8;
-    --series-outdoor-pressure: #b494e3;
+    --series-outdoor-pressure: #b494e3; --series-basement-temp: #e07cc0;
   }
 }
 * { box-sizing: border-box; }
@@ -127,6 +127,11 @@ main {
    instead is what let #42's selector go stale the moment a second card grew an
    overlay. */
 .card[data-overlay] .u-legend { --legend-rows: 3; }
+/* The temp card's basement overlay is a sixth entry. Measured with the legend
+   populated: realistic hover values need a fourth row at 375px, and a
+   three-digit indoor value beside a negative outdoor one needs it at every
+   width. `~=` matches one word of the space-separated `data-overlay`. */
+.card[data-overlay~="basement-temp"] .u-legend { --legend-rows: 4; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
@@ -169,7 +174,7 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
 </header>
 <main id="charts">
   {% for metric in metrics %}
-  <section class="card" data-metric="{{ metric }}"{% if metric in ceilings %} data-ceiling="{{ ceilings[metric] }}"{% endif %}{% if metric in overlays %} data-overlay="{{ overlays[metric] }}"{% endif %}>
+  <section class="card" data-metric="{{ metric }}"{% if metric in ceilings %} data-ceiling="{{ ceilings[metric] }}"{% endif %}{% if metric in overlays %} data-overlay="{{ overlays[metric] | join(' ') }}"{% endif %}>
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
   </section>
@@ -192,7 +197,8 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   the Awair Element local API. The Temp card also carries the outdoor
   temperature on the same axis, from quarter-hourly Open-Meteo readings held
   between publishes — a break in that line is an outdoor-poller gap, not a
-  weather event.
+  weather event — and the basement sensor's temperature, averaged per bucket;
+  a break in that line is a sensor or basement-poller gap.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>

@@ -37,6 +37,37 @@ const METRICS = {
     },
   };
 
+  // The temperature overlays the indoor temp card can carry, in draw order.
+  // `key` is the word in the card's space-separated `data-overlay`; `payload`
+  // is the `/api/series` key holding the trace, already on `metrics.temp.t`;
+  // `prefix` labels its latest value in the card header, and an overlay with
+  // no prefix stays out of the header. The basement has none: a fourth number
+  // needs ~265px against the ~245px the header has at the card's 330-340px
+  // (measured at 1440 and 390), and the wrapped header pushed the temp chart
+  // ~19px below its row-mates' and grew the whole row.
+  const TEMP_OVERLAYS = [
+    {
+      key: "outdoor-temp",
+      payload: "outdoor_temp",
+      label: OUTDOOR_METRICS.temp.name,
+      colorVar: OUTDOOR_METRICS.temp.colorVar,
+      prefix: "out",
+    },
+    {
+      key: "basement-temp",
+      payload: "basement_temp",
+      label: "Basement",
+      colorVar: "--series-basement-temp",
+      prefix: null,
+    },
+  ];
+
+  // The words of a card's `data-overlay`, which is space-separated so one card
+  // can carry more than one overlay.
+  function overlayKeys(card) {
+    return (card.dataset.overlay || "").split(" ").filter(Boolean);
+  }
+
   // Storm-warning threshold: a 3-hour pressure drop of ~2 hPa (~0.06 inHg) is
   // the classic "front moving in" signal (#42). Arrow shows current direction
   // of change over the last 3 hours of the visible range.
@@ -326,24 +357,27 @@ const METRICS = {
     };
   }
 
-  function makePlot(card, metric, series, outdoorTemp, peak) {
+  function makePlot(card, metric, series, payload, peak) {
     const meta = METRICS[metric];
     const color = cssVar(`--series-${metric}`);
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
 
-    // #109: the outdoor temperature trace rides on the indoor temp card.
-    // Dispatched on `data-overlay`, not on `metric === "temp"`, because the
-    // CSS reserves this card's extra legend row from the same attribute — one
-    // marker, so the fifth entry and the space for it cannot disagree.
+    // #109: the outdoor (and now basement) temperature traces ride on the
+    // indoor temp card. Dispatched on `data-overlay`, not on
+    // `metric === "temp"`, because the CSS reserves this card's extra legend
+    // rows from the same attribute — one marker, so the entries and the space
+    // for them cannot disagree.
     //
-    // The server ships `outdoor_temp` already on `series.t` (see
-    // `web._outdoor_temp_on_grid`): uPlot takes one x array per chart, and the
-    // two sides are sampled an order of magnitude apart. Nothing here
-    // resamples, interpolates or holds anything — that is a decision about
-    // what a stale reading means, and it belongs in Python where it is tested.
-    const overlayOutdoor =
-      card.dataset.overlay === "outdoor-temp" && Array.isArray(outdoorTemp);
+    // The server ships each trace already on `series.t` (see
+    // `web._outdoor_temp_on_grid`, `web._basement_temp_on_grid`): uPlot takes
+    // one x array per chart. Nothing here resamples, interpolates or holds
+    // anything — that is a decision about what a stale reading means, and it
+    // belongs in Python where it is tested.
+    const keys = overlayKeys(card);
+    const overlays = TEMP_OVERLAYS.filter(
+      (o) => keys.includes(o.key) && Array.isArray(payload[o.payload])
+    );
 
     // Server stamps the alert ceiling on the card when the metric has one in
     // spikes.METRICS. Missing → no reference line for this chart.
@@ -358,9 +392,15 @@ const METRICS = {
       plugins.push(ceilingLinePlugin(ceiling));
     }
 
-    const data = overlayOutdoor
-      ? [series.t, series.min, series.max, series.avg, outdoorTemp]
-      : [series.t, series.min, series.max, series.avg];
+    // Overlay columns appended in the same order their series are pushed onto
+    // `seriesConfig` below: uPlot pairs `data[i]` with `series[i]`.
+    const data = [
+      series.t,
+      series.min,
+      series.max,
+      series.avg,
+      ...overlays.map((o) => payload[o.payload]),
+    ];
     const axisStyle = {
       stroke: cssVar("--ink-muted"),
       grid: { stroke: cssVar("--grid"), width: 1 },
@@ -382,10 +422,10 @@ const METRICS = {
         spanGaps: false,
       },
     ];
-    if (overlayOutdoor) {
+    for (const overlay of overlays) {
       seriesConfig.push({
-        label: OUTDOOR_METRICS.temp.name,
-        stroke: cssVar(OUTDOOR_METRICS.temp.colorVar),
+        label: overlay.label,
+        stroke: cssVar(overlay.colorVar),
         width: 1.5,
         // Deliberately NO `scale:` — this shares the card's y axis, unlike
         // #42's pressure overlay two functions down. Both lines here are a
@@ -394,8 +434,8 @@ const METRICS = {
         // drift and a 20° outdoor swing as the same stroke.
         value: (u, v) => (v == null ? "–" : v.toFixed(meta.digits) + " " + meta.unit),
         points: { show: false },
-        // The server nulls the trace once the last outdoor observation goes
-        // stale, so a dead outdoor poller has to render as a break. Spanned,
+        // The server nulls the trace once the last observation goes stale, so
+        // a dead poller has to render as a break. Spanned,
         // it would render as a flat line instead — a wrong answer, not a
         // missing one.
         spanGaps: false,
@@ -430,12 +470,14 @@ const METRICS = {
     let nowText = fmt(latest, meta.digits) + (meta.unit ? " " + meta.unit : "");
     // Before the overlay suffix, so this card's own two numbers stay adjacent.
     nowText += peakSuffix(peak, meta.digits);
-    if (overlayOutdoor) {
-      const latestOutdoor = [...outdoorTemp].reverse().find((v) => v != null);
+    for (const overlay of overlays.filter((o) => o.prefix)) {
+      const latestOverlay = [...payload[overlay.payload]]
+        .reverse()
+        .find((v) => v != null);
       // Prefixed rather than bare: two numbers in the same unit side by side
       // is exactly the header that reads as a range.
       nowText +=
-        " · out " + fmt(latestOutdoor, meta.digits) +
+        " · " + overlay.prefix + " " + fmt(latestOverlay, meta.digits) +
         (meta.unit ? " " + meta.unit : "");
     }
     card.querySelector(".now").textContent = nowText;
@@ -522,7 +564,7 @@ const METRICS = {
     // marker loses the fifth entry and the space for it together rather than
     // drawing one into a box sized for four.
     const overlayPressure =
-      card.dataset.overlay === "pressure" && allMetrics && allMetrics.pressure;
+      overlayKeys(card).includes("pressure") && allMetrics && allMetrics.pressure;
     const pressureSeries = overlayPressure ? allMetrics.pressure : null;
     const pressureColor = overlayPressure
       ? cssVar(OUTDOOR_METRICS.pressure.colorVar)
@@ -633,7 +675,7 @@ const METRICS = {
         card,
         metric,
         seriesPayload.metrics[metric],
-        seriesPayload.outdoor_temp,
+        seriesPayload,
         seriesPayload.peaks[metric]
       );
     }

@@ -797,6 +797,15 @@ def insert_basement_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     return cursor.rowcount == 1
 
 
+def basement_readings_since(conn, since) -> list:
+    """[(epoch_seconds, celsius)] ascending, for poll-minutes at or after `since`."""
+    rows = conn.execute(
+        "SELECT ts, temp FROM basement_readings WHERE ts >= ? ORDER BY ts",
+        (since.isoformat(),),
+    )
+    return [(datetime.fromisoformat(ts).timestamp(), temp) for ts, temp in rows]
+
+
 def minisplit_readings_since(conn, columns, since) -> list:
     """[(epoch_seconds, col1, col2, ...)] ascending for mini split columns.
 

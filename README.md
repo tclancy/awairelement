@@ -37,7 +37,9 @@ going down cannot wedge the others:
   `http://192.168.68.50/sensor/Temperature`). The payload has **no clock**, so
   rows are keyed on our poll clock truncated to the minute: one row per
   poll-minute. An unavailable sensor (null/NaN `value`) stores nothing, so a
-  gap in the table is a gap on the chart. Like the mini split feed it has no
+  gap in the table is a gap on the chart. Drawn on the temp card as a
+  "Basement" line on the same axis, averaged per chart bucket and held for two
+  buckets. Like the mini split feed it has no
   health escalation; watch `journalctl --user -u awairelement-basement`.
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
