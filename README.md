@@ -27,9 +27,12 @@ going down cannot wedge the others:
 
   Three things to expect on a box today. **Only the temperature is charted.**
   The metered draw ships on `/api/series` as `minisplit_watts` and nothing
-  draws it: it is watts, the temp card's overlays all share that card's one
-  degree axis, and a 30 W trace beside a 66 °F one renders both as flat lines.
-  It needs an axis of its own — see #139. **The draw columns were NULL until
+  draws it: the temp card's overlay loop declares no `scale:` on purpose, so
+  every line on that card is drawn to one degree ruler and a draw in watts
+  would autoscale into a flat line. A second unit on a shared card is fine in
+  general — the precipitation card carries pressure that way — but this loop
+  would have to be restructured and the guard that keeps it scale-less
+  relaxed, so the draw is its own card and its own change. See #139. **The draw columns were NULL until
   parsons-pulse #182 deployed**; on the homelab they began filling 2026-10-30
   11:54 UTC, and a box running an older bridge still stores rows carrying the
   head's temperature and nothing else, which is working rather than broken.

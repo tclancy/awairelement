@@ -49,11 +49,16 @@ const METRICS = {
   // one overlay later.
   //
   // Only the mini split's TEMPERATURE is here. Its metered draw rides the same
-  // `/api/series` payload as `minisplit_watts`, and it is in watts: appended
-  // to this list it would share the card's y axis (see the push loop in
-  // `makePlot`, which declares no `scale:` on purpose) and a 30 W trace beside
-  // a 66 degF one draws both as flat lines. It needs its own axis, which is a
-  // card rather than an entry here (#139).
+  // `/api/series` payload, as `minisplit_watts`, and it is in watts: appended
+  // to this list it is drawn by the push loop in `makePlot`, which declares no
+  // `scale:` on purpose, so it would share the card's degree axis and the two
+  // would autoscale into flat lines.
+  //
+  // A second unit on a shared card is not itself the problem -- #42's pressure
+  // overlay does exactly that, with `scale: "pressure"` and its own `side: 1`
+  // axis. What this list cannot carry is a second unit, because the loop that
+  // draws it is deliberately scale-less and a test pins that. Watts needs the
+  // loop restructured and that guard relaxed, which is its own change (#139).
   const TEMP_OVERLAYS = [
     {
       key: "outdoor-temp",

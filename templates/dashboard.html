@@ -22,6 +22,14 @@
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
   --series-outdoor-pressure: #8b5cbf; --series-basement-temp: #a8327f;
+  /* Green, and the obvious objection was measured rather than waved off: on
+     the temp card this sits beside the outdoor teal, and the two are tight.
+     Simulating deuteranopia (Vienot) and taking the minimum CIELAB dE76 to
+     the card's other three lines, this green scores 31.2 here and 31.3 in the
+     dark palette -- the best of seven candidates tried. The intuitive fixes
+     are worse, not better: a yellow-green scores 12.5 and an amber 16.2,
+     because both collide with the basement magenta once red-green is gone.
+     Change it only against the same measurement. */
   --series-minisplit-temp: #1f7a3d;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
@@ -138,9 +146,14 @@ main {
    same four rows, not a fifth -- measured against a real database with the
    legend populated, at 1440/768/430/390/360: natural height 72px against the
    74.8px four rows reserve, so a fifth row would be ~19px of permanent blank
-   space on this card at every width. Its own rule rather than leaning on the
-   basement's, which is keyed to a different overlay and would take the fourth
-   row away with it if the basement line were ever dropped.
+   space on this card at every width.
+
+   Say plainly what this rule does today: nothing. It and the basement's are
+   both specificity (0,3,0) and both set 4, and the temp card carries both
+   words, so deleting this changes no pixel right now. It is written anyway
+   because the basement rule is keyed to a *different* overlay and would take
+   the fourth row with it if the basement line were ever dropped, leaving
+   seven entries in three rows. Forward insurance, not a live fix.
 
    Below ~330px of card (a 320px viewport) seven entries want six rows and
    `overflow: hidden` clips them. That is where the paragraph above says the
@@ -219,7 +232,8 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   bridge; a break in that line is a bridge or mini-split-poller gap. The
   head's power draw is on the same feed and deliberately not on this card: it
   is watts, and these four lines share one axis because they are all a
-  temperature in the same unit.
+  temperature in the same unit. It is on `/api/series` as `minisplit_watts`
+  and wants a card of its own.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
