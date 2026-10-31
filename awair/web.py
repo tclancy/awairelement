@@ -29,8 +29,22 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # unit. Outdoor humidity onto `humid` would be the other honest candidate; an
 # outdoor temperature onto `co2` would not, and this constant is not the place
 # that would stop it -- see `_outdoor_temp_on_grid`. The basement sensor is the
-# second temperature on the same card, in the same unit, for the same reason.
-METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp")}
+# second temperature on the same card, in the same unit, for the same reason,
+# and the mini split head's own room temperature is the third (#139).
+#
+# `minisplit_watts` is the series this constant is the reason NOT to add. The
+# shared axis is the whole mechanism: the overlay push loop in `dashboard.js`
+# declares no `scale:` on purpose, and `test_the_overlay_series_shares_the_
+# cards_own_y_axis` forbids one *inside that block*. So a draw in watts added
+# here is drawn to the card's degree ruler and autoscaled into a flat line.
+#
+# Not "it needs a card rather than an entry" -- #42's pressure overlay is a
+# second unit on a shared card, with `scale: "pressure"` and its own `side: 1`
+# axis, and it is correct. The reason is narrower and it is about this loop:
+# carrying watts means restructuring the push loop to take a per-overlay scale
+# and relaxing the guard that keeps every temperature on one ruler. That is
+# its own change, not a fourth tuple entry. See #139.
+METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp", "minisplit-temp")}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.

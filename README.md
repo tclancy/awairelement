@@ -25,7 +25,10 @@ going down cannot wedge the others:
   cycle's own clock. It carries the head's temperature, metered draw, setpoint
   and the cycle's target (both in °C), and the head's raw SmartThings status as
   JSON, stored only when a value in it changes. Loopback-only, so it runs on the
-  bridge's box or not at all.
+  bridge's box or not at all. The dining head's temperature is drawn on the
+  temp card as a "Mini split" line on the same axis, held for two report
+  windows; its metered draw is not charted yet (it needs an axis of its own —
+  see #139).
 
   Two things to expect. **A bedroom zone configured off logs `bedroom unkeyed`
   every poll**, which is the bridge publishing `bedroom: null`, not a fault.

@@ -145,6 +145,12 @@ def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
     # legend is populated (measured at 375px, and at every width worst-case).
     both = _rule_body(html, '.card[data-overlay~="basement-temp"] .u-legend')
     assert both is not None and re.search(r"--legend-rows:\s*4\s*;", both)
+    # The mini split's room temperature is a seventh entry and needs the same
+    # four rows, not a fifth (#139) -- measured against a real database at
+    # 1440/768/430/390/360, natural 72px against the 74.8px four reserve.
+    # Its own rule, because the basement's is keyed to a different overlay.
+    three = _rule_body(html, '.card[data-overlay~="minisplit-temp"] .u-legend')
+    assert three is not None and re.search(r"--legend-rows:\s*4\s*;", three)
     assert not re.search(r'\.card\[data-outdoor="[a-z]+"\]\s*\.u-legend', html), (
         "a legend reservation is still keyed to one named card; key it on "
         "`[data-overlay]` so every overlay card is covered"
