@@ -422,12 +422,18 @@ const METRICS = {
   // the card's top edge.
   //
   // `max <= 0` is every sample metered at zero, which is a real reading of a
-  // head that drew nothing: it answers [0, 1] and draws a flat floor. The
-  // `max == null` arm is defence rather than a live path -- the axis is only
-  // created for a trace with a reading in it (see `hasReading` at the axis
-  // push below), so an all-null trace never reaches this function. Kept
-  // because uPlot owns when it calls a range callback, and a degenerate
-  // [0, 0] range is a drawing bug rather than a visible one.
+  // head that drew nothing: it answers [0, 1] and draws a flat floor.
+  //
+  // `max == null` is a live path, not defence, and an earlier draft of this
+  // comment said the opposite. The axis is only created for a trace with a
+  // reading in it (`hasReading`, at the axis push below), so the FIRST paint
+  // never hits it -- but uPlot re-derives a data-backed range on every
+  // x-zoom, and the range it hands this function is taken over the visible
+  // window alone. Measured: on `30d`, drag-selecting the leftmost eighth (2
+  // to 5 October, before parsons-pulse #182 shipped the window fields) leaves
+  // the right-hand axis reading `0` and `1`. That is the honest picture of a
+  // window the head reported no energy for, and it is why the arm returns a
+  // range rather than letting a degenerate [0, 0] through.
   const OVERLAY_SCALE_HEADROOM = 1.05;
   function overlayScaleRange(u, min, max) {
     return [0, max == null || !(max > 0) ? 1 : max * OVERLAY_SCALE_HEADROOM];
@@ -538,8 +544,10 @@ const METRICS = {
       });
       // One axis per distinct scale, not per overlay: two overlays declaring
       // the same scale are two traces on one ruler, which is the point of
-      // naming it. `in` rather than a truthiness check because a scale
-      // object can legitimately be empty.
+      // naming it. Note the ordering this buys for free -- `scales[...]` is
+      // written only where the axis is pushed, so if the first overlay on a
+      // scale has an empty trace, a later one with readings still gets the
+      // axis rather than inheriting the first one's silence.
       //
       // And only when the trace has something in it. A trace that is entirely
       // null is what every box ran before parsons-pulse #182 shipped the

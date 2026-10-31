@@ -286,9 +286,10 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   metered power draw in watts, read against the right-hand axis, so its height
   is not comparable with any temperature on the card. It is the energy the head
   reported over its own window divided by that window — not its spot reading,
-  which sat at a constant 30.0 W while the metered energy said 45–65 W — so a
-  break in it is a window the head reported no energy for, and a flat zero is a
-  head that drew nothing.
+  which sat at a constant 30.0 W while the metered energy said 45–65 W. A break
+  in it is a window the head reported no energy for, or the same bridge or
+  mini-split-poller gap that breaks the Mini split line beside it; a flat zero
+  is a head that drew nothing, which is a reading rather than a gap.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
