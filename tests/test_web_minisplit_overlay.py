@@ -165,6 +165,18 @@ def _overlay_scales(js=None):
     return scales
 
 
+def _around(needle, before=80, after=60):
+    """The stripped stylesheet either side of `needle`, for a failure message.
+
+    A diagnostic, not an assertion: when the scoped-rule guard below fails it
+    is usually because the rule moved or its media query changed, and the next
+    question is always "what is it now". Quoting the neighbourhood answers that
+    without a second run.
+    """
+    at = DASHBOARD_HTML.index(needle)
+    return " ".join(DASHBOARD_HTML[at - before : at + len(needle) + after].split())
+
+
 def _non_null_pairs(celsius_trace, fahrenheit_trace):
     """Aligned (C, F) values where both traces have a reading."""
     assert len(celsius_trace) == len(fahrenheit_trace)
@@ -369,10 +381,6 @@ def test_the_mini_split_draw_is_declared_on_all_four_surfaces():
     assert "minisplit-watts" in _overlay_entries()
     rule = '.card[data-overlay~="minisplit-watts"] .u-legend'
     assert rule in DASHBOARD_HTML
-    query = re.search(
-        r"@media \(max-width:\s*(\d+)px\)\s*\{([^{]*\{[^}]*\}\s*)*\}",
-        DASHBOARD_HTML[DASHBOARD_HTML.index(rule) - 2000 :],
-    )
     scoped = re.search(
         r"@media \(max-width:\s*379px\)\s*\{\s*"
         + re.escape(rule)
@@ -383,8 +391,8 @@ def test_the_mini_split_draw_is_declared_on_all_four_surfaces():
         "the draw's legend rule is not `--legend-rows: 5` inside "
         "`@media (max-width: 379px)`. Measured: eight populated entries want "
         "five rows at a 335px card (375px viewport) and four at 340px (380px "
-        "viewport), so both the value and the breakpoint are the measurement "
-        f"(query found near the rule: {query.group(1) if query else None})"
+        "viewport), so both the value and the breakpoint are the measurement. "
+        f"What is there instead: {_around(rule)!r}"
     )
     footer = DASHBOARD_HTML[DASHBOARD_HTML.index("<footer>") :]
     assert "right-hand axis" in footer, (
