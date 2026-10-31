@@ -99,15 +99,16 @@ const METRICS = {
       // windows whose metered energy implied 45, 54 and 65 W, and
       // `/api/series` deliberately does not carry it.
       //
-      // One word rather than the glossary's two, and the word is load-bearing
-      // at a measured width. "Mini split draw" is the longest label on this
-      // card and it pushes the populated legend from four rows to five at a
-      // 320px card (a 360px viewport), where `overflow: hidden` then clips an
-      // entry that fits on origin/main. "Draw" keeps eight entries in the four
-      // rows already reserved at every width down to 320px of card. It reads
-      // in context: the entry above it is "Mini split", and the value carries
-      // its own `W`. Measured both ways with the entry removed from the DOM as
-      // the control -- see the PR body for the table.
+      // One word rather than the glossary's two, and shorter than the first
+      // draft deliberately -- but be accurate about what that bought, because
+      // it is less than it looks. Measured with the entry removed from the DOM
+      // as the control: "Mini split draw" was the longest label on the card
+      // and wanted a sixth row at a 300px card, where "Draw" wants five. At a
+      // 320px card both want five. So the shortening did NOT keep eight
+      // entries inside the four rows already reserved -- the media query in
+      // `dashboard.html` is what covers that, and this only moved the
+      // narrowest measured case by one row. It reads in context (the entry
+      // above it is "Mini split") and the value carries its own `W`.
       label: "Draw",
       colorVar: "--series-minisplit-watts",
       prefix: null,
