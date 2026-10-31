@@ -27,24 +27,30 @@ going down cannot wedge the others:
   the head's raw SmartThings status as JSON, stored only when a value in it
   changes. Loopback-only, so it runs on the bridge's box or not at all. The
   **dining** head is the one that is charted: its temperature is drawn on the
-  temp card as a "Mini split" line on the same axis, held for two report
-  windows, and its metered draw as a "Draw" line on its own right-hand watts
-  axis. The bedroom head is recorded and not charted.
+  temp card as a "Mini split" line on the same axis and its metered draw as a
+  "Draw" line on its own right-hand watts axis. Both are held for two report
+  windows, by one bound. The bedroom head is recorded and not charted.
 
   Four things to expect on a box today. **The draw and the temperatures are not
   comparable by height.** They share a card and not an axis: the temperatures
   are drawn to the card's degree ruler, and the draw to a zero-anchored watts
-  axis on the right, the way the precipitation card already carries pressure
-  (#42). An overlay on this card is admitted on one of two grounds — it is a
-  temperature in the card's own unit, or it declares its own `scale` — and the
-  footer says which axis the draw is read against, because nothing on the chart
-  does. **A bedroom zone configured off logs `bedroom unkeyed` every poll**,
-  which is the bridge publishing `bedroom: null`, not a fault. **The draw
+  axis on the right, the way the precipitation card already carries pressure on
+  an axis of its own (#42) — though pressure's is a *fixed* 28.5-31.0 inHg
+  rather than anchored at zero, because a barometer has no meaningful zero and
+  a power draw does. An overlay on this card is admitted on one of two
+  grounds — it is a temperature in the card's own unit, or it declares its own
+  `scale` — and the footer says which axis the draw is read against, because
+  nothing on the chart does. **A bedroom zone configured off logs `bedroom
+  unkeyed` every poll**, which is the bridge publishing `bedroom: null`, not a
+  fault. **The draw
   columns were NULL until parsons-pulse #182 deployed**; on the homelab they
   began filling 2026-10-30 11:54 UTC, and a box running an older bridge still
   stores rows carrying the head's temperature and nothing else, which is
   working rather than broken — such a row holds its temperature onto the grid
-  and contributes no draw. And **this feed has no health escalation**: unlike
+  and contributes no draw. With no draw to show, the right-hand axis is not
+  drawn either: it is created only for a trace that has a reading in it, so a
+  pre-#182 box gets the card it had before this feed rather than an empty
+  ruler down its right edge. And **this feed has no health escalation**: unlike
   the outdoor poller it opens no alert event and sends no ntfy, so a bridge
   that stops answering shows up only as `error` lines in `journalctl --user -u
   awairelement-minisplit`. Deliberate for a first cut, and the reason the log
