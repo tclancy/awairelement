@@ -1,25 +1,38 @@
-"""The mini split's room temperature as a temp-card overlay, and what may not be (#139).
+"""The mini split on the temp card: its room temperature, and its metered draw (#139).
 
-The browser half of #139. The data half (#140) already ships `minisplit_temp`
-and `minisplit_watts` on `/api/series`; what lands here is the decision that
-**only the first of those may ride the temperature card**, and the guards that
-hold it.
+The browser half of #139, both halves of it. The data half (#140) already
+ships `minisplit_temp` and `minisplit_watts` on `/api/series`; what lands here
+is the rule for what may ride the temperature card, and the guards that hold
+it.
 
-The admission test for a temp-card overlay is not "is it on the same feed" —
-it is "is it a temperature in this card's display unit". The overlays share the
-card's one y axis on purpose (`test_the_overlay_series_shares_the_cards_own_y_axis`
-pins the absence of a `scale:`), and that is sound exactly while every line is
-the same quantity in the same unit. `minisplit_watts` arrives in the same
-payload, from the same table, one key away from `minisplit_temp` — which makes
-appending it to `TEMP_OVERLAYS` the single likeliest way this regresses, and
-the result would be two flat lines rather than anything red.
+**That rule changed partway through this file's life, and the change is the
+thing to understand before editing it.** It began as "only a temperature in
+this card's display unit may ride this card", with `minisplit_watts` named as
+the series that must never be an overlay — the overlay push loop declared no
+`scale:` on purpose, so every line was drawn to one degree ruler and a draw in
+watts would have autoscaled into a flat line. The second half of #139 asked for
+the draw on this card anyway, and shipped it the way #42's pressure trace
+already rides the precipitation card: on `scale: "watts"` with its own `side: 1`
+axis. A second unit on a shared *card* was never the problem; a second unit on
+a shared *axis* is.
 
-So the guard below does not name `minisplit_watts`. It asks every overlay the
-page declares to *behave* like a temperature: flip `TEMPERATURE_UNIT` and the
-trace has to move by the Celsius-to-Fahrenheit relation. A watts series cannot
-pass that, and neither can any other non-temperature key somebody adds later.
-`test_the_unit_guard_would_actually_catch_the_watts_series` is the reachability
-control for it — an always-passing version of this test looks identical.
+So the admission test is now a disjunction: **an overlay is either a
+temperature in the card's own unit, or it declares its own scale.**
+
+- `test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit` holds the
+  scale-less half, by behaviour rather than by name — flip `TEMPERATURE_UNIT`
+  and the trace has to move by the Celsius-to-Fahrenheit relation.
+- `test_an_overlay_off_the_cards_axis_brings_its_own_unit` holds the other.
+- `test_the_unit_guard_would_actually_catch_a_non_temperature` is the
+  reachability control for the first: an always-passing version of it looks
+  identical from here.
+- `test_the_two_admission_rules_partition_every_overlay` is what stops an entry
+  falling between the two, or either half going quietly empty — a test scoped
+  to an empty set passes every time it runs.
+- `test_the_overlay_loop_never_names_a_scale_of_its_own`, over in
+  `test_dashboard_assets.py`, is what keeps the claim per-entry: the loop
+  declares `scale: overlay.scale` and never a literal, because a literal there
+  would apply to the three temperatures too.
 """
 
 import re

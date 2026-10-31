@@ -526,7 +526,7 @@ const METRICS = {
         // `TEMP_OVERLAYS` beside the trace it is about, and this loop only
         // carries it. An overlay that omits it shares the card's own axis,
         // which is what #109's three temperatures want and what
-        // `test_every_temperature_overlay_shares_the_cards_own_y_axis` pins.
+        // `test_the_overlay_loop_never_names_a_scale_of_its_own` pins.
         ...(overlay.scale ? { scale: overlay.scale } : {}),
         value: overlayFormatter(overlay, meta),
         points: { show: false },
