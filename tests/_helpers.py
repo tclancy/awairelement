@@ -146,3 +146,29 @@ def strip_js_comments(source):
         "would fail citing the wrong cause. See `strip_js_comments` (#90)."
     )
     return "".join(out)
+
+
+def strip_markup_comments(source):
+    """`source` with HTML `<!-- -->` and CSS `/* */` comments removed.
+
+    The markup sibling of `strip_js_comments`, and it exists for the inverse
+    of that helper's reason. `strip_js_comments` protects *absence* assertions
+    from a commented-out construct that is still in the text. This one protects
+    *presence* assertions — a guard that reads `dashboard.html` raw and asserts
+    a rule or a custom property is there passes while that line sits inside
+    `/* */` and the browser ignores it. Measured on this file: wrapping
+    `.card[data-overlay~="minisplit-temp"] .u-legend` in a CSS comment, and
+    separately deleting nothing but commenting out the dark-mode
+    `--series-minisplit-temp`, left every guard in
+    `test_web_minisplit_overlay.py` green.
+
+    Deliberately simple, because `templates/dashboard.html` is simple: one
+    `<style>` block, two `<script src=...>` tags with no inline body, and no
+    `//` anywhere. That is checked by
+    `test_the_markup_stripper_matches_the_file_it_is_used_on`, which fails if
+    the template grows an inline script — at which point this needs the
+    quote-awareness its JS sibling has, and the assertion says so rather than
+    letting a `/*` inside a string eat the rest of the file.
+    """
+    without_html = re.sub(r"<!--.*?-->", "", source, flags=re.DOTALL)
+    return re.sub(r"/\*.*?\*/", "", without_html, flags=re.DOTALL)

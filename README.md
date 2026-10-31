@@ -22,16 +22,25 @@ going down cannot wedge the others:
   temperature and metered power draw, read from the parsons-pulse climate
   bridge's loopback `/status` (#139). One row per bridge *cycle*, keyed on the
   cycle's own clock rather than on our poll clock. Loopback-only, so it runs on
-  the bridge's box or not at all.
+  the bridge's box or not at all. The head's temperature is drawn on the temp
+  card as a "Mini split" line on the same axis, held for two report windows.
 
-  Two things to expect on a box today. **The draw columns stay NULL until
-  parsons-pulse #182 is merged and deployed** — the bridge before it publishes
-  no `watts`/`deltaEnergy` at all, so rows carry the head's temperature and
-  nothing else; that is working, not broken. And **this feed has no health
-  escalation**: unlike the outdoor poller it opens no alert event and sends no
-  ntfy, so a bridge that stops answering shows up only as `error` lines in
-  `journalctl --user -u awairelement-minisplit`. Deliberate for a first cut,
-  and the reason the log line is worth watching after a deploy.
+  Three things to expect on a box today. **Only the temperature is charted.**
+  The metered draw ships on `/api/series` as `minisplit_watts` and nothing
+  draws it: the temp card's overlay loop declares no `scale:` on purpose, so
+  every line on that card is drawn to one degree ruler and a draw in watts
+  would autoscale into a flat line. A second unit on a shared card is fine in
+  general — the precipitation card carries pressure that way — but this loop
+  would have to be restructured and the guard that keeps it scale-less
+  relaxed, so the draw is its own card and its own change. See #139. **The draw columns were NULL until
+  parsons-pulse #182 deployed**; on the homelab they began filling 2026-10-30
+  11:54 UTC, and a box running an older bridge still stores rows carrying the
+  head's temperature and nothing else, which is working rather than broken.
+  And **this feed has no health escalation**: unlike the outdoor poller it
+  opens no alert event and sends no ntfy, so a bridge that stops answering
+  shows up only as `error` lines in `journalctl --user -u
+  awairelement-minisplit`. Deliberate for a first cut, and the reason the log
+  line is worth watching after a deploy.
 - **Basement** (`awair.basement`) — the basement ESPHome sensor's temperature
   every 60 s, from `AWAIR_BASEMENT_URL` (default
   `http://192.168.68.50/sensor/Temperature`). The payload has **no clock**, so
