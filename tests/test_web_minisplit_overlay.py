@@ -1,25 +1,38 @@
-"""The mini split's room temperature as a temp-card overlay, and what may not be (#139).
+"""The mini split on the temp card: its room temperature, and its metered draw (#139).
 
-The browser half of #139. The data half (#140) already ships `minisplit_temp`
-and `minisplit_watts` on `/api/series`; what lands here is the decision that
-**only the first of those may ride the temperature card**, and the guards that
-hold it.
+The browser half of #139, both halves of it. The data half (#140) already
+ships `minisplit_temp` and `minisplit_watts` on `/api/series`; what lands here
+is the rule for what may ride the temperature card, and the guards that hold
+it.
 
-The admission test for a temp-card overlay is not "is it on the same feed" —
-it is "is it a temperature in this card's display unit". The overlays share the
-card's one y axis on purpose (`test_the_overlay_series_shares_the_cards_own_y_axis`
-pins the absence of a `scale:`), and that is sound exactly while every line is
-the same quantity in the same unit. `minisplit_watts` arrives in the same
-payload, from the same table, one key away from `minisplit_temp` — which makes
-appending it to `TEMP_OVERLAYS` the single likeliest way this regresses, and
-the result would be two flat lines rather than anything red.
+**That rule changed partway through this file's life, and the change is the
+thing to understand before editing it.** It began as "only a temperature in
+this card's display unit may ride this card", with `minisplit_watts` named as
+the series that must never be an overlay — the overlay push loop declared no
+`scale:` on purpose, so every line was drawn to one degree ruler and a draw in
+watts would have autoscaled into a flat line. The second half of #139 asked for
+the draw on this card anyway, and shipped it the way #42's pressure trace
+already rides the precipitation card: on `scale: "watts"` with its own `side: 1`
+axis. A second unit on a shared *card* was never the problem; a second unit on
+a shared *axis* is.
 
-So the guard below does not name `minisplit_watts`. It asks every overlay the
-page declares to *behave* like a temperature: flip `TEMPERATURE_UNIT` and the
-trace has to move by the Celsius-to-Fahrenheit relation. A watts series cannot
-pass that, and neither can any other non-temperature key somebody adds later.
-`test_the_unit_guard_would_actually_catch_the_watts_series` is the reachability
-control for it — an always-passing version of this test looks identical.
+So the admission test is now a disjunction: **an overlay is either a
+temperature in the card's own unit, or it declares its own scale.**
+
+- `test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit` holds the
+  scale-less half, by behaviour rather than by name — flip `TEMPERATURE_UNIT`
+  and the trace has to move by the Celsius-to-Fahrenheit relation.
+- `test_an_overlay_off_the_cards_axis_brings_its_own_unit` holds the other.
+- `test_the_unit_guard_would_actually_catch_a_non_temperature` is the
+  reachability control for the first: an always-passing version of it looks
+  identical from here.
+- `test_the_two_admission_rules_partition_every_overlay` is what stops an entry
+  falling between the two, or either half going quietly empty — a test scoped
+  to an empty set passes every time it runs.
+- `test_the_overlay_loop_never_names_a_scale_of_its_own`, over in
+  `test_dashboard_assets.py`, is what keeps the claim per-entry: the loop
+  declares `scale: overlay.scale` and never a literal, because a literal there
+  would apply to the three temperatures too.
 """
 
 import re
@@ -134,6 +147,36 @@ def _overlay_payload_keys(js=None):
     return keys
 
 
+def _overlay_scales(js=None):
+    """`{payload-key: declared scale or None}` for every `TEMP_OVERLAYS` entry.
+
+    The partition the two admission tests below read. Keyed on the payload key
+    rather than the `key` word because what the guards check is the *series*:
+    whether `/api/series`'s `minisplit_watts` converts with the temperature
+    unit is a question about that list, not about a CSS marker.
+    """
+    scales = {}
+    for entry in _overlay_entries(js).values():
+        payload = re.search(r'payload:\s*"(\w+)"', entry)
+        assert payload, f"a TEMP_OVERLAYS entry has no payload key: {entry!r}"
+        declared = re.search(r'scale:\s*"(\w+)"', entry)
+        scales[payload.group(1)] = declared.group(1) if declared else None
+    assert scales, "TEMP_OVERLAYS lists no payload keys"
+    return scales
+
+
+def _around(needle, before=80, after=60):
+    """The stripped stylesheet either side of `needle`, for a failure message.
+
+    A diagnostic, not an assertion: when the scoped-rule guard below fails it
+    is usually because the rule moved or its media query changed, and the next
+    question is always "what is it now". Quoting the neighbourhood answers that
+    without a second run.
+    """
+    at = DASHBOARD_HTML.index(needle)
+    return " ".join(DASHBOARD_HTML[at - before : at + len(needle) + after].split())
+
+
 def _non_null_pairs(celsius_trace, fahrenheit_trace):
     """Aligned (C, F) values where both traces have a reading."""
     assert len(celsius_trace) == len(fahrenheit_trace)
@@ -150,20 +193,36 @@ def _non_null_pairs(celsius_trace, fahrenheit_trace):
 def test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit(
     tmp_path, monkeypatch
 ):
-    """Flip `TEMPERATURE_UNIT` and every overlay trace must follow.
+    """Flip `TEMPERATURE_UNIT` and every SCALE-LESS overlay trace must follow.
 
-    The overlays declare no `scale:`, so they are drawn against the indoor
-    temperature's own y axis. A series that does not convert is a series in
-    some other unit sharing that axis, and the chart then draws whichever of
-    the two has the smaller range as a flat line -- a wrong answer, with
-    nothing red anywhere.
+    An overlay that declares no `scale:` is drawn against the indoor
+    temperature's own y axis, and that is the claim omitting it makes. A series
+    that does not convert is a series in some other unit sharing that axis, and
+    the chart then draws whichever of the two has the smaller range as a flat
+    line -- a wrong answer, with nothing red anywhere.
+
+    Scoped to the scale-less entries since #139 put the mini split's draw on
+    this card with `scale: "watts"` and a right-hand axis of its own. The
+    scoping is where this test could go quietly blind, so note what holds it
+    open: `test_the_unit_guard_would_actually_catch_a_non_temperature` proves
+    the predicate still fails on a real non-temperature, and
+    `test_the_two_admission_rules_partition_every_overlay` proves no entry
+    escapes both halves. An entry that declared a scale it did not need would
+    buy itself out of this test -- the axis guard in
+    `test_dashboard_assets.py` is what makes that a visible change rather than
+    a silent one.
 
     Harvested from `TEMP_OVERLAYS` rather than listed, so an overlay added
     tomorrow is covered without an edit here.
     """
     in_c = _series(tmp_path, monkeypatch, "C")
     in_f = _series(tmp_path, monkeypatch, "F")
-    for key in _overlay_payload_keys():
+    shared_axis = [k for k, scale in _overlay_scales().items() if scale is None]
+    assert len(shared_axis) >= 3, (
+        f"only {shared_axis} share the card's axis; this guard was written "
+        "against three temperatures and an empty list would pass it silently"
+    )
+    for key in shared_axis:
         assert key in in_c, f"TEMP_OVERLAYS draws `{key}`, /api/series does not ship it"
         pairs = _non_null_pairs(in_c[key], in_f[key])
         assert pairs, (
@@ -181,15 +240,25 @@ def test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit(
             )
 
 
-def test_the_unit_guard_would_actually_catch_the_watts_series(tmp_path, monkeypatch):
+def test_the_unit_guard_would_actually_catch_a_non_temperature(tmp_path, monkeypatch):
     """Reachability control for the test above (#139).
 
-    `minisplit_watts` is the concrete series that must never be an overlay,
-    and it travels in the same payload one key away. Asserted here against the
-    same two responses: it is a real number in both and the *same* number in
-    both, so the conversion check above fails on it. Without this, an
-    always-passing version of that test -- one whose traces were all null, or
-    whose key list came back empty -- reads exactly the same.
+    `minisplit_watts` is a real non-temperature travelling in the same payload
+    one key away, so it is the honest probe for "would that conversion check
+    fail on something?" Asserted against the same two responses: it is a real
+    number in both and the *same* number in both, so the check above would go
+    red on it. Without this, an always-passing version of that test -- one
+    whose traces were all null, or whose key list came back empty -- reads
+    exactly the same.
+
+    **What this test used to assert, and why it had to change.** It ended with
+    `"minisplit-watts" not in METRIC_OVERLAYS["temp"]` -- the draw must never
+    be an overlay at all. #139 asked for the draw on this card and that is
+    what shipped, on its own `scale: "watts"` axis, so the old assertion is
+    now false and the guarantee moved: the draw is admitted *because* it
+    declares a scale, and what it must not do is sit on the degree axis. That
+    is `test_the_two_admission_rules_partition_every_overlay` plus the
+    scale-less scoping above, not an exclusion list here.
     """
     in_c = _series(tmp_path, monkeypatch, "C")
     in_f = _series(tmp_path, monkeypatch, "F")
@@ -198,8 +267,70 @@ def test_the_unit_guard_would_actually_catch_the_watts_series(tmp_path, monkeypa
     for celsius_side, fahrenheit_side in pairs:
         assert celsius_side == fahrenheit_side
         assert celsius_side != pytest.approx(units.from_celsius(celsius_side, "F"))
-    assert "minisplit_watts" not in _overlay_payload_keys()
-    assert "minisplit-watts" not in web.METRIC_OVERLAYS["temp"]
+    assert _overlay_scales()["minisplit_watts"] == "watts", (
+        "the draw is on the temp card without a scale of its own, so it is "
+        "drawn to the degree ruler (#139)"
+    )
+
+
+def test_the_two_admission_rules_partition_every_overlay():
+    """Every entry is held to exactly one of the two rules, and both are live.
+
+    The admission test is no longer "is it a temperature". It is: **either the
+    trace is in the card's own unit, or it declares its own scale.** Two tests
+    enforce the two halves, so the failure this guards against is an entry that
+    falls between them -- or, worse, a partition that collapses, since a test
+    scoped to an empty half passes every time it runs.
+
+    Asserted with both halves non-empty and against `METRIC_OVERLAYS`, which is
+    the surface that actually admits an overlay onto the card: an entry in the
+    JS that the constant never marks is never drawn, and vice versa.
+    """
+    scales = _overlay_scales()
+    shared = {k for k, v in scales.items() if v is None}
+    own = {k for k, v in scales.items() if v is not None}
+    assert shared and own, (
+        f"one half of the partition is empty (shared={shared}, own={own}); the "
+        "test scoped to it cannot fail"
+    )
+    assert shared | own == set(scales)
+    assert not shared & own
+    keys = {
+        re.search(r'key:\s*"([\w-]+)"', e).group(1): e
+        for e in _overlay_entries().values()
+    }
+    assert set(keys) == set(web.METRIC_OVERLAYS["temp"]), (
+        f"TEMP_OVERLAYS declares {sorted(keys)} and METRIC_OVERLAYS marks "
+        f"{sorted(web.METRIC_OVERLAYS['temp'])} -- an entry on one surface "
+        "only is either never drawn or never marked"
+    )
+
+
+def test_an_overlay_off_the_cards_axis_brings_its_own_unit():
+    """A scaled overlay cannot borrow the card's `METRICS` unit or precision.
+
+    The hover formatter reads `meta.unit`/`meta.digits` for a scale-less
+    overlay and the overlay's own `unit`/`digits` for a scaled one. An entry
+    that declares a scale and omits either renders `undefined` in the legend
+    (for the unit) or throws inside `toFixed` (for the digits) -- and only
+    while the cursor is over that card, which is the kind of break a test
+    suite never sees and a hover does.
+    """
+    by_key = _overlay_entries()
+    scaled = [
+        key for key, entry in by_key.items() if re.search(r'scale:\s*"\w+"', entry)
+    ]
+    assert scaled, "no scaled overlay to check; this guard is inert"
+    for key in scaled:
+        entry = by_key[key]
+        assert re.search(r'unit:\s*"[^"]+"', entry), (
+            f"overlay `{key}` declares a scale and no `unit`, so its hover "
+            "value prints `undefined`"
+        )
+        assert re.search(r"digits:\s*\d+", entry), (
+            f"overlay `{key}` declares a scale and no `digits`, so its hover "
+            "formatter calls toFixed(undefined)"
+        )
 
 
 # --- the three surfaces the marker binds together ---
@@ -226,6 +357,83 @@ def test_the_mini_split_overlay_is_declared_on_all_three_surfaces():
     assert "minisplit-temp" in web.METRIC_OVERLAYS["temp"]
     assert "minisplit-temp" in _overlay_entries()
     assert '.card[data-overlay~="minisplit-temp"] .u-legend' in DASHBOARD_HTML
+
+
+def test_the_mini_split_draw_is_declared_on_all_four_surfaces():
+    """`minisplit-watts` in the constant, the JS, the stylesheet and the footer.
+
+    Three of those are the same contract the temperature line has. The fourth
+    is the one this entry adds: it is the first line on this card that is NOT
+    read against the card's own axis, so the footer has to say which axis it
+    IS read against. A reader who takes its height for a temperature gets a
+    wrong answer, and nothing on the chart tells them otherwise.
+
+    The stylesheet surface is load-bearing here in a way the temperature's was
+    not. `.card[data-overlay~="minisplit-temp"]` is forward insurance -- it
+    sets the same four rows the basement rule already sets. This one sets
+    *five*, and only below 380px, because eight populated entries want a fifth
+    row at a 335px card and `overflow: hidden` would otherwise clip the draw's
+    own legend entry. So it is asserted together with its breakpoint: move the
+    rule out of the media query and the card is ~18.7px taller at every width;
+    widen the query and the entry comes back clipped at 390px.
+    """
+    assert "minisplit-watts" in web.METRIC_OVERLAYS["temp"]
+    assert "minisplit-watts" in _overlay_entries()
+    rule = '.card[data-overlay~="minisplit-watts"] .u-legend'
+    assert rule in DASHBOARD_HTML
+    scoped = re.search(
+        r"@media \(max-width:\s*379px\)\s*\{\s*"
+        + re.escape(rule)
+        + r"\s*\{\s*--legend-rows:\s*5;\s*\}\s*\}",
+        DASHBOARD_HTML,
+    )
+    assert scoped, (
+        "the draw's legend rule is not `--legend-rows: 5` inside "
+        "`@media (max-width: 379px)`. Measured: eight populated entries want "
+        "five rows at a 335px card (375px viewport) and four at 340px (380px "
+        "viewport), so both the value and the breakpoint are the measurement. "
+        f"What is there instead: {_around(rule)!r}"
+    )
+    footer = DASHBOARD_HTML[DASHBOARD_HTML.index("<footer>") :]
+    assert "right-hand axis" in footer, (
+        "the footer does not say the draw is read against the right-hand "
+        "axis, so its height reads as a temperature"
+    )
+
+
+def test_the_temp_cards_legend_reservation_is_four_rows_by_default():
+    """No rule the temp card matches may reserve fewer than four rows, or more.
+
+    Every `[data-overlay~=...]` rule here is specificity (0,3,0), so the last
+    one the card matches wins rather than the largest -- which means a new
+    rule setting three rows would silently clip two entries, and one setting
+    five unconditionally would make the card permanently taller than its
+    row-mates and grow the whole grid row.
+
+    Four is the measured default: eight populated entries at a 340px card are
+    71.9px against the 74.8px four rows reserve. The one exception is the
+    draw's rule, which is inside a media query and asserted with its
+    breakpoint by the test above; it is excluded here by that nesting rather
+    than by name.
+    """
+    unscoped = re.sub(r"@media[^{]*\{(?:[^{}]*\{[^{}]*\})*[^{}]*\}", "", DASHBOARD_HTML)
+    rules = re.findall(
+        r'\.card\[data-overlay~="([\w-]+)"\] \.u-legend \{\s*--legend-rows:\s*(\d+)',
+        unscoped,
+    )
+    on_card = {
+        name: int(rows) for name, rows in rules if name in web.METRIC_OVERLAYS["temp"]
+    }
+    assert on_card, (
+        "no unscoped --legend-rows rule is keyed to a temp-card overlay, so "
+        "the card falls back to the three rows `.card[data-overlay]` sets "
+        "and clips every entry past the sixth"
+    )
+    assert set(on_card.values()) == {4}, (
+        f"temp-card legend reservations are {on_card}; every unscoped rule the "
+        "card matches must say 4 -- fewer clips an entry, more is permanent "
+        "blank space on a card whose height sets its grid row's"
+    )
 
 
 def test_every_overlay_colour_variable_is_defined_in_both_palettes():
