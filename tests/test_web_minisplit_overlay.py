@@ -41,7 +41,7 @@ from pathlib import Path
 
 import pytest
 
-from awair import db, units, web
+from awair import db, minisplit, units, web
 from tests._helpers import strip_js_comments, strip_markup_comments
 from tests.test_web import _seed_db, _seed_outdoor
 
@@ -72,6 +72,7 @@ def _seed_minisplit(db_path, at):
     db.insert_minisplit_reading(
         conn,
         {
+            "head": minisplit.DINING,
             "ts": at.isoformat(),
             "received_at": at.isoformat(),
             "window_start": (at - timedelta(seconds=_WINDOW_SECONDS)).isoformat(),
@@ -81,6 +82,12 @@ def _seed_minisplit(db_path, at):
             "temp": _CELSIUS,
             "mode": "heat",
             "switch": "on",
+            "setpoint": None,
+            "target": None,
+            "target_source": None,
+            "decision_reason": None,
+            "temperature_at": None,
+            "raw": None,
         },
     )
     conn.close()

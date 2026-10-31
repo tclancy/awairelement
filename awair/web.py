@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, minisplit, outdoor, solar, spikes, units, weather_alerts
+from awair import db, minisplit, outdoor, solar, spikes, timing, units, weather_alerts
 from awair.series import bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -401,7 +401,7 @@ def _minisplit_carry_max_age_seconds():
 def _minisplit_on_grid(rows, grid, unit):
     """The mini split's room temperature and metered draw, on the indoor x-grid.
 
-    `rows` is `db.minisplit_readings_since(conn, _MINISPLIT_SERIES_COLUMNS, ...)`
+    `rows` is `db.minisplit_readings_since(conn, DINING, _MINISPLIT_SERIES_COLUMNS, ...)`
     and `grid` is `metrics["temp"]["t"]`, the stamps the indoor temperature
     chart is already drawn against. Returns `(temperature, watts)`, two flat
     lists each exactly as long as `grid` -- the same shape, and for the same
@@ -552,6 +552,12 @@ def create_app(db_path=None):
     app.config["TEMPERATURE_UNIT"] = units.get_temperature_unit()
 
     _bootstrap_schema(app.config["AWAIR_DB"], app.logger)
+    # One log line and a `Server-Timing` header per request (#141). Installed
+    # here rather than in the unit's gunicorn flags because an access log
+    # cannot say which endpoint served a path, and because the canonical unit
+    # file lives in the homelab repo -- a measurement that needs a second
+    # repo's deploy to turn on is a measurement that does not happen.
+    timing.install(app)
 
     def connect():
         """Read-only, per request. Every view below is query-only."""
@@ -593,8 +599,11 @@ def create_app(db_path=None):
             # One carry window before `since` as well, and for the identical
             # reason -- the report that was current at the left edge closed
             # before it.
+            # Dining's head only: `minisplit_temp` / `minisplit_watts` predate
+            # the bedroom rows and keep meaning the dining head.
             minisplit_rows = db.minisplit_readings_since(
                 conn,
+                minisplit.DINING,
                 _MINISPLIT_SERIES_COLUMNS,
                 since - timedelta(seconds=_minisplit_carry_max_age_seconds()),
             )

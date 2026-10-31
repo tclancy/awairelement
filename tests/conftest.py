@@ -4,11 +4,33 @@
 ResourceWarnings attributed to whatever test the GC happens to run in.
 """
 
+import logging
 import signal
 
 import pytest
 
-from awair import db
+from awair import db, timing
+
+
+@pytest.fixture(autouse=True)
+def restore_timing_logger_level():
+    """Leave the request-timing logger as the session found it (#141).
+
+    `awair.timing.install` raises the level on a module-global logger --
+    `logging.getLogger("awair.web")` is one object for the whole process -- so
+    the first test to call `create_app` configures it for every test after.
+
+    Insurance, not a fix for an observed failure: removing this fixture leaves
+    the suite green today, because the one test asserting what an
+    *unconfigured* app does uses a deliberately unrelated logger name rather
+    than relying on the order tests run in. It is here so the next test that
+    asserts something about this logger's level is not quietly answered by
+    whichever test ran before it.
+    """
+    logger = logging.getLogger(timing.LOGGER_NAME)
+    saved = logger.level
+    yield
+    logger.setLevel(saved)
 
 
 @pytest.fixture
