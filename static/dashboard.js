@@ -420,13 +420,23 @@ const METRICS = {
   // rounding on an idle head as a mountain range. Headroom keeps the peak off
   // the card's top edge.
   //
-  // `max == null` is a trace that is entirely null (no report in range, or a
-  // dead bridge); `max <= 0` is every sample metered at zero. Both would make
-  // uPlot's range degenerate, so both answer [0, 1] and draw a flat floor,
-  // which is the honest picture of a head that drew nothing.
+  // `max <= 0` is every sample metered at zero, which is a real reading of a
+  // head that drew nothing: it answers [0, 1] and draws a flat floor. The
+  // `max == null` arm is defence rather than a live path -- the axis is only
+  // created for a trace with a reading in it (see `hasReading` at the axis
+  // push below), so an all-null trace never reaches this function. Kept
+  // because uPlot owns when it calls a range callback, and a degenerate
+  // [0, 0] range is a drawing bug rather than a visible one.
   const OVERLAY_SCALE_HEADROOM = 1.05;
   function overlayScaleRange(u, min, max) {
     return [0, max == null || !(max > 0) ? 1 : max * OVERLAY_SCALE_HEADROOM];
+  }
+
+  // Does a trace have any reading at all? Gates the axis below. `!= null`
+  // catches both null and undefined; the server ships null for a stale or
+  // undatable reading and never NaN.
+  function hasReading(trace) {
+    return Array.isArray(trace) && trace.some((v) => v != null);
   }
 
   // The hover value for one overlay. An overlay on the card's own axis borrows
@@ -529,7 +539,19 @@ const METRICS = {
       // the same scale are two traces on one ruler, which is the point of
       // naming it. `in` rather than a truthiness check because a scale
       // object can legitimately be empty.
-      if (overlay.scale && !(overlay.scale in scales)) {
+      //
+      // And only when the trace has something in it. A trace that is entirely
+      // null is what every box ran before parsons-pulse #182 shipped the
+      // window fields, and what any box runs when the bridge is down -- and
+      // measured against such a database the axis renders as the literal
+      // labels `0` and `1` down the right-hand edge of a temperature chart,
+      // a ruler for a line that is not there. The series stays in the legend
+      // either way, which is how the temperature overlays already render a
+      // dead source; it is the axis that has nothing to say. uPlot
+      // auto-creates the named scale for the series, so nothing is drawn
+      // against an undefined one.
+      if (overlay.scale && hasReading(payload[overlay.payload])
+          && !(overlay.scale in scales)) {
         scales[overlay.scale] = { range: overlayScaleRange };
         axes.push({
           ...axisStyle,

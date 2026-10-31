@@ -250,6 +250,32 @@ def test_an_overlay_with_its_own_scale_gets_its_own_right_hand_axis(js_code):
     )
 
 
+def test_an_axis_is_only_drawn_for_a_trace_that_has_a_reading(js_code):
+    """An empty trace must not put a ruler on the card for a line that is absent.
+
+    Measured, not reasoned: served a copy of the homelab database with every
+    `delta_wh` and window bound NULLed — which is what every box ran before
+    parsons-pulse #182 and what any box runs with the bridge down — the card
+    rendered three axes, the third being the literal labels `0` and `1` down
+    the right-hand edge of a temperature chart. With the gate, two. The legend
+    entry stays in both, which is how the temperature overlays already render
+    a dead source; it is the axis that has nothing to say.
+
+    Keyed on the guard being in the axis push's condition rather than on the
+    helper existing somewhere in the file: `hasReading` defined and not called
+    here is exactly the regression.
+    """
+    loop = _overlay_loop_body(js_code)
+    condition = re.search(
+        r"if \(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*\{\s*scales\[", loop, re.S
+    )
+    assert condition, "the axis push is no longer guarded by an `if (...)`"
+    assert "hasReading(payload[overlay.payload])" in condition.group(1), (
+        "the overlay axis is created without checking the trace has a "
+        f"reading; condition is `{condition.group(1).strip()}`"
+    )
+
+
 def test_plot_container_clips_its_contents(html):
     """The outer guarantee: nothing inside a card paints outside it."""
     body = _rule_body(html, ".plot")
