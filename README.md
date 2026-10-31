@@ -23,16 +23,17 @@ going down cannot wedge the others:
   bridge's loopback `/status` (#139). One row per bridge *cycle*, keyed on the
   cycle's own clock rather than on our poll clock. Loopback-only, so it runs on
   the bridge's box or not at all. The head's temperature is drawn on the temp
-  card as a "Mini split" line on the same axis, held for two report windows.
+  card as a "Mini split" line on the same axis, held for two report windows,
+  and the metered draw as a "Draw" line on its own right-hand watts axis.
 
-  Three things to expect on a box today. **Only the temperature is charted.**
-  The metered draw ships on `/api/series` as `minisplit_watts` and nothing
-  draws it: the temp card's overlay loop declares no `scale:` on purpose, so
-  every line on that card is drawn to one degree ruler and a draw in watts
-  would autoscale into a flat line. A second unit on a shared card is fine in
-  general — the precipitation card carries pressure that way — but this loop
-  would have to be restructured and the guard that keeps it scale-less
-  relaxed, so the draw is its own card and its own change. See #139. **The draw columns were NULL until
+  Three things to expect on a box today. **The two lines are not comparable by
+  height.** They share a card and not an axis: the temperatures are drawn to
+  the card's degree ruler, and the draw to a zero-anchored watts axis on the
+  right, the way the precipitation card already carries pressure (#42). An
+  overlay on this card is admitted on one of two grounds — it is a temperature
+  in the card's own unit, or it declares its own `scale` — and the footer says
+  which axis the draw is read against, because nothing on the chart does.
+  **The draw columns were NULL until
   parsons-pulse #182 deployed**; on the homelab they began filling 2026-10-30
   11:54 UTC, and a box running an older bridge still stores rows carrying the
   head's temperature and nothing else, which is working rather than broken.
