@@ -378,7 +378,7 @@ def _minisplit_carry_max_age_seconds():
 def _minisplit_on_grid(rows, grid, unit):
     """The mini split's room temperature and metered draw, on the indoor x-grid.
 
-    `rows` is `db.minisplit_readings_since(conn, _MINISPLIT_SERIES_COLUMNS, ...)`
+    `rows` is `db.minisplit_readings_since(conn, DINING, _MINISPLIT_SERIES_COLUMNS, ...)`
     and `grid` is `metrics["temp"]["t"]`, the stamps the indoor temperature
     chart is already drawn against. Returns `(temperature, watts)`, two flat
     lists each exactly as long as `grid` -- the same shape, and for the same
@@ -576,8 +576,11 @@ def create_app(db_path=None):
             # One carry window before `since` as well, and for the identical
             # reason -- the report that was current at the left edge closed
             # before it.
+            # Dining's head only: `minisplit_temp` / `minisplit_watts` predate
+            # the bedroom rows and keep meaning the dining head.
             minisplit_rows = db.minisplit_readings_since(
                 conn,
+                minisplit.DINING,
                 _MINISPLIT_SERIES_COLUMNS,
                 since - timedelta(seconds=_minisplit_carry_max_age_seconds()),
             )
