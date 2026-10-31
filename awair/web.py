@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, minisplit, outdoor, solar, spikes, units, weather_alerts
+from awair import db, minisplit, outdoor, solar, spikes, timing, units, weather_alerts
 from awair.series import bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -529,6 +529,12 @@ def create_app(db_path=None):
     app.config["TEMPERATURE_UNIT"] = units.get_temperature_unit()
 
     _bootstrap_schema(app.config["AWAIR_DB"], app.logger)
+    # One log line and a `Server-Timing` header per request (#141). Installed
+    # here rather than in the unit's gunicorn flags because an access log
+    # cannot say which endpoint served a path, and because the canonical unit
+    # file lives in the homelab repo -- a measurement that needs a second
+    # repo's deploy to turn on is a measurement that does not happen.
+    timing.install(app)
 
     def connect():
         """Read-only, per request. Every view below is query-only."""
