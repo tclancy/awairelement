@@ -4,10 +4,12 @@ The key is the BRIDGE CYCLE's own clock, not the device's power-report window
 and not our poll clock -- see `db.MINISPLIT_COLUMNS_DDL` for why the obvious
 choice was the wrong one.
 
-The table is introduced whole, so it needs no entry in `_migrate` — but it does
-need the two guarantees the older two tables had to be repaired to get: a `ts`
-that cannot be null, and a conflict clause that names its target so a NOT NULL
-violation raises instead of reading as a duplicate (#95, #98).
+Both heads share the table, keyed on `(head, ts)` (the heads scope,
+2026-10-31). A deployed dining-only table is rebuilt into that shape by
+`_migrate_minisplit_heads`. The key keeps the two guarantees the older tables
+had to be repaired to get: neither half can be null, and the conflict clause
+names its target so a NOT NULL violation raises instead of reading as a
+duplicate (#95, #98).
 """
 
 from datetime import UTC, datetime
@@ -23,6 +25,7 @@ RECEIVED = "2026-10-26T07:30:00+00:00"
 def row(ts, **overrides):
     """A full `minisplit_readings` row, so a column addition fails loudly here."""
     base = {
+        "head": "dining",
         "ts": ts,
         "received_at": RECEIVED,
         "window_start": "2026-10-26T07:11:14+00:00",
@@ -32,12 +35,18 @@ def row(ts, **overrides):
         "temp": 15.0,
         "mode": "cool",
         "switch": "on",
+        "setpoint": 10.0,
+        "target": 20.0,
+        "target_source": "schedule",
+        "decision_reason": "in-band",
+        "temperature_at": "2026-10-26T07:20:00+00:00",
+        "raw": None,
     }
     return {**base, **overrides}
 
 
 def test_the_table_exists_after_a_plain_connect(conn):
-    """No migration entry: `CREATE TABLE IF NOT EXISTS` covers both installs."""
+    """A fresh install gets the per-head table straight from `SCHEMA`."""
     names = [
         r[0]
         for r in conn.execute(
@@ -103,7 +112,7 @@ def test_the_range_read_returns_epoch_stamps_ascending(conn):
     ):
         db.insert_minisplit_reading(conn, row(ts))
     rows = db.minisplit_readings_since(
-        conn, ("temp", "delta_wh"), datetime(2026, 10, 26, tzinfo=UTC)
+        conn, "dining", ("temp", "delta_wh"), datetime(2026, 10, 26, tzinfo=UTC)
     )
     assert [r[0] for r in rows] == sorted(r[0] for r in rows)
     assert rows[0][0] == datetime.fromisoformat("2026-10-26T07:11:14+00:00").timestamp()
@@ -121,17 +130,160 @@ def test_the_range_read_is_bounded_by_the_cycle_clock(conn):
         row("2026-10-26T07:24:34+00:00", window_start="2026-10-26T07:11:14+00:00"),
     )
     since = datetime.fromisoformat("2026-10-26T07:20:00+00:00")
-    assert len(db.minisplit_readings_since(conn, ("temp",), since)) == 1
+    assert len(db.minisplit_readings_since(conn, "dining", ("temp",), since)) == 1
     later = datetime.fromisoformat("2026-10-26T07:30:00+00:00")
-    assert db.minisplit_readings_since(conn, ("temp",), later) == []
+    assert db.minisplit_readings_since(conn, "dining", ("temp",), later) == []
 
 
 def test_an_unknown_column_is_refused_rather_than_interpolated(conn):
     """The column names reach the SQL text, so the whitelist is the injection
     boundary as well as a typo guard."""
     with pytest.raises(ValueError, match="unknown mini split columns"):
-        db.minisplit_readings_since(conn, ("temp", "watts"), datetime.now(UTC))
+        db.minisplit_readings_since(
+            conn, "dining", ("temp", "watts"), datetime.now(UTC)
+        )
 
 
 def test_no_row_is_a_shorter_list_not_an_error(conn):
-    assert db.minisplit_readings_since(conn, ("temp",), datetime.now(UTC)) == []
+    assert (
+        db.minisplit_readings_since(conn, "dining", ("temp",), datetime.now(UTC)) == []
+    )
+
+
+def test_the_head_cannot_be_null_either(conn):
+    with pytest.raises(IntegrityError):
+        db.insert_minisplit_reading(conn, row("2026-10-26T07:24:34+00:00", head=None))
+
+
+def test_both_heads_store_the_same_cycle_clock_and_each_dedups_alone(conn):
+    """The dedup is per head: one head's re-read must not shadow the other's."""
+    ts = "2026-10-26T07:24:34+00:00"
+    assert db.insert_minisplit_reading(conn, row(ts))
+    assert db.insert_minisplit_reading(conn, row(ts, head="bedroom"))
+    assert not db.insert_minisplit_reading(conn, row(ts, head="bedroom"))
+    assert conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 2
+
+
+def test_the_range_read_returns_only_the_head_it_is_asked_for(conn):
+    db.insert_minisplit_reading(conn, row("2026-10-26T07:24:34+00:00", temp=15.0))
+    db.insert_minisplit_reading(
+        conn, row("2026-10-26T07:25:00+00:00", head="bedroom", temp=14.0)
+    )
+    since = datetime(2026, 10, 26, tzinfo=UTC)
+    assert [
+        r[1] for r in db.minisplit_readings_since(conn, "dining", ("temp",), since)
+    ] == [15.0]
+    assert [
+        r[1] for r in db.minisplit_readings_since(conn, "bedroom", ("temp",), since)
+    ] == [14.0]
+
+
+def test_the_latest_raw_skips_rows_that_stored_none(conn):
+    db.insert_minisplit_reading(conn, row("2026-10-26T07:20:00+00:00", raw='{"a": 1}'))
+    db.insert_minisplit_reading(conn, row("2026-10-26T07:25:00+00:00", raw=None))
+    db.insert_minisplit_reading(
+        conn, row("2026-10-26T07:30:00+00:00", head="bedroom", raw='{"b": 2}')
+    )
+    assert db.latest_minisplit_raw(conn, "dining") == '{"a": 1}'
+    assert db.latest_minisplit_raw(conn, "bedroom") == '{"b": 2}'
+
+
+# -- the migration from the dining-only table ---------------------------------
+
+LEGACY_DDL = """
+    ts TEXT NOT NULL PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    window_start TEXT,
+    window_close TEXT,
+    delta_wh REAL,
+    watts_spot REAL,
+    temp REAL,
+    mode TEXT,
+    switch TEXT
+"""
+
+
+def legacy_db(path, rows):
+    """A database whose `minisplit_readings` is the table deployed before this."""
+    import sqlite3
+
+    raw = sqlite3.connect(path)
+    raw.execute(f"CREATE TABLE minisplit_readings ({LEGACY_DDL})")
+    raw.executemany(
+        "INSERT INTO minisplit_readings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+    )
+    raw.commit()
+    raw.close()
+
+
+LEGACY_ROWS = [
+    ("2026-10-30T10:00:00+00:00", RECEIVED, None, None, None, None, 18.0, "heat", "on"),
+    ("2026-10-30T10:05:00+00:00", RECEIVED, "a", "b", 5.0, 30.0, 18.5, "heat", "on"),
+]
+
+
+def test_a_deployed_dining_table_is_rebuilt_with_every_row_as_dining(tmp_path):
+    path = tmp_path / "legacy.db"
+    legacy_db(path, LEGACY_ROWS)
+    conn = db.connect(path)
+    try:
+        physical = tuple(
+            r[1] for r in conn.execute("PRAGMA table_info(minisplit_readings)")
+        )
+        assert physical == db.MINISPLIT_COLUMNS
+        legacy = ", ".join(db.MINISPLIT_LEGACY_COLUMNS)
+        stored = conn.execute(
+            f"SELECT head, {legacy} FROM minisplit_readings ORDER BY ts"
+        ).fetchall()
+        assert stored == [("dining", *r) for r in LEGACY_ROWS]
+        # And the new key is live on the migrated table.
+        assert db.insert_minisplit_reading(conn, row(LEGACY_ROWS[0][0], head="bedroom"))
+        assert not db.insert_minisplit_reading(conn, row(LEGACY_ROWS[0][0]))
+    finally:
+        conn.close()
+
+
+def test_a_migrated_table_is_the_same_table_as_a_fresh_one(tmp_path):
+    legacy_db(tmp_path / "legacy.db", LEGACY_ROWS)
+    migrated = db.connect(tmp_path / "legacy.db")
+    fresh = db.connect(tmp_path / "fresh.db")
+    try:
+        # Name, type, NOT NULL, default and key position of every column. Not
+        # the stored CREATE text: a RENAME quotes the table name in it.
+        shape = "PRAGMA table_info(minisplit_readings)"
+        assert migrated.execute(shape).fetchall() == fresh.execute(shape).fetchall()
+    finally:
+        migrated.close()
+        fresh.close()
+
+
+def test_the_migration_runs_once(tmp_path):
+    """A second connect finds the table already re-keyed and leaves it be."""
+    path = tmp_path / "legacy.db"
+    legacy_db(path, LEGACY_ROWS)
+    db.connect(path).close()
+    conn = db.connect(path)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 2
+        )
+    finally:
+        conn.close()
+
+
+def test_a_column_the_rebuild_does_not_know_refuses_rather_than_dropping(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    legacy_db(path, LEGACY_ROWS)
+    raw = sqlite3.connect(path)
+    raw.execute("ALTER TABLE minisplit_readings ADD COLUMN mystery TEXT")
+    raw.commit()
+    raw.close()
+    with pytest.raises(sqlite3.OperationalError, match="mystery"):
+        db.connect(path)
+    raw = sqlite3.connect(path)
+    try:
+        assert raw.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 2
+    finally:
+        raw.close()

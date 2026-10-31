@@ -18,29 +18,25 @@ going down cannot wedge the others:
 
 - **Outdoor** (`awair.outdoor`) — Open-Meteo weather and air quality every
   15 minutes, plus NWS alerts for the parcel. Needs `AWAIR_LAT` / `AWAIR_LON`.
-- **Mini split** (`awair.minisplit`) — the dining room Samsung head's own room
-  temperature and metered power draw, read from the parsons-pulse climate
-  bridge's loopback `/status` (#139). One row per bridge *cycle*, keyed on the
-  cycle's own clock rather than on our poll clock. Loopback-only, so it runs on
-  the bridge's box or not at all. The head's temperature is drawn on the temp
-  card as a "Mini split" line on the same axis, held for two report windows.
+- **Mini split** (`awair.minisplit`) — both Samsung heads, dining and bedroom,
+  read from the parsons-pulse climate bridge's loopback `/status` (#139; the
+  heads scope, `docs/superpowers/specs/2026-10-31-minisplit-heads-scope.md`).
+  Each row is one head's bridge *cycle*, keyed on `(head, ts)` with `ts` the
+  cycle's own clock. It carries the head's temperature, metered draw, setpoint
+  and the cycle's target (both in °C), and the head's raw SmartThings status as
+  JSON, stored only when a value in it changes. Loopback-only, so it runs on the
+  bridge's box or not at all. The dining head's temperature is drawn on the
+  temp card as a "Mini split" line on the same axis, held for two report
+  windows; its metered draw is not charted yet (it needs an axis of its own —
+  see #139).
 
-  Three things to expect on a box today. **Only the temperature is charted.**
-  The metered draw ships on `/api/series` as `minisplit_watts` and nothing
-  draws it: the temp card's overlay loop declares no `scale:` on purpose, so
-  every line on that card is drawn to one degree ruler and a draw in watts
-  would autoscale into a flat line. A second unit on a shared card is fine in
-  general — the precipitation card carries pressure that way — but this loop
-  would have to be restructured and the guard that keeps it scale-less
-  relaxed, so the draw is its own card and its own change. See #139. **The draw columns were NULL until
-  parsons-pulse #182 deployed**; on the homelab they began filling 2026-10-30
-  11:54 UTC, and a box running an older bridge still stores rows carrying the
-  head's temperature and nothing else, which is working rather than broken.
-  And **this feed has no health escalation**: unlike the outdoor poller it
-  opens no alert event and sends no ntfy, so a bridge that stops answering
-  shows up only as `error` lines in `journalctl --user -u
-  awairelement-minisplit`. Deliberate for a first cut, and the reason the log
-  line is worth watching after a deploy.
+  Two things to expect. **A bedroom zone configured off logs `bedroom unkeyed`
+  every poll**, which is the bridge publishing `bedroom: null`, not a fault.
+  And **this feed has no health
+  escalation**: unlike the outdoor poller it opens no alert event and sends no
+  ntfy, so a bridge that stops answering shows up only as `error` lines in
+  `journalctl --user -u awairelement-minisplit`. Deliberate for a first cut,
+  and the reason the log line is worth watching after a deploy.
 - **Basement** (`awair.basement`) — the basement ESPHome sensor's temperature
   every 60 s, from `AWAIR_BASEMENT_URL` (default
   `http://192.168.68.50/sensor/Temperature`). The payload has **no clock**, so
@@ -119,6 +115,7 @@ omitted entirely to run without alerts.
 | `AWAIR_PM25_NEAR_MISS` | `50` | pm25 at or above which a watchpoint line is logged. Behaviour-neutral. |
 | `AWAIR_MINISPLIT_URL` | `http://127.0.0.1:8100/status` | The parsons-pulse climate bridge's status endpoint. Loopback-only, so the mini split poller has to run on the bridge's box. |
 | `AWAIR_MINISPLIT_POLL_SECONDS` | `300` | Seconds between mini split polls. The bridge's own control cycle — polling faster re-reads one report window. |
+| `AWAIR_WEB_SLOW_MS` | `1000` | Dashboard requests at or above this many milliseconds log at `WARNING` instead of `INFO`. See [Response times](#response-times). |
 
 To disable ntfy entirely, leave `AWAIR_NTFY_TOKEN` unset and pick a topic
 nobody's listening on — the poller will still POST but no one will see the
@@ -466,6 +463,79 @@ two that stores a reading (after the 60s rate limit).
 To have the units start at boot rather than only after login, run
 `loginctl enable-linger $USER` once.
 
+## Response times
+
+Every dashboard request logs one line and carries a `Server-Timing` header
+(#141). Before this there was nothing to look at: gunicorn runs without
+`--access-logfile`, so the journal held worker lifecycle lines and not one
+request, and "is it slow?" was unanswerable on the record.
+
+```
+[2026-10-30 11:10:34,305] WARNING in timing: request GET /api/series?range=30d status=200 dur_ms=229.2 bytes=511567 endpoint=series
+```
+
+The path carries its **query string**, because that is what the duration
+varies with — `/api/series` is 40x slower at `?range=30d` than at `?range=today`.
+
+```bash
+# Everything slow today. Grep the level, do NOT use `journalctl -p warning`:
+# systemd stamps every line captured from a process's stderr with the same
+# priority, so the Python level survives only as text in the message.
+journalctl --user -u awairelement-web --since today -o cat | grep 'WARNING in timing'
+
+# The three slowest samples per path today, grouped by path.
+journalctl --user -u awairelement-web --since today -o cat |
+  sed -n 's/.*request [A-Z]* \([^ ]*\) .*dur_ms=\([0-9.]*\) .*/\2 \1/p' |
+  sort -k2,2 -k1,1gr |
+  awk '$2 != p { p = $2; n = 0 } n++ < 3 { printf "%-34s %8.1f ms\n", $2, $1 }'
+```
+
+`AWAIR_WEB_SLOW_MS` moves the `WARNING` threshold. The tier exists because
+`WARNING` clears Python's default effective level on its own, so the one line
+nobody can afford to lose survives a future edit undoing the `INFO`
+configuration in `awair/timing.py`
+(`tests/test_web_timing.py::test_a_slow_line_survives_an_operator_resetting_the_level`).
+
+### What the numbers mean, measured
+
+`docs/verification/response_time_probe.py` times every request the page makes,
+against a real database. Run on the homelab, 2026-10-30, 319,836 readings in a
+56 MB file:
+
+| request | range | p50 | body |
+|---|---|---|---|
+| document (`/`) | — | 0.2 ms | 11 KB |
+| three static assets | — | 0.2 ms each | 80 KB total |
+| `/api/series` | today | 7.9 ms | 115 KB |
+| `/api/series` | 7d | 70 ms | 344 KB |
+| `/api/series` | **30d** | **308 ms** | **500 KB** |
+| `/api/outdoor-series` | 30d | 8.3 ms | 55 KB |
+| `/api/events` | 30d | 0.7 ms | 11 KB |
+| every unranged `/api/*` | — | 0.4 ms | < 1 KB |
+
+So on a quiet box the server is not the delay. **Two costs sit outside what
+any in-app timer can see**, and both are named in `awair/timing.py`:
+
+- **Waiting for a worker.** The unit runs `gunicorn -w 2` with *sync* workers,
+  so two requests are served at a time, and `dashboard.js` fires three `/api/*`
+  fetches at once after the browser has already asked for the document and
+  three static assets. A queued request's timer does not start until it stops
+  queueing, and nothing in the WSGI environ carries an arrival stamp. **The
+  browser's TTFB minus `Server-Timing: app` is that wait** — which is the
+  reason for the header.
+- **Transfer.** 500 KB of JSON over wifi, plus the client-side parse and the
+  uPlot draw, is a wait the server attributes to nobody.
+
+### Caching the rendered HTML
+
+Proposed on #141, and measured rather than argued: `/` touches no database
+(`tests/test_web_readonly.py::test_dashboard_renders_without_touching_the_database`)
+and every one of its six template arguments is a process constant, so caching
+the render at startup is **safe**. It is also worth **0.05 ms** — the whole
+Jinja render, measured by the probe above, on the box. Jinja already caches the
+*compiled* template; what a cache would remove is only the interpolation. The
+500 KB JSON body beside it is four orders of magnitude more expensive.
+
 ## Development
 
 ```bash
@@ -489,9 +559,10 @@ awair/
 ├── monitor.py   # device health checks (unreachable, stale)
 ├── alerts.py    # ntfy client
 ├── series.py    # server-side bucketing for the dashboard
-├── minisplit.py # the mini split feed: one row per power-report window
+├── minisplit.py # the mini split feed: one row per head per bridge cycle
 ├── basement.py  # the basement ESPHome sensor: one row per poll-minute
 ├── units.py     # temperature conversion, in both directions
+├── timing.py    # one log line + a Server-Timing header per web request
 └── web.py       # Flask app + JSON endpoints
 ```
 

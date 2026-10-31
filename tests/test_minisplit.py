@@ -337,15 +337,15 @@ def test_zero_energy_over_a_real_window_is_zero_watts_not_unknown():
 
 def test_a_fresh_window_inserts_and_a_re_read_of_it_is_a_duplicate(conn):
     """Most polls are this: the bridge cycles faster than the device reports."""
-    assert minisplit.poll_once(conn, fetcher(STATUS)) == "inserted"
-    assert minisplit.poll_once(conn, fetcher(STATUS)) == "duplicate"
+    assert minisplit.poll_once(conn, fetcher(STATUS))["dining"] == "inserted"
+    assert minisplit.poll_once(conn, fetcher(STATUS))["dining"] == "duplicate"
     assert conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 1
 
 
 def test_a_later_cycle_inserts_beside_the_earlier_one(conn):
-    assert minisplit.poll_once(conn, fetcher(STATUS)) == "inserted"
+    assert minisplit.poll_once(conn, fetcher(STATUS))["dining"] == "inserted"
     later = at_cycle("2026-10-26T07:30:00+00:00")
-    assert minisplit.poll_once(conn, fetcher(later)) == "inserted"
+    assert minisplit.poll_once(conn, fetcher(later))["dining"] == "inserted"
     stored = [row[0] for row in conn.execute("SELECT ts FROM minisplit_readings")]
     assert stored == ["2026-10-26T07:25:00+00:00", "2026-10-26T07:30:00+00:00"]
 
@@ -353,13 +353,16 @@ def test_a_later_cycle_inserts_beside_the_earlier_one(conn):
 def test_a_bridge_with_no_cycle_yet_reports_unkeyed_not_error(conn):
     """'unkeyed' is a state to wait through -- a restart, or a 429 backoff."""
     no_cycle = {**STATUS, "head": None, "last_decision": None}
-    assert minisplit.poll_once(conn, fetcher(no_cycle)) == "unkeyed"
+    assert minisplit.poll_once(conn, fetcher(no_cycle))["dining"] == "unkeyed"
     assert conn.execute("SELECT COUNT(*) FROM minisplit_readings").fetchone()[0] == 0
 
 
 def test_the_deployed_bridge_stores_a_row_rather_than_reporting_unkeyed(conn):
     """The feed is useful before its dependency lands, not inert until then."""
-    assert minisplit.poll_once(conn, fetcher(DEPLOYED_BRIDGE_STATUS)) == "inserted"
+    assert (
+        minisplit.poll_once(conn, fetcher(DEPLOYED_BRIDGE_STATUS))["dining"]
+        == "inserted"
+    )
     stored = conn.execute(
         "SELECT ts, temp, delta_wh FROM minisplit_readings"
     ).fetchall()
@@ -377,9 +380,9 @@ def test_the_deployed_bridge_stores_a_row_rather_than_reporting_unkeyed(conn):
     ],
 )
 def test_one_bad_poll_costs_one_poll_and_never_the_service(conn, fetch):
-    assert minisplit.poll_once(conn, fetch) == "error"
+    assert minisplit.poll_once(conn, fetch)["dining"] == "error"
     # And the loop can carry straight on into a good payload.
-    assert minisplit.poll_once(conn, fetcher(STATUS)) == "inserted"
+    assert minisplit.poll_once(conn, fetcher(STATUS))["dining"] == "inserted"
 
 
 def test_an_insert_failure_is_reported_rather_than_unwinding_the_loop(
@@ -396,7 +399,7 @@ def test_an_insert_failure_is_reported_rather_than_unwinding_the_loop(
         raise db.sqlite3.ProgrammingError("unsupported type")
 
     monkeypatch.setattr(db, "insert_minisplit_reading", boom)
-    assert minisplit.poll_once(conn, fetcher(STATUS)) == "error"
+    assert minisplit.poll_once(conn, fetcher(STATUS))["dining"] == "error"
 
 
 def test_the_fetch_url_and_timeout_are_the_bridges_loopback_contract(monkeypatch):
@@ -516,3 +519,156 @@ def test_a_negative_energy_has_no_mean_rather_than_a_negative_draw(delta_wh):
         )
         is None
     )
+
+
+# -- both heads (the heads scope, 2026-10-31) ---------------------------------
+
+
+def smartthings(setpoint_unit="F", humidity=30, at="2026-10-31T16:54:05.403Z"):
+    """A cut-down `head.raw`: the attributes this feed reads, plus one it keeps."""
+    return {
+        "components": {
+            "main": {
+                "thermostatCoolingSetpoint": {
+                    "coolingSetpoint": {
+                        "value": 55,
+                        "unit": setpoint_unit,
+                        "timestamp": at,
+                    }
+                },
+                "relativeHumidityMeasurement": {
+                    "humidity": {"value": humidity, "unit": "%", "timestamp": at}
+                },
+            }
+        }
+    }
+
+
+def zone(at="2026-10-31T17:01:03+00:00", target=55.0, raw=None, **head):
+    return {
+        "target": {"value": 99.0, "source": "schedule"},  # request-time: never stored
+        "last_decision": {
+            "at": at,
+            "reason": "step",
+            "target": {"value": target, "source": "schedule"},
+        },
+        "head": {
+            "power": "on",
+            "mode": "heat",
+            "setpoint": 55.0,
+            "temperature": 57.0,
+            "temperature_at": "2026-10-31T14:38:20.870000+00:00",
+            "raw": smartthings() if raw is None else raw,
+            **head,
+        },
+    }
+
+
+def body(bedroom=..., **dining):
+    """A whole `/status`: dining at the top level, the bedroom under its key."""
+    top = {**STATUS, **dining}
+    top["bedroom"] = zone() if bedroom is ... else bedroom
+    return top
+
+
+def stored(conn, *columns):
+    return conn.execute(
+        f"SELECT head, {', '.join(columns)} FROM minisplit_readings ORDER BY head, ts"
+    ).fetchall()
+
+
+def test_one_poll_stores_a_row_for_each_head(conn):
+    assert minisplit.poll_once(conn, fetcher(body())) == {
+        "dining": "inserted",
+        "bedroom": "inserted",
+    }
+    assert stored(conn, "ts", "temp") == [
+        ("bedroom", "2026-10-31T17:01:03+00:00", 13.89),
+        ("dining", "2026-10-26T07:25:00+00:00", 15.0),
+    ]
+
+
+@pytest.mark.parametrize("payload", [body(bedroom=None), STATUS])
+def test_a_bedroom_zone_that_is_off_is_unkeyed_and_dining_still_stores(conn, payload):
+    """`bedroom: null` (zone off) and no key at all (a pre-ADR-025 bridge)."""
+    assert minisplit.poll_once(conn, fetcher(payload)) == {
+        "dining": "inserted",
+        "bedroom": "unkeyed",
+    }
+
+
+def test_a_broken_bedroom_block_costs_the_bedroom_row_and_not_dinings(conn):
+    broken = {"last_decision": {"at": "2026-10-31T17:01:03+00:00"}, "head": "garbage"}
+    assert minisplit.poll_once(conn, fetcher(body(bedroom=broken))) == {
+        "dining": "inserted",
+        "bedroom": "error",
+    }
+
+
+def test_a_failed_fetch_is_an_error_for_both_heads(conn):
+    assert minisplit.poll_once(conn, lambda: "not json") == {
+        "dining": "error",
+        "bedroom": "error",
+    }
+
+
+def test_dinings_zone_block_never_carries_the_bedroom():
+    [(_, dining), (_, bedroom)] = minisplit.zones(body())
+    assert "bedroom" not in dining
+    assert bedroom == zone()
+
+
+def test_the_setpoint_is_stored_in_celsius_when_the_head_says_fahrenheit():
+    row = minisplit.parse_reading(zone(), RECEIVED, "bedroom")
+    assert row["setpoint"] == 12.78
+
+
+@pytest.mark.parametrize("raw", [smartthings(setpoint_unit="C"), {}, "not an object"])
+def test_a_setpoint_whose_unit_is_not_fahrenheit_or_unknown_is_null(raw):
+    """The bridge does not gate the setpoint's unit, so this feed must."""
+    assert (
+        minisplit.parse_reading(zone(raw=raw), RECEIVED, "bedroom")["setpoint"] is None
+    )
+
+
+def test_the_target_is_the_cycles_own_not_the_request_time_one():
+    row = minisplit.parse_reading(zone(target=64.0), RECEIVED, "bedroom")
+    assert (row["target"], row["target_source"]) == (17.78, "schedule")
+    assert row["decision_reason"] == "step"
+
+
+def test_a_bridge_with_no_cycle_target_stores_null_rather_than_the_request_time_one():
+    row = minisplit.parse_reading(STATUS, RECEIVED)
+    assert (row["target"], row["target_source"]) == (None, None)
+
+
+def test_the_temperature_stamp_is_normalised_to_utc():
+    stamp = "2026-10-31T10:38:20-04:00"
+    row = minisplit.parse_reading(zone(temperature_at=stamp), RECEIVED, "bedroom")
+    assert row["temperature_at"] == "2026-10-31T14:38:20+00:00"
+
+
+def test_raw_is_stored_when_it_changes_and_not_when_only_its_stamps_do(conn):
+    def poll(at, raw):
+        minisplit.poll_once(conn, fetcher(body(bedroom=zone(at=at, raw=raw))))
+
+    poll("2026-10-31T17:00:00+00:00", smartthings(humidity=30))
+    poll(
+        "2026-10-31T17:05:00+00:00", smartthings(humidity=30, at="2026-10-31T17:04:00Z")
+    )
+    poll("2026-10-31T17:10:00+00:00", smartthings(humidity=29))
+    rows = conn.execute(
+        "SELECT raw FROM minisplit_readings WHERE head = 'bedroom' ORDER BY ts"
+    ).fetchall()
+    first, unchanged, changed = (row[0] for row in rows)
+    assert json.loads(first) == smartthings(humidity=30)
+    assert unchanged is None
+    assert json.loads(changed) == smartthings(humidity=29)
+
+
+def test_a_bridge_without_raw_stores_the_row_with_null_raw():
+    """A rollback to a bridge predating `head.raw` must not cost the row."""
+    old = zone()
+    del old["head"]["raw"]
+    row = minisplit.parse_reading(old, RECEIVED, "bedroom")
+    assert row["raw"] is None and row["temp"] == 13.89
