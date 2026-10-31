@@ -1956,7 +1956,7 @@ def test_every_outdoor_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
 # the other a draw in watts that cannot.
 
 
-def _seed_minisplit(db_path, samples):
+def _seed_minisplit(db_path, samples, head="dining"):
     """samples: [(cycle_at, start_or_None, delta_wh, celsius, spot_watts)].
 
     `cycle_at` is the row's key — the bridge cycle that read the head. The
@@ -1967,6 +1967,7 @@ def _seed_minisplit(db_path, samples):
         db.insert_minisplit_reading(
             conn,
             {
+                "head": head,
                 "ts": cycle_at.isoformat(),
                 "received_at": cycle_at.isoformat(),
                 "window_start": None if start is None else start.isoformat(),
@@ -1976,6 +1977,12 @@ def _seed_minisplit(db_path, samples):
                 "temp": celsius,
                 "mode": "cool",
                 "switch": "on",
+                "setpoint": None,
+                "target": None,
+                "target_source": None,
+                "decision_reason": None,
+                "temperature_at": None,
+                "raw": None,
             },
         )
     conn.close()
@@ -1997,6 +2004,16 @@ def test_series_ships_both_mini_split_traces_on_the_indoor_temp_grid(client, tmp
     assert len(payload["minisplit_temp"]) == len(grid)
     assert len(payload["minisplit_watts"]) == len(grid)
     assert payload["minisplit_watts_unit"] == "W"
+
+
+def test_the_bedroom_heads_rows_never_reach_the_dining_traces(client, tmp_path):
+    """`minisplit_temp` and `minisplit_watts` keep meaning the dining head."""
+    now = datetime.now(UTC)
+    _seed_minisplit(tmp_path / "web.db", _one_window(now), head="bedroom")
+    payload = client.get("/api/series?range=7d").get_json()
+    assert payload["metrics"]["temp"]["t"], "fixture has no grid to align against"
+    assert set(payload["minisplit_temp"]) == {None}
+    assert set(payload["minisplit_watts"]) == {None}
 
 
 def test_the_draw_on_the_chart_is_the_metered_mean_not_the_spot_reading(

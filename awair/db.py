@@ -136,10 +136,10 @@ SCHEMA += (
 )
 
 # The mini split column list (#139), same one-definition rule as
-# `OUTDOOR_COLUMNS_DDL` above -- though only `SCHEMA` creates this table today,
-# because a table introduced whole needs no rebuild migration.
+# `OUTDOOR_COLUMNS_DDL` above: `SCHEMA` creates the table on a fresh install
+# and `_rebuild_minisplit_readings` on a deployed one.
 #
-# `ts` is the BRIDGE CYCLE's own clock (`/status`'s `last_decision.at`), not our
+# `ts` is the head's BRIDGE CYCLE's own clock (`/status`'s `last_decision.at`), not our
 # poll clock and not the device's power-report window. That choice is the one
 # worth reading the rest of this comment for.
 #
@@ -157,10 +157,6 @@ SCHEMA += (
 # re-poll inside one cycle still writes nothing, which is the whole of what the
 # dedup is for.
 #
-# `ts TEXT NOT NULL PRIMARY KEY` for the #98 reason spelled out above -- a
-# non-INTEGER primary key gets no implicit NOT NULL, and two null-`ts` rows
-# would both insert.
-#
 # `temp` is CELSIUS, like every other temperature column in this database, and
 # the bridge publishes FAHRENHEIT (`climatesidecar.devices.BRIDGE_UNIT`). The
 # conversion happens once, at ingest, in `minisplit.parse_reading` -- see that
@@ -172,11 +168,27 @@ SCHEMA += (
 # and the bridge's own `HeadState` docstring names that confusion as the reason
 # it keeps the two apart. See GLOSSARY.md: `switch`.
 #
-# No `setpoint`. It is the bridge's control value in Fahrenheit, parsons-pulse
-# is its system of record, and a second temperature in a second unit in this
-# database is the silent-30-degree trap the `temp` note above exists to avoid.
+# `setpoint` and `target` ARE stored now (the heads scope, 2026-10-31), and in
+# CELSIUS like `temp`: the trap this comment used to cite as the reason for
+# leaving the setpoint out is a second unit, not a second temperature, and
+# converting at ingest closes it. `setpoint` is converted only when the head's
+# own raw status says it is in F -- the bridge does not gate the setpoint's
+# unit, so a missing or other unit stores null rather than a guess.
+#
+# Both heads share the table, told apart by `head` ('dining', 'bedroom'), and
+# the key is `(head, ts)`: each head re-publishes its own cycle until its next
+# one, so the dedup has to work per head. NOT NULL on both is spelled out for
+# the #98 reason -- a non-INTEGER primary key gets no implicit NOT NULL, and a
+# composite one is no exception.
+#
+# `raw` is the head's SmartThings status body as the bridge publishes it
+# (`head.raw`), JSON text, stored only when it differs from that head's last
+# stored body once per-attribute timestamps are ignored -- see
+# `minisplit.raw_to_store`. Measured 2026-10-31 at about 13.7 KB a head. It is
+# never served: the web surface has no authentication.
 MINISPLIT_COLUMNS_DDL = """
-    ts TEXT NOT NULL PRIMARY KEY,
+    head TEXT NOT NULL,
+    ts TEXT NOT NULL,
     received_at TEXT NOT NULL,
     window_start TEXT,
     window_close TEXT,
@@ -184,14 +196,37 @@ MINISPLIT_COLUMNS_DDL = """
     watts_spot REAL,
     temp REAL,
     mode TEXT,
-    switch TEXT
+    switch TEXT,
+    setpoint REAL,
+    target REAL,
+    target_source TEXT,
+    decision_reason TEXT,
+    temperature_at TEXT,
+    raw TEXT,
+    PRIMARY KEY (head, ts)
 """
+
+# The table as deployed before the heads scope: dining only, keyed on `ts`.
+# `_rebuild_minisplit_readings` copies exactly these across, as `head =
+# 'dining'`, which is every row that table ever held.
+MINISPLIT_LEGACY_COLUMNS = (
+    "ts",
+    "received_at",
+    "window_start",
+    "window_close",
+    "delta_wh",
+    "watts_spot",
+    "temp",
+    "mode",
+    "switch",
+)
 
 SCHEMA += (
     "\nCREATE TABLE IF NOT EXISTS minisplit_readings (" + MINISPLIT_COLUMNS_DDL + ");\n"
 )
 
 MINISPLIT_COLUMNS = (
+    "head",
     "ts",
     "received_at",
     # The power-report window's own bounds, as the device published them. Both
@@ -216,6 +251,15 @@ MINISPLIT_COLUMNS = (
     "temp",
     "mode",
     "switch",
+    "setpoint",
+    "target",
+    "target_source",
+    # `last_decision.reason`: why the bridge did what it did that cycle.
+    "decision_reason",
+    # When the head last reported `temp` (SmartThings restamps only on change,
+    # so an old stamp on a running head is a steady room, not a stale reading).
+    "temperature_at",
+    "raw",
 )
 
 # The basement ESPHome sensor (`awair.basement`). Its payload carries NO clock,
@@ -520,6 +564,69 @@ def _migrate(conn) -> None:
     # OUTDOOR_COLUMNS, so it has to run after the ALTERs that add them. On a
     # pre-#71 DB the reverse order fails on "no such column: weather_code".
     _migrate_outdoor_ts_not_null(conn)
+    # Independent of the outdoor work above; after it only so the outdoor
+    # comment's "last" stays true of the outdoor ALTERs.
+    _migrate_minisplit_heads(conn)
+
+
+def _minisplit_is_legacy(conn) -> bool:
+    """True while `minisplit_readings` is the dining-only, `ts`-keyed table."""
+    return not any(
+        row[1] == "head"
+        for row in conn.execute("PRAGMA table_info(minisplit_readings)")
+    )
+
+
+def _rebuild_minisplit_readings(conn) -> None:
+    """Re-key `minisplit_readings` on `(head, ts)`. Caller owns the transaction.
+
+    Unlike `_rebuild_outdoor_readings`, which copies the NEW column list, this
+    copies the OLD one plus a literal head: the new columns do not exist on the
+    table being copied from. Every legacy row is dining's -- it was the only
+    head this table ever recorded.
+    """
+    present = [row[1] for row in conn.execute("PRAGMA table_info(minisplit_readings)")]
+    surplus = [name for name in present if name not in MINISPLIT_LEGACY_COLUMNS]
+    if surplus:
+        # Same refusal, same reason, as the outdoor rebuild: a column this code
+        # does not know would go over the side with the DROP.
+        raise sqlite3.OperationalError(
+            "refusing to rebuild minisplit_readings: it carries column(s) "
+            f"{surplus} that this version of db.py does not know about"
+        )
+    legacy = ", ".join(MINISPLIT_LEGACY_COLUMNS)
+    conn.execute("DROP TABLE IF EXISTS minisplit_readings_rebuilt")
+    conn.execute(f"CREATE TABLE minisplit_readings_rebuilt ({MINISPLIT_COLUMNS_DDL})")
+    conn.execute(
+        f"INSERT INTO minisplit_readings_rebuilt (head, {legacy})"
+        f" SELECT 'dining', {legacy} FROM minisplit_readings"
+    )
+    conn.execute("DROP TABLE minisplit_readings")
+    conn.execute("ALTER TABLE minisplit_readings_rebuilt RENAME TO minisplit_readings")
+
+
+def _migrate_minisplit_heads(conn) -> None:
+    """Give a deployed `minisplit_readings` its `head` column and composite key.
+
+    A primary key cannot be altered in SQLite, so this is a rebuild, under
+    `BEGIN IMMEDIATE` with a re-check inside it for the race
+    `_migrate_outdoor_ts_not_null` describes: several processes run `connect()`
+    after a restart, and only one of them may rebuild.
+    """
+    if not _minisplit_is_legacy(conn):
+        return
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _minisplit_is_legacy(conn):
+            conn.rollback()  # another process rebuilt while we waited
+            return
+        _rebuild_minisplit_readings(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _add_column(conn, table: str, column_def: str) -> None:
@@ -740,7 +847,7 @@ def outdoor_readings_since(conn, columns, since) -> list:
 
 
 def insert_minisplit_reading(conn: sqlite3.Connection, reading: dict) -> bool:
-    """Insert one mini split reading. False if this report window is stored.
+    """Insert one head's reading. False if that head's cycle is already stored.
 
     `ts` is the head's own power-report window close (#139), so this is the
     same idempotency the two older pollers have and it does more work here: the
@@ -761,7 +868,7 @@ def insert_minisplit_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     try:
         cursor = conn.execute(
             f"INSERT INTO minisplit_readings ({', '.join(MINISPLIT_COLUMNS)})"
-            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            f" VALUES ({placeholders}) ON CONFLICT(head, ts) DO NOTHING",
             reading,
         )
     except sqlite3.Error:
@@ -806,8 +913,18 @@ def basement_readings_since(conn, since) -> list:
     return [(datetime.fromisoformat(ts).timestamp(), temp) for ts, temp in rows]
 
 
-def minisplit_readings_since(conn, columns, since) -> list:
-    """[(epoch_seconds, col1, col2, ...)] ascending for mini split columns.
+def latest_minisplit_raw(conn, head: str) -> str | None:
+    """The most recent `raw` stored for `head`, or None if none ever was."""
+    row = conn.execute(
+        "SELECT raw FROM minisplit_readings WHERE head = ? AND raw IS NOT NULL"
+        " ORDER BY ts DESC LIMIT 1",
+        (head,),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def minisplit_readings_since(conn, head, columns, since) -> list:
+    """[(epoch_seconds, col1, col2, ...)] ascending for one head's columns.
 
     `since` is compared against `ts`, the report window's close, so a window
     that OPENED before `since` and closed inside it is included and a window
@@ -820,8 +937,8 @@ def minisplit_readings_since(conn, columns, since) -> list:
         raise ValueError(f"unknown mini split columns {unknown}")
     rows = conn.execute(
         f"SELECT ts, {', '.join(columns)} FROM minisplit_readings"
-        f" WHERE ts >= ? ORDER BY ts",
-        (since.isoformat(),),
+        f" WHERE head = ? AND ts >= ? ORDER BY ts",
+        (head, since.isoformat()),
     )
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
