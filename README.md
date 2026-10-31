@@ -18,16 +18,18 @@ going down cannot wedge the others:
 
 - **Outdoor** (`awair.outdoor`) — Open-Meteo weather and air quality every
   15 minutes, plus NWS alerts for the parcel. Needs `AWAIR_LAT` / `AWAIR_LON`.
-- **Mini split** (`awair.minisplit`) — the dining room Samsung head's own room
-  temperature and metered power draw, read from the parsons-pulse climate
-  bridge's loopback `/status` (#139). One row per bridge *cycle*, keyed on the
-  cycle's own clock rather than on our poll clock. Loopback-only, so it runs on
-  the bridge's box or not at all.
+- **Mini split** (`awair.minisplit`) — both Samsung heads, dining and bedroom,
+  read from the parsons-pulse climate bridge's loopback `/status` (#139; the
+  heads scope, `docs/superpowers/specs/2026-10-31-minisplit-heads-scope.md`).
+  Each row is one head's bridge *cycle*, keyed on `(head, ts)` with `ts` the
+  cycle's own clock. It carries the head's temperature, metered draw, setpoint
+  and the cycle's target (both in °C), and the head's raw SmartThings status as
+  JSON, stored only when a value in it changes. Loopback-only, so it runs on the
+  bridge's box or not at all.
 
-  Two things to expect on a box today. **The draw columns stay NULL until
-  parsons-pulse #182 is merged and deployed** — the bridge before it publishes
-  no `watts`/`deltaEnergy` at all, so rows carry the head's temperature and
-  nothing else; that is working, not broken. And **this feed has no health
+  Two things to expect. **A bedroom zone configured off logs `bedroom unkeyed`
+  every poll**, which is the bridge publishing `bedroom: null`, not a fault.
+  And **this feed has no health
   escalation**: unlike the outdoor poller it opens no alert event and sends no
   ntfy, so a bridge that stops answering shows up only as `error` lines in
   `journalctl --user -u awairelement-minisplit`. Deliberate for a first cut,
@@ -554,7 +556,7 @@ awair/
 ├── monitor.py   # device health checks (unreachable, stale)
 ├── alerts.py    # ntfy client
 ├── series.py    # server-side bucketing for the dashboard
-├── minisplit.py # the mini split feed: one row per power-report window
+├── minisplit.py # the mini split feed: one row per head per bridge cycle
 ├── basement.py  # the basement ESPHome sensor: one row per poll-minute
 ├── units.py     # temperature conversion, in both directions
 ├── timing.py    # one log line + a Server-Timing header per web request
