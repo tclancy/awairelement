@@ -783,15 +783,107 @@ const METRICS = {
     card.querySelector(".now").textContent = nowText;
   }
 
+  // The Bedroom card's temperature lines, in draw order (scope 2026-10-31,
+  // step 4). `trace` is the `/api/bedroom-series` key -- not `payload`, which
+  // is the `/api/series` contract `TEMP_OVERLAYS` entries are checked against. All three share the
+  // card's degree axis because they are one quantity in one unit; the draw is
+  // pushed separately below because it is not. The server has already nulled
+  // the head temperature for a long-off head and broken every line at a gap,
+  // so nothing here decides what a stale reading means.
+  const BEDROOM_SERIES = [
+    { trace: "temp", label: "Head", colorVar: "--series-minisplit-temp", width: 2 },
+    { trace: "setpoint", label: "Setpoint", colorVar: "--series-bedroom-setpoint", width: 1.5, dash: [5, 3] },
+    { trace: "target", label: "Target", colorVar: "--series-bedroom-target", width: 1.5, dash: [1, 3] },
+  ];
+
+  function makeBedroomPlot(card, payload) {
+    const plotEl = card.querySelector(".plot");
+    plotEl.innerHTML = "";
+    const tempUnit = payload.temp_unit_symbol;
+    const axisStyle = {
+      stroke: cssVar("--ink-muted"),
+      grid: { stroke: cssVar("--grid"), width: 1 },
+      ticks: { stroke: cssVar("--axis"), width: 1 },
+      font: "11px system-ui, sans-serif",
+    };
+    const seriesConfig = [{ value: "{M}/{D} {h}:{mm}{aa}" }];
+    const data = [payload.t];
+    for (const line of BEDROOM_SERIES) {
+      seriesConfig.push({
+        label: line.label,
+        stroke: cssVar(line.colorVar),
+        width: line.width,
+        ...(line.dash ? { dash: line.dash } : {}),
+        value: (u, v) => (v == null ? "–" : v.toFixed(1) + " " + tempUnit),
+        points: { show: false },
+        spanGaps: false,
+      });
+      data.push(payload[line.trace]);
+    }
+    seriesConfig.push({
+      label: "Draw",
+      stroke: cssVar("--series-minisplit-watts"),
+      width: 1.5,
+      scale: "watts",
+      value: (u, v) => (v == null ? "–" : v.toFixed(0) + " " + payload.watts_unit),
+      points: { show: false },
+      spanGaps: false,
+    });
+    data.push(payload.watts);
+    // The server anchors `t` at both ends of the range, so this auto-fits to
+    // the range the other cards show and drag-zoom still works.
+    const scales = { x: { time: true } };
+    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
+    // The same rule as the temp card's draw: no right-hand ruler for a trace
+    // with nothing on it.
+    if (hasReading(payload.watts)) {
+      scales.watts = { range: overlayScaleRange };
+      axes.push({
+        ...axisStyle,
+        side: 1,
+        scale: "watts",
+        size: 44,
+        values: (u, splits) => splits.map((v) => v.toFixed(0)),
+      });
+    }
+    const plot = new uPlot(
+      {
+        width: plotEl.clientWidth || 320,
+        height: 150,
+        cursor: { sync: { key: sync.key }, points: { size: 7 } },
+        legend: { live: true },
+        scales,
+        series: seriesConfig,
+        axes,
+        plugins: [sunMoonMarkersPlugin(), touchCursorPlugin()],
+      },
+      data,
+      plotEl
+    );
+    state.plots.push(plot);
+    card.querySelector(".name").textContent = "Bedroom";
+    card.querySelector(".unit").textContent = tempUnit;
+    card.querySelector(".dot").style.background = cssVar("--series-minisplit-temp");
+    // Latest head temperature and setpoint, prefixed for the reason the temp
+    // card prefixes its outdoor value: two bare numbers in one unit read as a
+    // range.
+    const latestOf = (trace) => [...trace].reverse().find((v) => v != null);
+    card.querySelector(".now").textContent =
+      fmt(latestOf(payload.temp), 1) + " " + tempUnit +
+      " · set " + fmt(latestOf(payload.setpoint), 0) + " " + tempUnit;
+  }
+
   async function load() {
-    const [seriesRes, eventsRes, outdoorRes] = await Promise.all([
+    const [seriesRes, eventsRes, outdoorRes, bedroomRes] = await Promise.all([
       fetch(`/api/series?range=${state.range}`),
       fetch(`/api/events?range=${state.range}`),
       fetch(`/api/outdoor-series?range=${state.range}`),
+      fetch(`/api/bedroom-series?range=${state.range}`),
     ]);
     const seriesPayload = await seriesRes.json();
     state.events = (await eventsRes.json()).events;
     const outdoorPayload = await outdoorRes.json();
+    const bedroomPayload = await bedroomRes.json();
     state.dailyEvents = outdoorPayload.daily_events || [];
 
     state.plots.forEach((p) => p.destroy());
@@ -814,6 +906,9 @@ const METRICS = {
         outdoorPayload.metrics[metric],
         outdoorPayload.metrics
       );
+    }
+    for (const card of document.querySelectorAll(".card[data-minisplit]")) {
+      makeBedroomPlot(card, bedroomPayload);
     }
     renderEvents();
     document.getElementById("updated").textContent =

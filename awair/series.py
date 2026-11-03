@@ -84,6 +84,28 @@ def carry_forward(points, grid, max_age_seconds):
     return result
 
 
+def break_gaps(t, columns, max_gap_seconds):
+    """Insert a None stamp wherever two consecutive stamps are too far apart.
+
+    For a series drawn on its own rows rather than carried onto another
+    series' grid: uPlot joins consecutive points whatever the distance
+    between them, so a bridge outage between two real rows would render as a
+    straight line across it. One stamp a second after the earlier row, None
+    in every column, makes it a break instead -- `spanGaps: false` does the
+    rest. `columns` is `{name: [value, ...]}`, each as long as `t`.
+    """
+    result = {"t": [], **{name: [] for name in columns}}
+    for i, stamp in enumerate(t):
+        if result["t"] and stamp - t[i - 1] > max_gap_seconds:
+            result["t"].append(t[i - 1] + 1)
+            for name in columns:
+                result[name].append(None)
+        result["t"].append(stamp)
+        for name, values in columns.items():
+            result[name].append(values[i])
+    return result
+
+
 def peak(series):
     """The highest single reading in a bucketed `series`, or None if it has none.
 

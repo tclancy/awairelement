@@ -87,7 +87,11 @@ Each step is its own PR, tests first.
    `decision_reason`, `temperature_at`, `raw`), per-head polling, and a
    head-filtered range read. Deploy, then confirm bedroom rows arrive.
 4. **awairelement: draw.** The Bedroom card in the eighth slot. Checked in a
-   browser at the desktop and phone widths in `docs/screenshots/`.
+   browser at the desktop and phone widths in `docs/screenshots/`. Tom added
+   the head's metered draw to it on 2026-11-03, on its own right-hand watts
+   axis and never hidden by the switch rule: a flat standby draw is what showed
+   the head idle at a 55°F setpoint on a 64°F day. Dining keeps its existing
+   "Draw" trace on the temp card.
 
 ## Done means
 
@@ -99,5 +103,6 @@ Each step is its own PR, tests first.
   raw-size decision says to keep it on, and it never contains a `bedroom` key.
 - The bridge's journal lines are the same length as before step 2.
 - The temp card's dining data is unchanged. The Bedroom card shows the head's
-  temperature against setpoint and target on today, 7 and 30 days.
+  temperature against setpoint and target, plus its draw, on today, 7 and 30
+  days.
   Screenshots committed.

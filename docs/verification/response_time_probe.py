@@ -70,6 +70,7 @@ RANGED = (
     ("api/series", "/api/series"),
     ("api/events", "/api/events"),
     ("api/outdoor-series", "/api/outdoor-series"),
+    ("api/bedroom-series", "/api/bedroom-series"),
 )
 # Endpoints the page polls without a range.
 UNRANGED = (
