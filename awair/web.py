@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from flask import Flask, abort, jsonify, render_template, request
 
 from awair import db, minisplit, outdoor, solar, spikes, timing, units, weather_alerts
-from awair.series import bucket, carry_forward, peak
+from awair.series import break_gaps, bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 
@@ -510,6 +510,97 @@ def _metered_watts_of(delta_wh, window_start, window_close):
         return None
 
 
+# How long the bedroom head's own temperature stays on the Bedroom card after
+# the head switches off (scope 2026-10-31, step 4). `/status` keeps publishing
+# an off head's last temperature, so past the grace window the number is a
+# stale reading drawn as a live one. Thirty minutes keeps the drift just after
+# a switch-off visible and drops the rest.
+BEDROOM_TEMP_GRACE_SECONDS = 30 * 60
+
+# The columns `_bedroom_series` unpacks, in its order. `raw` is not here and
+# must never be: the head's raw status carries device identifiers, and this
+# endpoint is on the unauthenticated dashboard (ADR-019).
+_BEDROOM_SERIES_COLUMNS = (
+    "temp",
+    "switch",
+    "setpoint",
+    "target",
+    "delta_wh",
+    "window_start",
+    "window_close",
+)
+
+
+def _bedroom_temp_shown(rows):
+    """One bool per `(epoch, switch)` row: draw that row's head temperature?
+
+    Yes while the head is on, and while it is off but last read on no more
+    than `BEDROOM_TEMP_GRACE_SECONDS` ago. A switch the bridge did not report
+    (None) is not "off", so it shows. An off head with no on reading in
+    `rows` at all is hidden -- the caller reads one grace window before the
+    range so an on reading just before the left edge still counts.
+    """
+    shown = []
+    last_on = None
+    for epoch, switch in rows:
+        if switch == "on":
+            last_on = epoch
+        recently_on = (
+            last_on is not None and epoch - last_on <= BEDROOM_TEMP_GRACE_SECONDS
+        )
+        shown.append(switch != "off" or recently_on)
+    return shown
+
+
+def _in_unit(celsius, unit):
+    """A stored Celsius value in the display unit, None passing through."""
+    if celsius is None or unit == "C":
+        return celsius
+    return units.from_celsius(celsius, unit)
+
+
+def _bedroom_series(rows, since_epoch, until_epoch, unit):
+    """The Bedroom card's traces on the bedroom head's own rows.
+
+    `rows` is `db.minisplit_readings_since(conn, BEDROOM, _BEDROOM_SERIES_COLUMNS,
+    ...)` read from one grace window before `since_epoch`; rows before it only
+    decide whether the first rows in range show their temperature. Own x-axis
+    rather than the indoor grid because the bedroom has no Awair to share one
+    with, and gaps longer than the dining trace's carry bound become breaks.
+
+    The first and last stamps are always `since_epoch` and `until_epoch`, None
+    in every column, so the card's auto-fitted x-axis spans the range the other
+    cards do: a head recorded for two of seven days reads as two days of
+    seven, and an empty table still draws an empty range rather than nothing.
+    """
+    shown = _bedroom_temp_shown([(row[0], row[2]) for row in rows])
+    t = []
+    columns = {"temp": [], "setpoint": [], "target": [], "watts": []}
+    for row, show in zip(rows, shown, strict=True):
+        epoch, temp, _switch, setpoint, target, delta_wh, start, close = row
+        if epoch < since_epoch:
+            continue
+        t.append(epoch)
+        columns["temp"].append(_in_unit(temp, unit) if show else None)
+        columns["setpoint"].append(_in_unit(setpoint, unit))
+        columns["target"].append(_in_unit(target, unit))
+        columns["watts"].append(_metered_watts_of(delta_wh, start, close))
+    drawn = break_gaps(t, columns, _minisplit_carry_max_age_seconds())
+    return _anchored(drawn, since_epoch, until_epoch)
+
+
+def _anchored(drawn, since_epoch, until_epoch):
+    """`drawn` with a None stamp at each end of the range."""
+    return {
+        name: [
+            since_epoch if name == "t" else None,
+            *values,
+            until_epoch if name == "t" else None,
+        ]
+        for name, values in drawn.items()
+    }
+
+
 def _bootstrap_schema(db_path, logger) -> None:
     """Run the schema bootstrap once, at app construction rather than per request.
 
@@ -667,6 +758,36 @@ def create_app(db_path=None):
                     basement_rows, metrics["temp"]["t"], bucket_seconds, unit
                 ),
                 "temp_unit_symbol": units.symbol(unit),
+            }
+        )
+
+    @app.get("/api/bedroom-series")
+    def bedroom_series():
+        """The bedroom head for the Bedroom card: temperature, setpoint, target, draw.
+
+        Temperatures in the display unit, the draw in `watts_unit`. Never the
+        raw status -- see `_BEDROOM_SERIES_COLUMNS`. An unconfigured bedroom
+        zone stores no rows, which is a 200 with empty traces.
+        """
+        since, _ = _range_params()
+        conn = connect()
+        try:
+            rows = db.minisplit_readings_since(
+                conn,
+                minisplit.BEDROOM,
+                _BEDROOM_SERIES_COLUMNS,
+                since - timedelta(seconds=BEDROOM_TEMP_GRACE_SECONDS),
+            )
+        finally:
+            conn.close()
+        unit = temp_unit()
+        return jsonify(
+            {
+                **_bedroom_series(
+                    rows, since.timestamp(), datetime.now(UTC).timestamp(), unit
+                ),
+                "temp_unit_symbol": units.symbol(unit),
+                "watts_unit": "W",
             }
         )
 

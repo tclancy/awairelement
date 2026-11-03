@@ -589,7 +589,12 @@ def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
     wrapped `.card h2` onto a second line, growing that card taller than its
     row-mates.
 
-    A third chart factory moves `plots` and fails here whichever way it goes,
+    The eighth, the Bedroom card (mini split scope, step 4), does not either:
+    its header already carries the head temperature and its setpoint, and a
+    peak head temperature answers no "how bad did it get" question -- the
+    card's question is whether the head is heating, which the draw answers.
+
+    A fourth chart factory moves `plots` and fails here whichever way it goes,
     which is the point: the next card has to decide, rather than inherit
     either answer by omission.
 
@@ -600,8 +605,8 @@ def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
     """
     plots = len(re.findall(r"\bnew uPlot\(", js_code))
     renders = len(re.findall(r"(?<!function )\bpeakSuffix\(", js_code))
-    assert plots == 2, (
-        f"{plots} chart factories, expected 2 — does the new one report a "
+    assert plots == 3, (
+        f"{plots} chart factories, expected 3 — does the new one report a "
         "range peak in its card header (#116)?"
     )
     assert renders == 1, (
