@@ -31,6 +31,20 @@
      because both collide with the basement magenta once red-green is gone.
      Change it only against the same measurement. */
   --series-minisplit-temp: #1f7a3d;
+  /* The mini split's metered draw (#139). Measured the same way the green
+     above it was, and then once more: minimum CIELAB dE76 to the temp card's
+     other four lines, under simulated deuteranopia (Vienot) AND under normal
+     vision, in BOTH palettes -- the green was chosen on the deuteranopia
+     number alone, which can be improved at a trichromat's expense.
+
+     Swept the whole hue circle for the pair whose WORST of those four numbers
+     is largest. This azure wins at 30.6: light 33.3 normal / 31.2 deuter,
+     dark 30.9 / 30.6, nearest neighbour the outdoor teal in all four. The
+     intuitive alternative, a strong blue (#2a2ad0 / #5f7ae8), is far better
+     for normal vision (66.7 / 48.4) and much worse where it matters -- 20.6
+     in the dark palette, because the dark outdoor cyan and a blue merge once
+     red-green is gone. Change the pair only against the same four numbers. */
+  --series-minisplit-watts: #0098d9;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
 @media (prefers-color-scheme: dark) {
@@ -43,6 +57,7 @@
     --series-outdoor-temp: #4bb9c3; --series-outdoor-precip: #6a95d8;
     --series-outdoor-pressure: #b494e3; --series-basement-temp: #e07cc0;
     --series-minisplit-temp: #5fc77f;
+    --series-minisplit-watts: #26beff;
   }
 }
 * { box-sizing: border-box; }
@@ -161,6 +176,42 @@ main {
    five rows there. Measured, not assumed -- a baseline checkout was served
    the same database to check. */
 .card[data-overlay~="minisplit-temp"] .u-legend { --legend-rows: 4; }
+/* The mini split's metered draw is an eighth entry (#139) and it is the first
+   overlay on this card that costs a row -- but only on a narrow phone, so it
+   buys the row there and nowhere else.
+
+   Measured with the legend POPULATED (an idle legend reads "--" and packs two
+   entries narrower, so it answers a different question), and with the eighth
+   entry removed from the DOM as the control, so both counts come from the same
+   stylesheet, font and card width:
+
+     viewport  card   7 entries        8 entries
+       1440    340px  4 rows 71.9px    4 rows 71.9px
+        768    728px  2 rows 36.0px    2 rows 36.0px
+        430    390px  3 rows 54.0px    4 rows 71.9px
+        390    350px  4 rows 71.9px    4 rows 71.9px
+        380    340px  4 rows 71.9px    4 rows 71.9px
+        375    335px  4 rows 71.9px    5 rows 89.9px   <- the breakpoint
+        360    320px  4 rows 71.9px    5 rows 89.9px
+
+   So four rows (74.8px reserved) still carry eight entries at 380px and up,
+   and at 375px and below they clip one -- which would be the draw entry
+   itself, the only thing on the page that names that line. 375px is an
+   iPhone SE/8, not a hypothetical.
+
+   A viewport query rather than a container query because that is the
+   mechanism this stylesheet already uses (`max-width: 1024px` below) and the
+   card width is a pure function of it here. Scoped to the width that needs it
+   rather than raised everywhere: unconditional five rows would be ~18.7px of
+   permanent blank space on this card at 1440 and 390 alike, and a card
+   permanently taller than its row-mates grows the whole grid row.
+
+   Below ~320px of card eight entries want six rows and are clipped even at
+   five. Not new and not made materially worse: seven entries already wanted
+   five rows there on origin/main against the same four reserved. */
+@media (max-width: 379px) {
+  .card[data-overlay~="minisplit-watts"] .u-legend { --legend-rows: 5; }
+}
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
@@ -229,11 +280,16 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   weather event — and the basement sensor's temperature, averaged per bucket;
   a break in that line is a sensor or basement-poller gap — and the dining
   room mini split head's own room temperature, read through the climate
-  bridge; a break in that line is a bridge or mini-split-poller gap. The
-  head's power draw is on the same feed and deliberately not on this card: it
-  is watts, and these four lines share one axis because they are all a
-  temperature in the same unit. It is on `/api/series` as `minisplit_watts`
-  and wants a card of its own.
+  bridge; a break in that line is a bridge or mini-split-poller gap. Those
+  four lines share one axis because they are all a temperature in the same
+  unit. <b>Draw</b> is the fifth line and the one exception: it is the head's
+  metered power draw in watts, read against the right-hand axis, so its height
+  is not comparable with any temperature on the card. It is the energy the head
+  reported over its own window divided by that window — not its spot reading,
+  which sat at a constant 30.0 W while the metered energy said 45–65 W. A break
+  in it is a window the head reported no energy for, or the same bridge or
+  mini-split-poller gap that breaks the Mini split line beside it; a flat zero
+  is a head that drew nothing, which is a reading rather than a gap.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>

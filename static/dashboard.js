@@ -48,17 +48,25 @@ const METRICS = {
   // none for the same measured reason -- it would be the same fourth number,
   // one overlay later.
   //
-  // Only the mini split's TEMPERATURE is here. Its metered draw rides the same
-  // `/api/series` payload, as `minisplit_watts`, and it is in watts: appended
-  // to this list it is drawn by the push loop in `makePlot`, which declares no
-  // `scale:` on purpose, so it would share the card's degree axis and the two
-  // would autoscale into flat lines.
+  // `scale` is what lets one card carry two quantities, and an entry that
+  // omits it is making a claim: this trace is the card's own metric in the
+  // card's own unit, so it belongs on the card's axis. The three temperatures
+  // omit it deliberately -- the distance between an indoor line and an outdoor
+  // one IS the answer #109 asked for, and two auto-fitted axes would draw a 1
+  // degree indoor drift and a 20 degree outdoor swing as the same stroke.
   //
-  // A second unit on a shared card is not itself the problem -- #42's pressure
-  // overlay does exactly that, with `scale: "pressure"` and its own `side: 1`
-  // axis. What this list cannot carry is a second unit, because the loop that
-  // draws it is deliberately scale-less and a test pins that. Watts needs the
-  // loop restructured and that guard relaxed, which is its own change (#139).
+  // The mini split's metered draw is the first entry here that declares one
+  // (#139). It is in watts, so the shared-axis claim is false for it: on the
+  // card's degree ruler a 600 W trace puts every temperature on the floor.
+  // It gets its own right-hand axis, the way #42's pressure overlay already
+  // does on the precipitation card -- a second unit on a shared card was
+  // never the problem, a second unit on a shared *axis* is.
+  //
+  // `unit` and `digits` ride with the scale and are read by the hover
+  // formatter, because an overlay off the card's axis can no longer borrow
+  // the card's `METRICS` entry for them. An entry that declares `scale` and
+  // omits either one is caught by
+  // `test_an_overlay_off_the_cards_axis_brings_its_own_unit`.
   const TEMP_OVERLAYS = [
     {
       key: "outdoor-temp",
@@ -80,6 +88,33 @@ const METRICS = {
       label: "Mini split",
       colorVar: "--series-minisplit-temp",
       prefix: null,
+    },
+    {
+      key: "minisplit-watts",
+      payload: "minisplit_watts",
+      // "Draw", not "power": the series is the energy the head metered over
+      // its own report window divided by that window -- GLOSSARY.md's
+      // **metered draw**, which is what `minisplit.metered_watts` publishes.
+      // The head's spot `power` reading sat at a constant 30.0 W across three
+      // windows whose metered energy implied 45, 54 and 65 W, and
+      // `/api/series` deliberately does not carry it.
+      //
+      // One word rather than the glossary's two, and shorter than the first
+      // draft deliberately -- but be accurate about what that bought, because
+      // it is less than it looks. Measured with the entry removed from the DOM
+      // as the control: "Mini split draw" was the longest label on the card
+      // and wanted a sixth row at a 300px card, where "Draw" wants five. At a
+      // 320px card both want five. So the shortening did NOT keep eight
+      // entries inside the four rows already reserved -- the media query in
+      // `dashboard.html` is what covers that, and this only moved the
+      // narrowest measured case by one row. It reads in context (the entry
+      // above it is "Mini split") and the value carries its own `W`.
+      label: "Draw",
+      colorVar: "--series-minisplit-watts",
+      prefix: null,
+      scale: "watts",
+      unit: "W",
+      digits: 0,
     },
   ];
 
@@ -378,6 +413,48 @@ const METRICS = {
     };
   }
 
+  // An overlay that brings its own axis gets that axis anchored at zero rather
+  // than auto-fitted. The one quantity that needs one here is a power draw,
+  // which has a true zero, and "is it drawing anything at all" is the first
+  // question the line answers -- auto-fitted, a head cycling between 490 W and
+  // 1000 W fills the card with the top half of its range and draws the
+  // rounding on an idle head as a mountain range. Headroom keeps the peak off
+  // the card's top edge.
+  //
+  // `max <= 0` is every sample metered at zero, which is a real reading of a
+  // head that drew nothing: it answers [0, 1] and draws a flat floor.
+  //
+  // `max == null` is a live path, not defence, and an earlier draft of this
+  // comment said the opposite. The axis is only created for a trace with a
+  // reading in it (`hasReading`, at the axis push below), so the FIRST paint
+  // never hits it -- but uPlot re-derives a data-backed range on every
+  // x-zoom, and the range it hands this function is taken over the visible
+  // window alone. Measured: on `30d`, drag-selecting the leftmost eighth (2
+  // to 5 October, before parsons-pulse #182 shipped the window fields) leaves
+  // the right-hand axis reading `0` and `1`. That is the honest picture of a
+  // window the head reported no energy for, and it is why the arm returns a
+  // range rather than letting a degenerate [0, 0] through.
+  const OVERLAY_SCALE_HEADROOM = 1.05;
+  function overlayScaleRange(u, min, max) {
+    return [0, max == null || !(max > 0) ? 1 : max * OVERLAY_SCALE_HEADROOM];
+  }
+
+  // Does a trace have any reading at all? Gates the axis below. `!= null`
+  // catches both null and undefined; the server ships null for a stale or
+  // undatable reading and never NaN.
+  function hasReading(trace) {
+    return Array.isArray(trace) && trace.some((v) => v != null);
+  }
+
+  // The hover value for one overlay. An overlay on the card's own axis borrows
+  // the card's unit and precision from `METRICS`; one with its own `scale` is
+  // a different quantity and cannot, so it carries `unit` and `digits`.
+  function overlayFormatter(overlay, meta) {
+    const unit = overlay.scale ? overlay.unit : meta.unit;
+    const digits = overlay.scale ? overlay.digits : meta.digits;
+    return (u, v) => (v == null ? "–" : v.toFixed(digits) + (unit ? " " + unit : ""));
+  }
+
   function makePlot(card, metric, series, payload, peak) {
     const meta = METRICS[metric];
     const color = cssVar(`--series-${metric}`);
@@ -443,17 +520,21 @@ const METRICS = {
         spanGaps: false,
       },
     ];
+    const scales = { x: { time: true } };
+    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
     for (const overlay of overlays) {
       seriesConfig.push({
         label: overlay.label,
         stroke: cssVar(overlay.colorVar),
         width: 1.5,
-        // Deliberately NO `scale:` — this shares the card's y axis, unlike
-        // #42's pressure overlay two functions down. Both lines here are a
-        // temperature in the same unit, and the distance between them is the
-        // answer #109 asked for. Two auto-fitted axes would draw a 1° indoor
-        // drift and a 20° outdoor swing as the same stroke.
-        value: (u, v) => (v == null ? "–" : v.toFixed(meta.digits) + " " + meta.unit),
+        // The scale is `overlay.scale` and never a literal spelled here: the
+        // claim about which ruler a trace belongs on is made once, in
+        // `TEMP_OVERLAYS` beside the trace it is about, and this loop only
+        // carries it. An overlay that omits it shares the card's own axis,
+        // which is what #109's three temperatures want and what
+        // `test_the_overlay_loop_never_names_a_scale_of_its_own` pins.
+        ...(overlay.scale ? { scale: overlay.scale } : {}),
+        value: overlayFormatter(overlay, meta),
         points: { show: false },
         // The server nulls the trace once the last observation goes stale, so
         // a dead poller has to render as a break. Spanned,
@@ -461,6 +542,34 @@ const METRICS = {
         // missing one.
         spanGaps: false,
       });
+      // One axis per distinct scale, not per overlay: two overlays declaring
+      // the same scale are two traces on one ruler, which is the point of
+      // naming it. Note the ordering this buys for free -- `scales[...]` is
+      // written only where the axis is pushed, so if the first overlay on a
+      // scale has an empty trace, a later one with readings still gets the
+      // axis rather than inheriting the first one's silence.
+      //
+      // And only when the trace has something in it. A trace that is entirely
+      // null is what every box ran before parsons-pulse #182 shipped the
+      // window fields, and what any box runs when the bridge is down -- and
+      // measured against such a database the axis renders as the literal
+      // labels `0` and `1` down the right-hand edge of a temperature chart,
+      // a ruler for a line that is not there. The series stays in the legend
+      // either way, which is how the temperature overlays already render a
+      // dead source; it is the axis that has nothing to say. uPlot
+      // auto-creates the named scale for the series, so nothing is drawn
+      // against an undefined one.
+      if (overlay.scale && hasReading(payload[overlay.payload])
+          && !(overlay.scale in scales)) {
+        scales[overlay.scale] = { range: overlayScaleRange };
+        axes.push({
+          ...axisStyle,
+          side: 1,
+          scale: overlay.scale,
+          size: 44,
+          values: (u, splits) => splits.map((v) => v.toFixed(overlay.digits)),
+        });
+      }
     }
 
     const plot = new uPlot(
@@ -469,13 +578,10 @@ const METRICS = {
         height: 150,
         cursor: { sync: { key: sync.key }, points: { size: 7 } },
         legend: { live: true },
-        scales: { x: { time: true } },
+        scales,
         bands: [{ series: [2, 1], fill: hexToRgba(color, 0.14) }],
         series: seriesConfig,
-        axes: [
-          { ...axisStyle },
-          { ...axisStyle, size: 52 },
-        ],
+        axes,
         plugins,
       },
       data,

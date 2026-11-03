@@ -24,27 +24,36 @@ CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
 # marker the CSS legend reservation and `dashboard.js` both read -- so a card
 # cannot end up drawing a fifth legend entry it has not reserved room for.
 #
-# Only temp, and only temp can be here: the overlay shares the card's Y axis,
-# which is sound exactly when both series are the same quantity in the same
-# unit. Outdoor humidity onto `humid` would be the other honest candidate; an
-# outdoor temperature onto `co2` would not, and this constant is not the place
-# that would stop it -- see `_outdoor_temp_on_grid`. The basement sensor is the
-# second temperature on the same card, in the same unit, for the same reason,
-# and the mini split head's own room temperature is the third (#139).
+# Only temp today, and the first three entries are all one quantity: an overlay
+# with no `scale` of its own shares the card's Y axis, which is sound exactly
+# when both series are the same quantity in the same unit. Outdoor humidity onto
+# `humid` would be the other honest candidate; an outdoor temperature onto `co2`
+# would not, and this constant is not the place that would stop it -- see
+# `_outdoor_temp_on_grid`. The basement sensor is the second temperature on the
+# same card, in the same unit, for the same reason, and the mini split head's
+# own room temperature is the third (#139).
 #
-# `minisplit_watts` is the series this constant is the reason NOT to add. The
-# shared axis is the whole mechanism: the overlay push loop in `dashboard.js`
-# declares no `scale:` on purpose, and `test_the_overlay_series_shares_the_
-# cards_own_y_axis` forbids one *inside that block*. So a draw in watts added
-# here is drawn to the card's degree ruler and autoscaled into a flat line.
+# `minisplit-watts` is the fourth, and it is the first entry here that is NOT a
+# temperature. It is the mini split's metered draw, in watts, and it rides this
+# card because that is what #139 asked for -- the question is "what is the head
+# doing to this room", and the draw and the room temperature answer it together.
 #
-# Not "it needs a card rather than an entry" -- #42's pressure overlay is a
-# second unit on a shared card, with `scale: "pressure"` and its own `side: 1`
-# axis, and it is correct. The reason is narrower and it is about this loop:
-# carrying watts means restructuring the push loop to take a per-overlay scale
-# and relaxing the guard that keeps every temperature on one ruler. That is
-# its own change, not a fourth tuple entry. See #139.
-METRIC_OVERLAYS = {"temp": ("outdoor-temp", "basement-temp", "minisplit-temp")}
+# What makes that sound is that the draw is drawn against its own right-hand
+# axis, declared as `scale: "watts"` on its `TEMP_OVERLAYS` entry in
+# `dashboard.js`, the way #42's pressure trace already rides the precipitation
+# card. A second unit on a shared *card* was never the problem; a second unit on
+# a shared *axis* is, and on the card's degree ruler a 600 W trace would put
+# every temperature on the floor.
+#
+# So the rule this constant enforces is no longer "temperatures only". It is:
+# an overlay is either in the card's own unit, or it declares its own scale.
+# Membership here is not that promise -- `test_every_temp_card_overlay_is_a_
+# temperature_in_the_cards_unit` makes it for the scale-less entries and
+# `test_an_overlay_off_the_cards_axis_brings_its_own_unit` for the rest, and
+# the pair is what a fifth entry has to satisfy.
+METRIC_OVERLAYS = {
+    "temp": ("outdoor-temp", "basement-temp", "minisplit-temp", "minisplit-watts")
+}
 
 # Metric fields on an alert_event whose value carries the same unit as the
 # metric itself — converted for temp events at the API boundary.

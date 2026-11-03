@@ -181,10 +181,16 @@ def test_the_temp_card_is_the_only_card_marked_to_carry_an_overlay(client):
     attribute. Rendered from `web.METRIC_OVERLAYS` rather than typed onto a
     card, so the marker cannot be added in the template without the constant
     that names what to draw.
+
+    Order matters and is asserted whole rather than as a set: `data-overlay`
+    is the draw order too, and the draw (#139) has to come last so a watts
+    line on its own axis paints over the temperatures rather than under them.
     """
     html = client.get("/").get_data(as_text=True)
     marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w -]+)"', html)
-    assert marked == [("temp", "outdoor-temp basement-temp minisplit-temp")]
+    assert marked == [
+        ("temp", "outdoor-temp basement-temp minisplit-temp minisplit-watts")
+    ]
     # The precipitation card carries #42's pressure overlay and must keep the
     # same marker — the reservation rule has no other way to reach it.
     assert 'data-outdoor="precipitation" data-overlay="pressure"' in html

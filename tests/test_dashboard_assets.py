@@ -171,24 +171,108 @@ def _overlay_push_block(js_code):
     return match.group(0)
 
 
-def test_the_overlay_series_shares_the_cards_own_y_axis(js_code):
-    """#109's outdoor trace must NOT get a scale of its own.
+def _overlay_loop_body(js_code):
+    """The whole `for (const overlay of overlays)` body, not just the push.
 
-    Both series are a temperature in the same unit, and the gap between them IS
-    the thing the chart was asked for — "how outdoor affects indoor". Give the
-    outdoor line its own auto-fitted axis and the two are drawn to different
-    rulers: a 1° indoor drift and a 20° outdoor swing become the same stroke on
-    screen, and a reader cannot tell a well-insulated house from a leaky one.
-
-    This is a real temptation rather than a hypothetical, because the pattern
-    beside it does exactly that on purpose — #42 puts pressure on `scale:
-    "pressure"` with a fixed range, correctly, since inHg and inches of rain
-    are different quantities. Copying that line onto a second temperature is
-    the likeliest way this regresses.
+    `_overlay_push_block` stops at the `seriesConfig.push` call because that is
+    what the scale guard is about. The axis guard needs the statements after
+    it, so it gets its own accessor rather than a widened regex that would
+    quietly change what the scale guard reads.
     """
-    assert not re.search(r"\bscale\s*:", _overlay_push_block(js_code)), (
-        "a temperature overlay declares its own `scale:`, so the temperatures "
-        "are drawn against different rulers (#109)"
+    start = js_code.index("for (const overlay of overlays) {")
+    depth, i = 0, js_code.index("{", start)
+    while i < len(js_code):
+        if js_code[i] == "{":
+            depth += 1
+        elif js_code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js_code[start : i + 1]
+        i += 1
+    raise AssertionError("unbalanced braces in the overlay loop")
+
+
+def test_the_overlay_loop_never_names_a_scale_of_its_own(js_code):
+    """The loop carries `overlay.scale` and may not spell a scale itself.
+
+    The guarantee #109 needs is that its outdoor trace shares the indoor
+    temperature's y axis: both series are a temperature in the same unit, the
+    gap between them IS the thing the chart was asked for, and two auto-fitted
+    axes draw a 1° indoor drift and a 20° outdoor swing as the same stroke.
+
+    Until #139's watts line this was enforced by banning `scale:` from the push
+    block outright. That is no longer the rule, because the block now draws a
+    second quantity too — so the rule became: **the claim about which ruler a
+    trace belongs on is made once, on the trace's own `TEMP_OVERLAYS` entry,
+    and this loop only carries it.** A literal here would apply to every
+    overlay the loop draws, including the three temperatures, which is exactly
+    the #109 regression under a new spelling.
+
+    `test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit` is the
+    other half: it holds every scale-LESS entry to the card's unit. Neither
+    test is sufficient alone — this one permits a per-entry scale, that one
+    says what omitting it promises.
+    """
+    declared = [
+        d.strip()
+        for d in re.findall(r"\bscale\s*:\s*([^,\n}]+)", _overlay_push_block(js_code))
+    ]
+    assert declared == ["overlay.scale"], (
+        f"the overlay push block declares {declared or 'no'} scale(s); it must "
+        "declare exactly `scale: overlay.scale` and never a literal, or the "
+        "ruler a trace is drawn to stops being a property of that trace (#139)"
+    )
+
+
+def test_an_overlay_with_its_own_scale_gets_its_own_right_hand_axis(js_code):
+    """A named scale with no axis is a trace drawn against nothing visible.
+
+    uPlot will happily autoscale a series onto an unlabelled scale: the line
+    renders, at a height no reader can convert into a number, and the only hint
+    that it is not a temperature is the unit in the hover value. #42's pressure
+    overlay pairs its scale with a `side: 1` axis for this reason, and the
+    temperature-overlay loop has to do the same now that one of its entries
+    brings a scale (#139).
+
+    Asserted on the axis push inside the same loop, keyed on `overlay.scale` so
+    the axis cannot end up describing a different scale than the series.
+    """
+    loop = _overlay_loop_body(js_code)
+    axis_push = re.search(r"axes\.push\(\{(.*?)\}\);", loop, re.S)
+    assert axis_push, (
+        "the overlay loop pushes no axis, so an overlay declaring `scale:` "
+        "draws against a scale with no axis (#139)"
+    )
+    body = axis_push.group(1)
+    assert re.search(r"side:\s*1\b", body), "the overlay axis is not on side 1"
+    assert re.search(r"scale:\s*overlay\.scale\b", body), (
+        "the overlay axis names a scale other than the overlay's own"
+    )
+
+
+def test_an_axis_is_only_drawn_for_a_trace_that_has_a_reading(js_code):
+    """An empty trace must not put a ruler on the card for a line that is absent.
+
+    Measured, not reasoned: served a copy of the homelab database with every
+    `delta_wh` and window bound NULLed — which is what every box ran before
+    parsons-pulse #182 and what any box runs with the bridge down — the card
+    rendered three axes, the third being the literal labels `0` and `1` down
+    the right-hand edge of a temperature chart. With the gate, two. The legend
+    entry stays in both, which is how the temperature overlays already render
+    a dead source; it is the axis that has nothing to say.
+
+    Keyed on the guard being in the axis push's condition rather than on the
+    helper existing somewhere in the file: `hasReading` defined and not called
+    here is exactly the regression.
+    """
+    loop = _overlay_loop_body(js_code)
+    condition = re.search(
+        r"if \(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*\{\s*scales\[", loop, re.S
+    )
+    assert condition, "the axis push is no longer guarded by an `if (...)`"
+    assert "hasReading(payload[overlay.payload])" in condition.group(1), (
+        "the overlay axis is created without checking the trace has a "
+        f"reading; condition is `{condition.group(1).strip()}`"
     )
 
 
