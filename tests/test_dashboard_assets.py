@@ -666,3 +666,133 @@ def test_the_peak_is_handed_to_the_factory_in_the_slot_it_declares(js_code):
     assert args[params.index("metric")] == "metric", (
         f"{factory}'s `metric` slot is {args[params.index('metric')]!r}"
     )
+
+
+# --- Y-axis tick spacing (#139) ----------------------------------------------
+#
+# uPlot picks tick increments by fitting them to `axis.space`, the minimum
+# pixel gap it will leave between two labels. Its own y default is 30, and at
+# this dashboard's 83px of plot height that collapses a narrow range to ONE
+# labelled value — measured in Chromium at a 375px viewport against the live
+# homelab database on 2026-11-06, the temp card's degree axis rendered the
+# single split `[20]` for four temperature traces, while the watts axis
+# beside it rendered three. `AXIS_TICK_SPACE_PX` is what buys the finer
+# increment back; these guards hold the three things that make it work.
+
+UPLOT_JS = REPO / "static" / "uplot.iife.min.js"
+UPLOT_Y_AXIS_DEFAULT_SPACE = 30
+
+
+def _axes_arrays(js_code):
+    """Every `const axes = [...]` initialiser, one per chart factory."""
+    found = re.findall(r"const axes = \[(.*?)\];", js_code, re.S)
+    assert found, "no chart factory builds an `axes` array any more"
+    return found
+
+
+def _tick_space_px(js_code):
+    match = re.search(r"const AXIS_TICK_SPACE_PX = (\d+);", js_code)
+    assert match, (
+        "`AXIS_TICK_SPACE_PX` is gone from dashboard.js — the y-axis tick "
+        "spacing is back to whatever uPlot defaults to (#139)"
+    )
+    return int(match.group(1))
+
+
+def test_the_tick_space_is_tighter_than_uplots_own_default(js_code):
+    """Derived from the vendored bundle, so a uPlot bump cannot make this inert.
+
+    If `AXIS_TICK_SPACE_PX` were >= uPlot's own y default, every axis on the
+    page would choose exactly the increments it chose before and the whole
+    change would be a no-op that still reads as shipped. Pinning our number
+    against a hard-coded 30 would have the same hole one layer up — uPlot
+    could raise its default and our "tighter" value would silently stop being
+    tighter — so the default is read out of the file that defines it.
+    """
+    bundle = UPLOT_JS.read_text()
+    assert f"space:{UPLOT_Y_AXIS_DEFAULT_SPACE}" in bundle, (
+        f"the vendored uPlot no longer declares `space:"
+        f"{UPLOT_Y_AXIS_DEFAULT_SPACE}`. That constant is its y-axis default "
+        "and the reason this dashboard sets its own; re-measure the splits in "
+        "a browser before updating this number (#139)"
+    )
+    ours = _tick_space_px(js_code)
+    assert ours < UPLOT_Y_AXIS_DEFAULT_SPACE, (
+        f"AXIS_TICK_SPACE_PX is {ours}, which is not tighter than uPlot's own "
+        f"y default of {UPLOT_Y_AXIS_DEFAULT_SPACE} — every axis would pick "
+        "the increments it picked before and the temp card would be back to "
+        "one labelled degree (#139)"
+    )
+
+
+def test_no_x_axis_carries_the_y_tick_spacing(js_code):
+    """The x axis keeps uPlot's wider default, and that is the point of two styles.
+
+    An x label here is a timestamp — `12am`, and on the first tick a second
+    line carrying `11/6/26` — several times wider than a two-digit
+    temperature. Spread the y style onto `axes[0]` and uPlot fits ticks to
+    20px of a label that needs ~40, so the fix for an unreadable y axis
+    arrives as an unreadable x one. Asserted on position 0 of every factory's
+    array rather than on a count, because that is the slot uPlot treats as x.
+    """
+    for axes in _axes_arrays(js_code):
+        first = axes.split(",")[0].strip()
+        assert "yAxisStyle" not in first, (
+            f"an `axes` array starts with {first!r}: the x axis must be built "
+            "from `axisStyle()`, which leaves uPlot's 50px default in place "
+            "(#139)"
+        )
+        assert "axisStyle()" in first, (
+            f"an `axes` array starts with {first!r} rather than `axisStyle()` "
+            "— every chart's x axis is styled from one place"
+        )
+
+
+def test_every_right_hand_overlay_axis_carries_the_y_tick_spacing(js_code):
+    """A second ruler on a card is a y axis too, and has to agree with the first.
+
+    These are the `axes.push({...})` sites: the temp and bedroom cards' watts
+    axes and the precipitation card's pressure axis. Built from the bare style
+    they would fit ticks to a different rule than the axis facing them across
+    the same chart — two rulers on one card, disagreeing about how dense a
+    ruler is.
+    """
+    pushes = re.findall(r"axes\.push\(\{(.*?)\}\);", js_code, re.S)
+    assert len(pushes) == 3, (
+        f"expected 3 right-hand axis pushes (temp watts, bedroom watts, "
+        f"pressure), found {len(pushes)} — a new one needs a decision here"
+    )
+    for body in pushes:
+        assert "...yAxisStyle()" in body, (
+            "a right-hand axis is spread from something other than "
+            f"`yAxisStyle()`: {body.strip()[:80]!r} (#139)"
+        )
+
+
+def test_only_the_rainfall_axis_opts_out_of_the_tick_spacing(js_code):
+    """Exactly one y axis keeps the wider default, and it is a named decision.
+
+    The rainfall axis is exempt because of its LABELS, not its spacing: at
+    20px the finer increment it admits is 0.0025 in, and uPlot's number
+    formatter prints that tick `0.003` and the one above it `0.008` — a
+    gridline labelled with a number it is not drawn at. Measured against the
+    live database on 2026-11-06: at 20 the splits are
+    `[0, 0.0025, 0.005, 0.0075]`, at 30 they are `[0, 0.005]`.
+
+    The guard is that it stays the ONLY one. A second card built from the bare
+    style would inherit an exemption granted for a reason that is not true of
+    it, and nothing on the rendered page would say so — an axis with two
+    labels looks like an axis.
+    """
+    exempt = [a for a in _axes_arrays(js_code) if "yAxisStyle" not in a]
+    assert len(exempt) == 1, (
+        f"{len(exempt)} chart factories build their own y axis from the bare "
+        "`axisStyle()`; exactly one may (the rainfall axis in "
+        "`makeOutdoorPlot`), and a new one needs its own measured reason "
+        "written down beside it (#139)"
+    )
+    outdoor_body = js_code[js_code.index("function makeOutdoorPlot") :]
+    assert exempt[0] in outdoor_body, (
+        "the y axis opting out of the tick spacing is not the rainfall one — "
+        "the exemption moved to a card the measurement was never about (#139)"
+    )

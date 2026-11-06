@@ -439,6 +439,63 @@ const METRICS = {
     return [0, max == null || !(max > 0) ? 1 : max * OVERLAY_SCALE_HEADROOM];
   }
 
+  // Minimum pixel gap uPlot must leave between two tick labels on a y axis.
+  // uPlot's own default is 30, and at this card's 83px of plot height that is
+  // large enough to collapse a narrow range to a SINGLE labelled value --
+  // measured in Chromium at a 375px viewport against the live homelab
+  // database on 2026-11-06, with the rendered `_splits` read off each plot:
+  //
+  //   card           y range        space 30      space 20
+  //   Temp (°C)      15.8 - 23.5    [20]          [16, 18, 20, 22]
+  //   Bedroom (°C)   12.1 - 19.6    [15]          [14, 16, 18]
+  //   TVOC (ppb)     0 - 7400       [0, 5000]     [0, 2000, 4000, 6000]
+  //   Humidity (%)   53 - 70        [60, 70]      [55, 60, 65, 70]
+  //   CO2 (ppm)      390 - 1250     [500, 1000]   [500, 750, 1000, 1250]
+  //   PM2.5, Score, both `watts` axes, `pressure`   unchanged
+  //   Precipitation (in)  exempt -- see `makeOutdoorPlot`
+  //
+  // The two °C cards are why this exists. Four temperature traces drawn
+  // against one labelled gridline is not a ruler, and on the Temp card that
+  // single label is `20` while the right-hand watts axis also prints a `20`,
+  // at a different height, for a different quantity -- so the one number the
+  // degree axis offered was the one number most able to be read as the other
+  // axis's.
+  //
+  // Four of the eleven axes do not move at all: their next-finer increment
+  // still does not fit at 20, which is the point of a minimum rather than a
+  // target. The rainfall axis is the single exception that had to be written
+  // down, and it is an exception about label PRECISION, not about spacing --
+  // the reasoning is at its own call site.
+  //
+  // Not a tick COUNT, deliberately: a count forces labels onto an axis that
+  // has no room for them, and the failure that produces -- overlapping text
+  // on a phone -- is worse than the one being fixed.
+  const AXIS_TICK_SPACE_PX = 20;
+
+  // One axis style for every card. A function and not a constant because
+  // `cssVar` reads the live palette: a theme flip rebuilds the plots, and a
+  // style object built once at load would hold the colours of whichever
+  // palette happened to be active then.
+  function axisStyle() {
+    return {
+      stroke: cssVar("--ink-muted"),
+      grid: { stroke: cssVar("--grid"), width: 1 },
+      ticks: { stroke: cssVar("--axis"), width: 1 },
+      font: "11px system-ui, sans-serif",
+    };
+  }
+
+  // The same style plus the tick spacing, for a Y axis ONLY. The x axis keeps
+  // uPlot's own default of 50, which is a different number for a different
+  // reason: an x label here is a timestamp ("12am", "11/6/26") and is several
+  // times wider than a two-digit temperature, so 20px between them would
+  // overlap the labels rather than reveal them. Every axis on this page is
+  // built from one of these two, and which one is the claim about whether the
+  // labels are short.
+  function yAxisStyle() {
+    return { ...axisStyle(), space: AXIS_TICK_SPACE_PX };
+  }
+
   // Does a trace have any reading at all? Gates the axis below. `!= null`
   // catches both null and undefined; the server ships null for a stale or
   // undatable reading and never NaN.
@@ -499,12 +556,6 @@ const METRICS = {
       series.avg,
       ...overlays.map((o) => payload[o.payload]),
     ];
-    const axisStyle = {
-      stroke: cssVar("--ink-muted"),
-      grid: { stroke: cssVar("--grid"), width: 1 },
-      ticks: { stroke: cssVar("--axis"), width: 1 },
-      font: "11px system-ui, sans-serif",
-    };
     const seriesConfig = [
       // Year-free hover timestamp: the full default ("2026-07-11 10:50am")
       // wraps the legend row in a card this narrow, and the row growing to
@@ -521,7 +572,7 @@ const METRICS = {
       },
     ];
     const scales = { x: { time: true } };
-    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
+    const axes = [axisStyle(), { ...yAxisStyle(), size: 52 }];
     for (const overlay of overlays) {
       seriesConfig.push({
         label: overlay.label,
@@ -563,7 +614,7 @@ const METRICS = {
           && !(overlay.scale in scales)) {
         scales[overlay.scale] = { range: overlayScaleRange };
         axes.push({
-          ...axisStyle,
+          ...yAxisStyle(),
           side: 1,
           scale: overlay.scale,
           size: 44,
@@ -700,12 +751,6 @@ const METRICS = {
     const data = overlayPressure
       ? [series.t, series.min, series.max, series.avg, pressureSeries.min]
       : [series.t, series.min, series.max, series.avg];
-    const axisStyle = {
-      stroke: cssVar("--ink-muted"),
-      grid: { stroke: cssVar("--grid"), width: 1 },
-      ticks: { stroke: cssVar("--axis"), width: 1 },
-      font: "11px system-ui, sans-serif",
-    };
     const seriesConfig = [
       { value: "{M}/{D} {h}:{mm}{aa}" },
       { label: "low", stroke: null, points: { show: false } },
@@ -719,7 +764,18 @@ const METRICS = {
       },
     ];
     const scales = { x: { time: true } };
-    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
+    // The one y axis on the page that keeps uPlot's wider default spacing,
+    // and the reason is its labels rather than its quantity. Rainfall here is
+    // hundredths of an inch at most, so the finer increment the tighter
+    // spacing admits is 0.0025 in — and uPlot's number formatter prints that
+    // tick as `0.003` and the one above it as `0.008`. Measured against the
+    // live database on 2026-11-06: at 20 the splits are
+    // [0, 0.0025, 0.005, 0.0075] rendering as "0 / 0.003 / 0.005 / 0.008", a
+    // gridline labelled with a number it is not drawn at. An axis that lies
+    // is worse than an axis with two labels, which is what it has at 30.
+    // The `pressure` overlay below is unaffected — it is a fixed 28.5-31.0
+    // range formatted to one decimal, and 30 and 20 choose the same splits.
+    const axes = [axisStyle(), { ...axisStyle(), size: 52 }];
     if (overlayPressure) {
       seriesConfig.push({
         label: "Pressure",
@@ -734,7 +790,7 @@ const METRICS = {
         range: [PRESSURE_SCALE_MIN_INHG, PRESSURE_SCALE_MAX_INHG],
       };
       axes.push({
-        ...axisStyle,
+        ...yAxisStyle(),
         side: 1,
         scale: "pressure",
         size: 44,
@@ -800,12 +856,6 @@ const METRICS = {
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
     const tempUnit = payload.temp_unit_symbol;
-    const axisStyle = {
-      stroke: cssVar("--ink-muted"),
-      grid: { stroke: cssVar("--grid"), width: 1 },
-      ticks: { stroke: cssVar("--axis"), width: 1 },
-      font: "11px system-ui, sans-serif",
-    };
     const seriesConfig = [{ value: "{M}/{D} {h}:{mm}{aa}" }];
     const data = [payload.t];
     for (const line of BEDROOM_SERIES) {
@@ -833,13 +883,13 @@ const METRICS = {
     // The server anchors `t` at both ends of the range, so this auto-fits to
     // the range the other cards show and drag-zoom still works.
     const scales = { x: { time: true } };
-    const axes = [{ ...axisStyle }, { ...axisStyle, size: 52 }];
+    const axes = [axisStyle(), { ...yAxisStyle(), size: 52 }];
     // The same rule as the temp card's draw: no right-hand ruler for a trace
     // with nothing on it.
     if (hasReading(payload.watts)) {
       scales.watts = { range: overlayScaleRange };
       axes.push({
-        ...axisStyle,
+        ...yAxisStyle(),
         side: 1,
         scale: "watts",
         size: 44,
