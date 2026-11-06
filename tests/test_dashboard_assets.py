@@ -256,7 +256,9 @@ def test_an_axis_is_only_drawn_for_a_trace_that_has_a_reading(js_code):
     Measured, not reasoned: served a copy of the homelab database with every
     `delta_wh` and window bound NULLed — which is what every box ran before
     parsons-pulse #182 and what any box runs with the bridge down — the card
-    rendered three axes, the third being the literal labels `0` and `1` down
+    rendered three axes, the third being the literal labels `0.00` through
+    `1.00` (measured 2026-11-06; `0` and `1` when that was first written,
+    before `tickValues` began writing a label to its increment) down
     the right-hand edge of a temperature chart. With the gate, two. The legend
     entry stays in both, which is how the temperature overlays already render
     a dead source; it is the axis that has nothing to say.
@@ -690,19 +692,19 @@ def _axes_arrays(js_code):
     return found
 
 
-def _factory_body(js_code, name):
-    """One chart factory's body, ending where the next top-level one begins.
-
-    Bounded on purpose. Slicing from `function {name}` to the end of the file
-    makes any later factory satisfy a membership test about this one, which is
-    an assertion that cannot fail — and this is not hypothetical: the first
-    draft of the exemption guard below did exactly that, and moving the
-    exemption from the rainfall card to the bedroom card (declared *after* it)
-    left the test green.
-    """
-    start = js_code.index(f"function {name}")
-    rest = js_code.index("\n  function ", start + 1)
-    return js_code[start:rest]
+def _function_source(js_code, name):
+    """One brace-balanced `function name(...) { ... }`, body included."""
+    start = js_code.index(f"function {name}(")
+    depth, i = 0, js_code.index("{", start)
+    while i < len(js_code):
+        if js_code[i] == "{":
+            depth += 1
+        elif js_code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return js_code[start : i + 1]
+        i += 1
+    raise AssertionError(f"`function {name}` is not brace-balanced")
 
 
 def _tick_space_px(js_code):
@@ -725,16 +727,28 @@ def test_the_tick_space_is_tighter_than_uplots_own_default(js_code):
     tighter — so the default is read out of the file that defines it.
     """
     bundle = UPLOT_JS.read_text()
-    assert f"space:{UPLOT_Y_AXIS_DEFAULT_SPACE}" in bundle, (
-        f"the vendored uPlot no longer declares `space:"
-        f"{UPLOT_Y_AXIS_DEFAULT_SPACE}`. That constant is its y-axis default "
-        "and the reason this dashboard sets its own; re-measure the splits in "
-        "a browser before updating this number (#139)"
+    # Read the Y default out of uPlot's y-axis defaults object, not as a bare
+    # substring. `"space:30" in bundle` is true of the X default too, so it
+    # survives uPlot lowering its y default to 25 — the exact bump this test
+    # claims to catch. Keyed on `scale:"y"`, because a minifier renames
+    # identifiers and never object keys.
+    found = re.search(r'scale:\s*"y"[^}]*?\bspace:\s*(\d+)', bundle)
+    assert found, (
+        "cannot find uPlot's y-axis default `space` in the vendored bundle. "
+        "It is the number this dashboard's own spacing has to beat; measure "
+        "it by hand in a browser before editing this test (#139)"
+    )
+    uplot_default = int(found.group(1))
+    assert uplot_default == UPLOT_Y_AXIS_DEFAULT_SPACE, (
+        f"the vendored uPlot's y-axis default `space` is {uplot_default}, not "
+        f"{UPLOT_Y_AXIS_DEFAULT_SPACE}. Every split in the comment on "
+        "`AXIS_TICK_SPACE_PX` was measured against the old default — "
+        "re-measure in a browser before updating this number (#139)"
     )
     ours = _tick_space_px(js_code)
-    assert ours < UPLOT_Y_AXIS_DEFAULT_SPACE, (
+    assert ours < uplot_default, (
         f"AXIS_TICK_SPACE_PX is {ours}, which is not tighter than uPlot's own "
-        f"y default of {UPLOT_Y_AXIS_DEFAULT_SPACE} — every axis would pick "
+        f"y default of {uplot_default} — every axis would pick "
         "the increments it picked before and the temp card would be back to "
         "one labelled degree (#139)"
     )
@@ -757,7 +771,7 @@ def test_no_x_axis_carries_the_y_tick_spacing(js_code):
             "from `axisStyle()`, which leaves uPlot's 50px default in place "
             "(#139)"
         )
-        assert "axisStyle()" in first, (
+        assert first.startswith("axisStyle()"), (
             f"an `axes` array starts with {first!r} rather than `axisStyle()` "
             "— every chart's x axis is styled from one place"
         )
@@ -784,29 +798,87 @@ def test_every_right_hand_overlay_axis_carries_the_y_tick_spacing(js_code):
         )
 
 
-def test_only_the_rainfall_axis_opts_out_of_the_tick_spacing(js_code):
-    """Exactly one y axis keeps the wider default, and it is a named decision.
+def test_every_cards_own_y_axis_carries_the_tick_spacing(js_code):
+    """No exemptions, and the first draft of this change had one.
 
-    The rainfall axis is exempt because of its LABELS, not its spacing: at
-    20px the finer increment it admits is 0.0025 in, and uPlot's number
-    formatter prints that tick `0.003` and the one above it `0.008` — a
-    gridline labelled with a number it is not drawn at. Measured against the
-    live database on 2026-11-06: at 20 the splits are
-    `[0, 0.0025, 0.005, 0.0075]`, at 30 they are `[0, 0.005]`.
+    That draft kept uPlot's wider default on the rainfall axis, because at
+    20px the finer increment it admits is 0.0025 in and uPlot's own
+    formatter, capped at three decimal places, prints that tick `0.003`.
+    The exemption was wrong twice over. It treated a LABEL problem as a
+    SPACING problem — and measured against the 30-day record, a 0.006 in
+    daily maximum makes the wider spacing choose 0.0025 too, so the
+    exemption did not even buy what it claimed. `tickValues` fixes the
+    labels instead, which lets every y axis take the same spacing.
 
-    The guard is that it stays the ONLY one. A second card built from the bare
-    style would inherit an exemption granted for a reason that is not true of
-    it, and nothing on the rendered page would say so — an axis with two
-    labels looks like an axis.
+    An exemption is what this guards against, not a spelling: a card built
+    from the bare `axisStyle()` renders an axis that looks exactly like one
+    that took the tighter rule.
     """
     exempt = [a for a in _axes_arrays(js_code) if "yAxisStyle" not in a]
-    assert len(exempt) == 1, (
+    assert exempt == [], (
         f"{len(exempt)} chart factories build their own y axis from the bare "
-        "`axisStyle()`; exactly one may (the rainfall axis in "
-        "`makeOutdoorPlot`), and a new one needs its own measured reason "
-        "written down beside it (#139)"
+        "`axisStyle()`, which is the x-axis style. Every y axis takes "
+        "`yAxisStyle()`; if one genuinely cannot, the reason belongs beside "
+        "it and in this test, measured (#139)"
     )
-    assert exempt[0] in _factory_body(js_code, "makeOutdoorPlot"), (
-        "the y axis opting out of the tick spacing is not the rainfall one — "
-        "the exemption moved to a card the measurement was never about (#139)"
+
+
+def test_the_tick_spacing_is_wired_to_the_constant_that_documents_it(js_code):
+    """The constant and the style are two tokens, and only one was pinned.
+
+    Found by mutation: `return { ...axisStyle(), space: 50 };` left
+    `AXIS_TICK_SPACE_PX = 20` sitting above it, untouched and fully
+    documented, while the temp card went straight back to a single `20`
+    label — and all the other guards here stayed green. The constant is
+    where the measurement lives, so the style has to read it rather than
+    carry a number of its own.
+
+    The second half is the inverse: `axisStyle()` must stay silent about
+    spacing, or the x axis inherits a minimum calibrated for a two-digit
+    temperature and crams its timestamps.
+    """
+    y_body = _function_source(js_code, "yAxisStyle")
+    assert "space: AXIS_TICK_SPACE_PX" in y_body, (
+        f"`yAxisStyle` does not read AXIS_TICK_SPACE_PX: {y_body.strip()!r} "
+        "— the measured constant and the spacing that is actually applied "
+        "have come apart (#139)"
+    )
+    x_body = _function_source(js_code, "axisStyle")
+    assert "space" not in x_body, (
+        f"`axisStyle` names a tick spacing: {x_body.strip()!r}. It is the "
+        "x-axis style; a spacing here reaches the timestamps (#139)"
+    )
+
+
+def test_no_axis_pins_its_tick_precision(js_code):
+    """Every axis label is written to its own increment's precision.
+
+    A pinned precision is how a gridline ends up labelled with a number it
+    is not drawn at, and both live cases were measured in Chromium at the
+    card's real 83px rather than reasoned about:
+
+    - an IDLE mini-split head. `overlayScaleRange` answers `[0, 1]` for a
+      head that metered no energy, which is a real reading, so the axis is
+      drawn. uPlot fits a 0.25 W increment and `toFixed(0)` printed the
+      five gridlines `0 0 1 1 1`.
+    - rainfall at a 0.006 in daily maximum, present in the 30-day record:
+      uPlot's default formatter caps at three places and printed a
+      0.0025 in increment as `0.003`.
+
+    So the guard is on the mechanism rather than on any one axis: a
+    `values:` on an axis goes through `tickValues`, whose floor argument may
+    not be *lowered* by anything (it is a minimum, and uPlot's increment
+    raises it). A bare `toFixed` in an axis formatter is the regression.
+    """
+    formatters = re.findall(r"\bvalues:\s*([^\n]+)", js_code)
+    assert formatters, "no axis declares a `values` formatter any more"
+    for f in formatters:
+        assert f.startswith("tickValues("), (
+            f"an axis formats its ticks with {f.strip().rstrip(',')!r} rather "
+            "than `tickValues(...)`; a pinned precision labels a gridline "
+            "with a number it is not drawn at (#139)"
+        )
+    assert "foundIncr" in _function_source(js_code, "tickValues"), (
+        "`tickValues` ignores the increment uPlot hands it, which is the "
+        "only thing that can tell it how many places a label needs (#139)"
     )

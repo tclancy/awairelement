@@ -431,7 +431,9 @@ const METRICS = {
   // x-zoom, and the range it hands this function is taken over the visible
   // window alone. Measured: on `30d`, drag-selecting the leftmost eighth (2
   // to 5 October, before parsons-pulse #182 shipped the window fields) leaves
-  // the right-hand axis reading `0` and `1`. That is the honest picture of a
+  // the right-hand axis reading `0.00` through `1.00` (it was `0` and `1`
+  // until `tickValues` started writing a label to its own increment's
+  // precision). That is the honest picture of a
   // window the head reported no energy for, and it is why the arm returns a
   // range rather than letting a degenerate [0, 0] through.
   const OVERLAY_SCALE_HEADROOM = 1.05;
@@ -451,8 +453,7 @@ const METRICS = {
   //   TVOC (ppb)     0 - 7400       [0, 5000]     [0, 2000, 4000, 6000]
   //   Humidity (%)   53 - 70        [60, 70]      [55, 60, 65, 70]
   //   CO2 (ppm)      390 - 1250     [500, 1000]   [500, 750, 1000, 1250]
-  //   PM2.5, Score, both `watts` axes, `pressure`   unchanged
-  //   Precipitation (in)  exempt -- see `makeOutdoorPlot`
+  //   Precip. (in)   0 - 0.0088     [0, 0.005]    [0, 0.0025, 0.005, 0.0075]
   //
   // The two °C cards are why this exists. Four temperature traces drawn
   // against one labelled gridline is not a ruler, and on the Temp card that
@@ -461,11 +462,12 @@ const METRICS = {
   // degree axis offered was the one number most able to be read as the other
   // axis's.
   //
-  // Four of the eleven axes do not move at all: their next-finer increment
-  // still does not fit at 20, which is the point of a minimum rather than a
-  // target. The rainfall axis is the single exception that had to be written
-  // down, and it is an exception about label PRECISION, not about spacing --
-  // the reasoning is at its own call site.
+  // Five of the eleven axes do not move at all -- PM2.5, Score, both `watts`
+  // axes and `pressure`. Their next-finer increment still does not fit at
+  // 20, which is the point of a minimum rather than a target. There is no
+  // exemption: a finer increment is only a hazard when a label is written to
+  // fewer places than it needs, and `tickValues` above is what stops that,
+  // on every axis, at any increment.
   //
   // Not a tick COUNT, deliberately: a count forces labels onto an axis that
   // has no room for them, and the failure that produces -- overlapping text
@@ -483,6 +485,48 @@ const METRICS = {
       ticks: { stroke: cssVar("--axis"), width: 1 },
       font: "11px system-ui, sans-serif",
     };
+  }
+
+  // How many decimal places it takes to write this increment exactly.
+  // uPlot's increments come off a decimal ladder (1, 2, 2.5, 5 x a power of
+  // ten), so `String` renders them cleanly; the exponent branch is for the
+  // small end, where JS switches to `2.5e-7` on its own.
+  function decimalsOf(incr) {
+    const text = String(incr);
+    const e = text.indexOf("e");
+    if (e < 0) return (text.split(".")[1] || "").length;
+    const fraction = (text.slice(0, e).split(".")[1] || "").length;
+    return Math.max(0, fraction - Number(text.slice(e + 1)));
+  }
+
+  // Tick labels that name the value their gridline is drawn at.
+  //
+  // uPlot hands `values` the increment it settled on, and the only way a
+  // label can be wrong is to be written to fewer places than that increment
+  // needs. Pinning a precision instead is what produces a ruler that lies,
+  // and the tighter spacing below makes that reachable on ordinary data
+  // rather than only in theory. Both measured in Chromium at 375px against
+  // the live database on 2026-11-06, at the card's real 83px of plot height:
+  //
+  //   the watts axis of an IDLE head. `overlayScaleRange` answers [0, 1] for
+  //   a head that metered no energy -- a real reading, so the axis is drawn.
+  //   At a 20px minimum uPlot fits a 0.25 W increment, and `toFixed(0)` then
+  //   prints the five gridlines 0 / 0.25 / 0.5 / 0.75 / 1 as
+  //   `0 0 1 1 1`: three labels naming a value their line is not at.
+  //
+  //   the rainfall axis at a 0.006 in daily maximum, which is present in the
+  //   30-day record. uPlot's own default formatter caps at three decimals,
+  //   so the 0.0025 in increment prints `0 / 0.003 / 0.005` -- and this one
+  //   happens at uPlot's WIDER default spacing, which is where this card has
+  //   always been. The lie is older than the spacing change and is not
+  //   caused by it.
+  //
+  // So `minDigits` is a floor and never a ceiling: pressure keeps reading
+  // `29.0` rather than `29` at its usual 1-unit increment, and gains a place
+  // if an increment ever needs one.
+  function tickValues(minDigits) {
+    return (u, splits, axisIdx, foundSpace, foundIncr) =>
+      splits.map((v) => v.toFixed(Math.max(minDigits, decimalsOf(foundIncr))));
   }
 
   // The same style plus the tick spacing, for a Y axis ONLY. The x axis keeps
@@ -604,7 +648,8 @@ const METRICS = {
       // null is what every box ran before parsons-pulse #182 shipped the
       // window fields, and what any box runs when the bridge is down -- and
       // measured against such a database the axis renders as the literal
-      // labels `0` and `1` down the right-hand edge of a temperature chart,
+      // labels `0.00` through `1.00` down the right-hand edge of a
+      // temperature chart,
       // a ruler for a line that is not there. The series stays in the legend
       // either way, which is how the temperature overlays already render a
       // dead source; it is the axis that has nothing to say. uPlot
@@ -618,7 +663,7 @@ const METRICS = {
           side: 1,
           scale: overlay.scale,
           size: 44,
-          values: (u, splits) => splits.map((v) => v.toFixed(overlay.digits)),
+          values: tickValues(overlay.digits),
         });
       }
     }
@@ -764,18 +809,17 @@ const METRICS = {
       },
     ];
     const scales = { x: { time: true } };
-    // The one y axis on the page that keeps uPlot's wider default spacing,
-    // and the reason is its labels rather than its quantity. Rainfall here is
-    // hundredths of an inch at most, so the finer increment the tighter
-    // spacing admits is 0.0025 in — and uPlot's number formatter prints that
-    // tick as `0.003` and the one above it as `0.008`. Measured against the
-    // live database on 2026-11-06: at 20 the splits are
-    // [0, 0.0025, 0.005, 0.0075] rendering as "0 / 0.003 / 0.005 / 0.008", a
-    // gridline labelled with a number it is not drawn at. An axis that lies
-    // is worse than an axis with two labels, which is what it has at 30.
-    // The `pressure` overlay below is unaffected — it is a fixed 28.5-31.0
-    // range formatted to one decimal, and 30 and 20 choose the same splits.
-    const axes = [axisStyle(), { ...axisStyle(), size: 52 }];
+    // Rainfall is the finest-grained quantity on the page -- hundredths of
+    // an inch -- so it is the axis whose labels most need their increment's
+    // precision rather than a pinned one. `tickValues(0)` gives it that:
+    // measured on the live database, a 0.006 in daily maximum draws ticks at
+    // 0.002 in and labels them `0.000 / 0.002 / 0.004 / 0.006` where uPlot's
+    // own formatter, capped at three places, had been printing a 0.0025 in
+    // increment as `0.003`.
+    const axes = [
+      axisStyle(),
+      { ...yAxisStyle(), size: 52, values: tickValues(0) },
+    ];
     if (overlayPressure) {
       seriesConfig.push({
         label: "Pressure",
@@ -794,7 +838,7 @@ const METRICS = {
         side: 1,
         scale: "pressure",
         size: 44,
-        values: (u, splits) => splits.map((v) => v.toFixed(1)),
+        values: tickValues(1),
       });
     }
     const plot = new uPlot(
@@ -893,7 +937,7 @@ const METRICS = {
         side: 1,
         scale: "watts",
         size: 44,
-        values: (u, splits) => splits.map((v) => v.toFixed(0)),
+        values: tickValues(0),
       });
     }
     const plot = new uPlot(
