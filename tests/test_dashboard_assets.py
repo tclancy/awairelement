@@ -690,6 +690,21 @@ def _axes_arrays(js_code):
     return found
 
 
+def _factory_body(js_code, name):
+    """One chart factory's body, ending where the next top-level one begins.
+
+    Bounded on purpose. Slicing from `function {name}` to the end of the file
+    makes any later factory satisfy a membership test about this one, which is
+    an assertion that cannot fail — and this is not hypothetical: the first
+    draft of the exemption guard below did exactly that, and moving the
+    exemption from the rainfall card to the bedroom card (declared *after* it)
+    left the test green.
+    """
+    start = js_code.index(f"function {name}")
+    rest = js_code.index("\n  function ", start + 1)
+    return js_code[start:rest]
+
+
 def _tick_space_px(js_code):
     match = re.search(r"const AXIS_TICK_SPACE_PX = (\d+);", js_code)
     assert match, (
@@ -791,8 +806,7 @@ def test_only_the_rainfall_axis_opts_out_of_the_tick_spacing(js_code):
         "`makeOutdoorPlot`), and a new one needs its own measured reason "
         "written down beside it (#139)"
     )
-    outdoor_body = js_code[js_code.index("function makeOutdoorPlot") :]
-    assert exempt[0] in outdoor_body, (
+    assert exempt[0] in _factory_body(js_code, "makeOutdoorPlot"), (
         "the y axis opting out of the tick spacing is not the rainfall one — "
         "the exemption moved to a card the measurement was never about (#139)"
     )
