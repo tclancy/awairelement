@@ -239,11 +239,19 @@ const METRICS = {
   // When the watch was raised, in the reader's own clock. Omitted rather than
   // guessed at if the payload carries no stamp: a badge that said "since
   // Invalid Date" would be worse than one that said nothing about when.
+  //
+  // The date is dropped when the trip was today, which is the ordinary case
+  // and the one that costs the most: the badge is a sentence on a card that
+  // is 330px wide on a phone, and "11/14/2026, 5:52:00 PM" is most of a line
+  // on its own. The latch can hold overnight, so the date is kept when it
+  // actually says something.
   function sinceSuffix(since) {
     if (since == null) return "";
     const at = new Date(since * 1000);
     if (Number.isNaN(at.getTime())) return "";
-    return " · since " + at.toLocaleString();
+    const clock = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const sameDay = at.toDateString() === new Date().toDateString();
+    return " · since " + (sameDay ? clock : at.toLocaleDateString() + " " + clock);
   }
 
   // Wash alert-event spans onto a chart, clipped to the plotting area.

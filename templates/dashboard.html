@@ -136,9 +136,15 @@ main {
   font-size: 12px; font-weight: 600; color: var(--ink-2);
 }
 .card .watch[hidden] { display: none; }
+/* `align-self` and the nudge, not the container's `align-items: center`: the
+   sentence wraps to two lines on a 330px card, and a centred square then
+   floats against the middle of a paragraph instead of marking its first
+   line. Colour is the only thing the square carries and the words carry the
+   meaning -- deliberately, because `--event-relative` on `--surface-1` is
+   about 2.6:1 and would fail as 12px text in the light palette. */
 .card .watch::before {
   content: ""; width: 8px; height: 8px; border-radius: 2px; flex: none;
-  background: var(--event-relative);
+  background: var(--event-relative); align-self: flex-start; margin-top: 4px;
 }
 /* Let vertical panning pass through the plot to the page. uPlot's cursor
    otherwise captures every touch and "wants to select the graph" instead
@@ -339,7 +345,13 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   its metered draw on the right-hand axis. The head's temperature is left off
   once the head has been switched off for more than 30 minutes, because the
   bridge keeps reporting an off head's last reading; a break in every line is
-  a bridge or mini-split-poller gap.
+  a bridge or mini-split-poller gap. A badge under the Temp card's header is
+  the <b>basement watch</b>: the basement is above 62 °F during the hours the
+  room is unoccupied and the outdoor high of the preceding 24 hours was below
+  62 °F too, so the weather does not account for it. It states a fact and
+  asks for nothing. No badge covers three different things — the basement is
+  below 62 °F, the hours do not apply, or no reading can be judged — and an
+  outdoor-poller gap is the third of those, never a badge.
 </footer>
 <script src="{{ url_for('static', filename='uplot.iife.min.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard.js') }}"></script>
