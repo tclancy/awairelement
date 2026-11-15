@@ -287,8 +287,14 @@ def watch(basement_rows, outdoor_rows, now: float) -> Watch:
     at, celsius = readings[-1]
     if now - at > stale_after_seconds():
         return Watch(UNKNOWN, basement=celsius)
-    if celsius <= WARM_ABOVE_C:
-        return Watch(CLEAR, basement=celsius)
+    # No `if celsius <= WARM_ABOVE_C: return CLEAR` fast path here, and its
+    # absence is deliberate. `_uncleared_run` breaks on exactly that
+    # comparison, so a cool newest reading already yields an empty run and
+    # falls through to the same `Watch(CLEAR, basement=celsius)` below. The
+    # fast path was written first and a mutation round found it: flipping its
+    # `<=` to `<` changed nothing observable, because the other guard covers
+    # the boundary. A branch whose mutation cannot be detected is a branch no
+    # test can hold, and two owners of one threshold is how they drift apart.
     for trip in _uncleared_run(readings):
         high = _unattributable(trip, outdoor_rows)
         if high is not None:

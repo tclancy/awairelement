@@ -209,8 +209,30 @@ def test_exactly_one_card_carries_a_watch_element(tmp_path, monkeypatch):
     assert page.count('class="watch"') == 1
 
 
-def test_the_card_that_carries_it_is_the_one_the_app_names(tmp_path, monkeypatch):
-    """Rendered from `web.WATCH_METRIC`, so moving the badge is one edit."""
+def _card_drawing_the_basement_line():
+    """The metric card the basement's own trace is drawn on.
+
+    The independent fact this file checks `WATCH_METRIC` against. Asserting
+    the badge sits on the card `WATCH_METRIC` names is a tautology — the test
+    would read the same constant the template did, and a mutation round
+    confirmed it: `WATCH_METRIC = "humid"` survived. What is actually being
+    claimed is that the badge is beside the line it is about, and
+    `METRIC_OVERLAYS` is where that is written down.
+    """
+    carrying = [
+        metric
+        for metric, overlays in web.METRIC_OVERLAYS.items()
+        if "basement-temp" in overlays
+    ]
+    assert len(carrying) == 1, f"expected one card to draw it, got {carrying}"
+    return carrying[0]
+
+
+def test_the_badge_is_on_the_card_that_draws_the_basement_line():
+    assert web.WATCH_METRIC == _card_drawing_the_basement_line()
+
+
+def test_the_rendered_badge_lands_on_that_same_card(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     page = client.get("/").get_data(as_text=True)
     section = re.search(
@@ -220,7 +242,7 @@ def test_the_card_that_carries_it_is_the_one_the_app_names(tmp_path, monkeypatch
         re.S,
     )
     assert section, "no metric card carries the watch element"
-    assert section.group(1) == web.WATCH_METRIC
+    assert section.group(1) == _card_drawing_the_basement_line()
 
 
 def test_the_badge_starts_hidden_so_a_dead_fetch_shows_no_verdict(
