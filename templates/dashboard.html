@@ -112,6 +112,34 @@ main {
   margin-left: auto; font-weight: 650; font-variant-numeric: tabular-nums;
   color: var(--ink-2); font-size: 13px;
 }
+/* The basement watch's badge (parsons-pulse #205). Its own line between the
+   header and the chart, NOT a sixth segment in `.card h2`: that header
+   already carries the card's value, its peak and four overlay numbers, and
+   #139's measurements record it wrapping to a second line at 1440px when a
+   third segment was added. A sentence would not have fitted there at any
+   width.
+
+   Colour is `--event-relative`, the amber this palette already uses for a
+   relative spike, rather than a sixth series colour. The dE76 sweep that
+   chose the temp card's line colours does not apply: this is not a trace on
+   the card's axis, nothing is being told apart from it, and the badge says
+   in words what it means -- the square is a second carrier, never the only
+   one.
+
+   `[hidden]` needs its own rule and this is the load-bearing half: the
+   `hidden` attribute works by a UA `display: none`, and ANY author `display`
+   wins over it, so the flex rule above would otherwise render the badge on
+   every card that has one regardless of the attribute. The watch would read
+   as permanently on, with an empty sentence. */
+.card .watch {
+  display: flex; align-items: center; gap: 5px; margin: 0 0 4px;
+  font-size: 12px; font-weight: 600; color: var(--ink-2);
+}
+.card .watch[hidden] { display: none; }
+.card .watch::before {
+  content: ""; width: 8px; height: 8px; border-radius: 2px; flex: none;
+  background: var(--event-relative);
+}
 /* Let vertical panning pass through the plot to the page. uPlot's cursor
    otherwise captures every touch and "wants to select the graph" instead
    of scrolling — the exact failure #36 reports. Horizontal gestures still
@@ -264,6 +292,10 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   {% for metric in metrics %}
   <section class="card" data-metric="{{ metric }}"{% if metric in ceilings %} data-ceiling="{{ ceilings[metric] }}"{% endif %}{% if metric in overlays %} data-overlay="{{ overlays[metric] | join(' ') }}"{% endif %}>
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    {# The basement watch belongs to one card, and which card comes from the
+       app (`web.WATCH_METRIC`) rather than a metric name typed in here --
+       the same rule the range buttons follow. #}
+    {% if metric == watch_metric %}<p class="watch" hidden></p>{% endif %}
     <div class="plot"></div>
   </section>
   {% endfor %}

@@ -65,6 +65,26 @@ going down cannot wedge the others:
   buckets. Like the mini split feed it has no
   health escalation; watch `journalctl --user -u awairelement-basement`.
 
+The temp card also carries one derived verdict, the **basement watch**
+(parsons-pulse #205): a yellow badge under the card's header when the basement
+is above 62 °F during the hours Tom says the room is unoccupied — weekdays
+23:00–17:00, weekends 00:00–07:00 — *and* the highest outdoor temperature in
+the preceding 24 hours was below 62 °F too. A basement that is warm while the
+weather cannot account for it is warm for some reason inside the house. The
+watch reports and never instructs: there is no ntfy, no alert event and
+nothing that acts on it.
+
+A trailing 24 hours rather than the calendar day, decided on the record rather
+than on taste — the two bases disagree about exactly one episode in the
+basement feed's history and the calendar day is wrong about it
+([ADR-003](docs/decisions/003-basement-watch-attributes-warmth-to-a-trailing-window.md)).
+Two things to expect on a box today. **The watch has never fired on real
+data** — 0 of 898 candidate readings through 2026-11-14 — so its first
+appearance is worth going and looking at rather than trusting. And an
+outdoor-poller outage shows as **no badge**, never as a yellow: a maximum over
+a window with the afternoon missing is the night's high, so an uncovered
+attribution window is no verdict at all.
+
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).
 

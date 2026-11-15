@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from awair import db, web
+from awair import basement_watch, db, web
 from tests.test_web import _seed_db
 
 
@@ -151,8 +151,18 @@ def test_rows_are_read_from_one_carry_window_before_since(
         seconds=web._basement_carry_max_age_seconds(spec["bucket_seconds"])
     )
     expected = before - timedelta(days=spec["days"]) - window
-    assert len(asked) == 1
+    # Two reads, not one: the chart's (first, this range's window) and the
+    # basement watch's (second, its own fixed window -- #205,
+    # `web._basement_watch`). Asserting a call *count* here would have made
+    # this test a tripwire on every later reader of the same table, which is
+    # not what #109 was about; what it was about is the window, below.
+    assert len(asked) == 2
     assert abs((asked[0] - expected).total_seconds()) < 5
+    # And the watch's window is its own, which is what keeps its verdict from
+    # changing when the reader presses a range button.
+    assert asked[1] == pytest.approx(
+        before - basement_watch.history_lookback(), abs=timedelta(seconds=5)
+    )
 
 
 def test_the_range_read_returns_epoch_seconds_from_since(conn):
