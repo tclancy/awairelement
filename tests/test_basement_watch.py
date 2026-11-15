@@ -180,9 +180,15 @@ def test_a_warm_spell_behind_it_accounts_for_the_warmth_and_clears():
 
 
 def test_an_outdoor_outage_does_not_manufacture_a_yellow():
+    """And says so: UNKNOWN, not CLEAR.
+
+    A warm basement we could not judge is a different fact from one the
+    weather explains, and only the second is a statement about the house.
+    """
     now = at(SATURDAY, 3)
     state = basement_watch.watch(basement_run(at(SATURDAY, 2), WARM, 61), [], now)
-    assert state.status == CLEAR
+    assert state.status == UNKNOWN
+    assert state.outdoor_high is None
 
 
 def test_warm_outside_the_window_is_not_the_watchs_business():
@@ -308,3 +314,100 @@ def test_the_outdoor_lookback_reaches_past_the_oldest_trips_own_window():
             basement_watch.history_lookback() + basement_watch.ATTRIBUTION_LOOKBACK
         ).total_seconds()
     )
+
+
+# --- the attribution window's upper bound -----------------------------------
+
+
+def test_warmth_arriving_after_the_trip_does_not_clear_the_latch():
+    """The lookback ends AT the reading, and the latch is why that bites.
+
+    Once a watch is standing, every later afternoon is inside some reading's
+    trailing 24 hours. Without the `ts <= at` bound the trip itself would be
+    re-judged against weather that had not happened when it tripped, and a
+    hot Tuesday would retroactively explain a cold Monday night. Caught by a
+    mutation round: dropping the bound left every other test green.
+    """
+    trip_at = at(SATURDAY, 2)
+    now = at(SATURDAY, 16)
+    rows = outdoor_cover(trip_at, COLD := 5.0, hours=30)
+    rows += [(trip_at + i * 900, 25.0) for i in range(1, int(14 * 3600 / 900) + 1)]
+    state = basement_watch.watch(basement_run(trip_at, WARM, 841), sorted(rows), now)
+    assert state.status == ON
+    assert state.outdoor_high == COLD
+
+
+# --- the coverage bound, on both sides --------------------------------------
+
+
+def test_a_gap_of_exactly_the_bound_is_still_believed():
+    until = at(MONDAY, 2)
+    gap = basement_watch.MAX_ATTRIBUTION_GAP.total_seconds()
+    rows = outdoor_cover(until, 5.0)
+    opens = until - basement_watch.ATTRIBUTION_LOOKBACK.total_seconds()
+    hole = opens + 6 * 3600
+    kept = [(ts, c) for ts, c in rows if not hole < ts < hole + gap]
+    assert basement_watch.attributable_high(kept, until) == 5.0
+
+
+def test_one_second_past_the_bound_is_not():
+    until = at(MONDAY, 2)
+    gap = basement_watch.MAX_ATTRIBUTION_GAP.total_seconds()
+    rows = outdoor_cover(until, 5.0)
+    opens = until - basement_watch.ATTRIBUTION_LOOKBACK.total_seconds()
+    hole = opens + 6 * 3600
+    kept = [(ts, c) for ts, c in rows if not hole < ts < hole + gap + 1]
+    assert basement_watch.attributable_high(kept, until) is None
+
+
+# --- the latch's own horizon ------------------------------------------------
+
+
+def test_a_run_reaching_the_querys_first_row_is_unknown_not_clear():
+    """A basement warm for longer than the evidence must not read as cooled.
+
+    The trip is outside every row the query returns and every surviving
+    reading is attributable, so there is nothing left to flag on — but no
+    reading was ever at or below 62 °F either, which is the only thing #205
+    says clearing means.
+    """
+    horizon = basement_watch.history_lookback().total_seconds()
+    now = at(SATURDAY, 12)
+    rows = basement_run(now - horizon, WARM, int(horizon / 60) + 1)
+    state = basement_watch.watch(rows, outdoor_cover(now, 20.0, hours=70), now)
+    assert state.status == UNKNOWN
+    assert state.since is None
+
+
+def test_a_short_record_that_never_cleared_is_judged_normally():
+    """Control: 'no clear reading' is not the same as 'the run ran off the end'.
+
+    A sensor installed two hours ago has no clear reading either, and its run
+    is entirely visible. Same shape as the test above, two hours instead of
+    forty-two, and it must still reach a verdict.
+    """
+    now = at(SATURDAY, 3)
+    rows = basement_run(at(SATURDAY, 2), WARM, 61)
+    assert basement_watch.watch(rows, outdoor_cover(now, 5.0), now).status == ON
+
+
+def test_a_standing_watch_keeps_its_stamp_for_the_whole_horizon():
+    """The behavioural claim `history_lookback`'s docstring makes.
+
+    A trip at the weekday window's open is still reported with its own stamp
+    at the window's close eighteen hours later, with the basement never
+    cooling. Asserted through `watch` rather than by recomputing the formula:
+    a test that rebuilds `(24 - opens) + closes` catches a constant edit and
+    says nothing about the latch.
+    """
+    opens, _ = basement_watch.WEEKDAY_WINDOW
+    trip_at = at(MONDAY, opens)
+    now = trip_at + 18 * 3600
+    minutes = int((now - trip_at) / 60) + 1
+    state = basement_watch.watch(
+        basement_run(trip_at, WARM, minutes),
+        outdoor_cover(now, 5.0, hours=50),
+        now,
+    )
+    assert state.status == ON
+    assert state.since == trip_at

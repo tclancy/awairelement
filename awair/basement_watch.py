@@ -97,8 +97,10 @@ ATTRIBUTION_LOOKBACK = timedelta(hours=24)
 # yellow about the house. The direction matters — a missing observation can
 # only lower the observed high, and a lower high can only *add* a flag.
 #
-# Three hours, which at Open-Meteo's quarter-hourly cadence is twelve
-# consecutive misses. The bound is on where the peak could hide rather than on
+# Three hours, which at Open-Meteo's quarter-hourly cadence is eleven
+# consecutive misses: a gap of exactly 3 h spans twelve 900 s intervals and so
+# has eleven absent observations between the two present ones. The bound is
+# inclusive, so eleven is believed and twelve is refused. The bound is on where the peak could hide rather than on
 # how much data arrived: this house's outdoor high is a broad afternoon
 # plateau, not a spike, so a gap narrower than this cannot move the day's
 # maximum far. A judgment, and the one to revisit if the watch ever fires
@@ -225,13 +227,22 @@ def attributable_high(outdoor_rows, at: float) -> float | None:
     return max(c for _, c in window)
 
 
-def _unattributable(row, outdoor_rows) -> float | None:
-    """The outdoor high behind a reading that the weather cannot explain.
+# What one warm reading says about itself. Four outcomes rather than a
+# boolean, because `watch` has to tell "the weather explains this" from "we
+# cannot tell" — folding them together is how an outdoor outage ends up
+# published as CLEAR, which is the opposite claim.
+TRIP = "trip"
+ATTRIBUTED = "attributed"
+UNCERTAIN = "uncertain"
+OUTSIDE = "outside"
 
-    None when this reading is not a trip at all — outside the **watch
-    window**, the weather accounts for it, or the attribution window is
-    uncovered. The float it returns is the high itself, so the caller can
-    publish the number that justified the flag rather than re-deriving it.
+
+def _verdict_of(row, outdoor_rows) -> tuple[str, float | None]:
+    """What one warm reading is, and the outdoor high behind a `TRIP`.
+
+    The float comes back with `TRIP` so the caller can publish the number that
+    justified the flag rather than re-deriving it; every other outcome has no
+    number to publish.
 
     Takes `row` from `_uncleared_run`, so its temperature is a number and it
     is already above `WARM_ABOVE_C`; there is deliberately no second check for
@@ -245,29 +256,62 @@ def _unattributable(row, outdoor_rows) -> float | None:
     """
     at, _ = row
     if not in_watch_window(local(at)):
-        return None
+        return OUTSIDE, None
     high = attributable_high(outdoor_rows, at)
-    if high is None or high >= WARM_ABOVE_C:
-        return None
-    return high
+    if high is None:
+        return UNCERTAIN, None
+    if high >= WARM_ABOVE_C:
+        return ATTRIBUTED, None
+    return TRIP, high
 
 
-def _uncleared_run(readings: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """The newest readings, back to the last one at or below the threshold.
+def _uncleared_run(readings, horizon: float) -> tuple[list, bool]:
+    """The newest readings back to the last clear one, and whether it is whole.
 
     This is what makes the watch a latch rather than a re-decision: #205 says
     yellow "clears once the temp drops to 62 or below", so a trip inside the
     **watch window** keeps standing through the afternoon that follows it,
     until the basement actually comes back down. Derived from the rows rather
     than stored, so there is no state to get stuck and nothing to migrate.
+
+    **The second return value is the honesty half, and it is why `horizon` is
+    an argument.** A stateless latch can only see as far back as the rows it
+    was handed, so a basement that has been warm for longer than
+    `history_lookback()` has its original trip outside the evidence entirely.
+    Left unsaid, that reads as a watch that cleared — with no reading ever at
+    or below 62 °F, which is precisely what #205 says clearing means. So a run
+    that reaches the oldest row the query *could* have returned is reported as
+    truncated, and `watch` declines to call it either way.
+
+    The horizon test is "the data starts where the query did", not "no clear
+    reading was found": a sensor installed two hours ago has no clear reading
+    either, and its run is entirely visible. One stale-bound of slack, because
+    the first row after a `since` lands a poll or two later.
     """
-    run: list[tuple[float, float]] = []
+    run = []
     for reading in reversed(readings):
         if reading[1] <= WARM_ABOVE_C:
-            break
+            return list(reversed(run)), False
         run.append(reading)
-    run.reverse()
-    return run
+    reaches_horizon = bool(run) and readings[0][0] <= horizon + stale_after_seconds()
+    return list(reversed(run)), reaches_horizon
+
+
+def _first_trip(run, outdoor_rows) -> tuple[tuple | None, float | None, bool]:
+    """The earliest trip in the run, its outdoor high, and any uncertainty.
+
+    Returns at the first trip, so a long standing run costs one verdict per
+    reading only while it is NOT flagging. The third value is sticky across
+    the readings scanned: one warm reading we could not judge is enough to
+    stop the caller publishing CLEAR, which is a claim about the house.
+    """
+    uncertain = False
+    for reading in run:
+        verdict, high = _verdict_of(reading, outdoor_rows)
+        if verdict == TRIP:
+            return reading, high, uncertain
+        uncertain = uncertain or verdict == UNCERTAIN
+    return None, None, uncertain
 
 
 def watch(basement_rows, outdoor_rows, now: float) -> Watch:
@@ -295,22 +339,50 @@ def watch(basement_rows, outdoor_rows, now: float) -> Watch:
     # `<=` to `<` changed nothing observable, because the other guard covers
     # the boundary. A branch whose mutation cannot be detected is a branch no
     # test can hold, and two owners of one threshold is how they drift apart.
-    for trip in _uncleared_run(readings):
-        high = _unattributable(trip, outdoor_rows)
-        if high is not None:
-            return Watch(ON, since=trip[0], basement=celsius, outdoor_high=high)
+    run, truncated = _uncleared_run(readings, now - history_lookback().total_seconds())
+    trip, high, uncertain = _first_trip(run, outdoor_rows)
+    if trip is not None:
+        # `since` only when the run's start is inside the evidence: on a
+        # truncated run the earliest trip we can SEE marches forward one
+        # reading at a time as the window slides, so publishing it would make
+        # a two-day-old condition read "since 01:30" and then "since 05:30"
+        # the next morning. No stamp is the true answer.
+        return Watch(
+            ON,
+            since=None if truncated else trip[0],
+            basement=celsius,
+            outdoor_high=high,
+        )
+    if truncated or uncertain:
+        # Not CLEAR. "The weather explains every warm reading" and "we could
+        # not judge one of them" are different facts, and only the first is a
+        # statement about the house.
+        return Watch(UNKNOWN, basement=celsius)
     return Watch(CLEAR, basement=celsius)
 
 
 def history_lookback() -> timedelta:
-    """How much basement history `watch` needs to resolve the latch.
+    """How much basement history `watch` reads, and so how long the latch holds.
 
-    The longest **watch window** plus one attribution lookback: a trip can be
-    as old as the start of the window it happened in, and the oldest window a
-    reading can belong to is the weekday one, which is 18 hours wide. Shorter
-    than this and a flag raised at 23:30 would clear itself at 17:30 the next
-    day with the basement still warm — not because it cooled, but because the
-    trip fell off the back of the query.
+    The longest **watch window** plus one attribution lookback — 42 hours: a
+    trip can be as old as the start of the window it happened in, and the
+    oldest window a reading can belong to is the weekday one, which is 18
+    hours wide. Shorter than this and a flag raised at 23:30 would clear
+    itself at 17:30 the next day with the basement still warm — not because it
+    cooled, but because the trip fell off the back of the query.
+
+    **It is also a hard bound on the latch, and that bound is a real cost.**
+    #205 says the yellow clears when the basement comes back to 62 °F, and
+    nothing else. A stateless derivation cannot honour that indefinitely: a
+    basement continuously above 62 °F for longer than this has its original
+    trip outside every row the query returns. The watch does not pretend
+    otherwise — `_uncleared_run` reports such a run as truncated and `watch`
+    answers `UNKNOWN`, which renders as no badge but publishes as a different
+    fact from `CLEAR`. Raising the bound is not free either: `watch` evaluates
+    `attributable_high` per in-window reading, so the work grows with the
+    square of the horizon. Storing the trip is the fix if the truncated case
+    turns out to be common; it has never been observed, because the watch has
+    never fired.
     """
     opens, closes = WEEKDAY_WINDOW
     widest = timedelta(hours=(24 - opens) + closes)

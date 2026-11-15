@@ -229,11 +229,18 @@ const METRICS = {
     // Both numbers, because either alone is half the claim: the basement
     // reading without the outdoor high reads as a thermostat complaint, and
     // the high without the basement reading does not say what is warm.
+    //
+    // "now" and "then" are load-bearing, not filler. `basement` is the newest
+    // reading and `outdoor_high` is the high as of the TRIP, which the latch
+    // can hold up to 42 hours behind it — so a standing watch can show
+    // "41 °F" through an afternoon that actually reached 77 °F. Stating the
+    // two tenses is cheaper than publishing a second high, and it is the
+    // honest sentence: the watch's claim has always been about the day
+    // behind the trip.
     badge.textContent =
-      "Warm for the weather — basement " +
-      fmt(watch.basement, 1) + " " + unit +
-      ", outdoor high " + fmt(watch.outdoor_high, 1) + " " + unit +
-      sinceSuffix(watch.since);
+      "Warm for the weather" + sinceSuffix(watch.since) +
+      " — now " + fmt(watch.basement, 1) + " " + unit +
+      ", outdoor high then " + fmt(watch.outdoor_high, 1) + " " + unit;
   }
 
   // When the watch was raised, in the reader's own clock. Omitted rather than
@@ -251,7 +258,7 @@ const METRICS = {
     if (Number.isNaN(at.getTime())) return "";
     const clock = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     const sameDay = at.toDateString() === new Date().toDateString();
-    return " · since " + (sameDay ? clock : at.toLocaleDateString() + " " + clock);
+    return " since " + (sameDay ? clock : at.toLocaleDateString() + " " + clock);
   }
 
   // Wash alert-event spans onto a chart, clipped to the plotting area.

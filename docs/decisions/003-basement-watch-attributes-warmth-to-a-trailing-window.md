@@ -70,6 +70,13 @@ Two supporting rules come with it:
   than a thing to trust. A rule with no observed positive also cannot be
   tuned: if 62 °F turns out to be the wrong threshold, nothing in the record
   will say so.
+- **Bounds, not hidden:** the latch is stateless, so it holds only as far
+  back as `history_lookback()` reads — 42 hours of continuous warmth. Past
+  that the original trip is outside every row the query returns, and the
+  watch answers `unknown` rather than `clear`: no reading was ever at or
+  below 62 °F, and clearing is the only thing #205 says that means. Raising
+  the bound costs quadratically (one `attributable_high` per in-window
+  reading); storing the trip is the fix if the case is ever observed.
 - **Reverses if:** the watch fires during a long outdoor-poller outage (then
   `MAX_ATTRIBUTION_GAP` is too generous), or Tom reads a suppressed warm-spell
   morning as a yellow he wanted (then the basis goes back to the calendar day,

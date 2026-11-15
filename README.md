@@ -72,7 +72,9 @@ is above 62 °F during the hours Tom says the room is unoccupied — weekdays
 the preceding 24 hours was below 62 °F too. A basement that is warm while the
 weather cannot account for it is warm for some reason inside the house. The
 watch reports and never instructs: there is no ntfy, no alert event and
-nothing that acts on it.
+nothing that acts on it. It holds until a reading comes back to 62 °F or
+below, so the basement temperature it shows is *now* and the outdoor high is
+*then* — up to 42 hours apart, which is why the badge says which is which.
 
 A trailing 24 hours rather than the calendar day, decided on the record rather
 than on taste — the two bases disagree about exactly one episode in the
@@ -83,7 +85,11 @@ data** — 0 of 898 candidate readings through 2026-11-14 — so its first
 appearance is worth going and looking at rather than trusting. And an
 outdoor-poller outage shows as **no badge**, never as a yellow: a maximum over
 a window with the afternoon missing is the night's high, so an uncovered
-attribution window is no verdict at all.
+attribution window is no verdict at all — published as `unknown`, which is a
+different key from `clear` even though both render as silence. The same goes
+for a basement warm for longer than the 42 hours of history the latch reads:
+its trip is outside the evidence, so the watch says `unknown` rather than
+claiming it cleared.
 
 Design and rationale live in [SCOPE.md](SCOPE.md); canonical vocabulary lives
 in [GLOSSARY.md](GLOSSARY.md).
