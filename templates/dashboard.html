@@ -21,20 +21,72 @@
   --series-co2: #2a78d6; --series-voc: #008300; --series-pm25: #4a3aa7;
   --series-temp: #eb6834; --series-humid: #e34948; --series-score: #52514e;
   --series-outdoor-temp: #0b7a86; --series-outdoor-precip: #3a68a8;
-  --series-outdoor-pressure: #8b5cbf; --series-basement-temp: #a8327f;
-  /* Green, and the obvious objection was measured rather than waved off: on
-     the temp card this sits beside the outdoor teal, and the two are tight.
-     Simulating deuteranopia (Vienot) and taking the minimum CIELAB dE76 to
-     the card's other three lines, this green scores 31.2 here and 31.3 in the
-     dark palette -- the best of seven candidates tried. The intuitive fixes
-     are worse, not better: a yellow-green scores 12.5 and an amber 16.2,
-     because both collide with the basement magenta once red-green is gone.
-     Change it only against the same measurement. */
-  --series-minisplit-temp: #1f7a3d;
-  /* The mini split's metered draw (#139). Measured the same way the green
-     above it was, and then once more: minimum CIELAB dE76 to the temp card's
+  --series-outdoor-pressure: #8b5cbf;
+  /* The basement sensor, on the temp card and (since #156) on the humidity
+     card. One colour per PLACE rather than per trace, which is also why the
+     variable lost its `-temp` suffix: the same magenta is that sensor's
+     temperature and its humidity, one card each. Value unchanged from #109. */
+  --series-basement: #a8327f;
+  /* The dining head, on the Great room card (its temperature) and the
+     humidity card (its humidity). Still a green, and a DIFFERENT green from
+     the #139 one, because the card that green was measured against no longer
+     exists in that shape: it was chosen for the minimum CIELAB dE76 to the
+     temp card's indoor orange, outdoor teal and basement magenta, and #156
+     moved this line off that card entirely.
+
+     Re-measured in the company it actually keeps now -- the Great room card's
+     indoor orange and azure draw, and the humidity card's red, basement
+     magenta and bedroom blue -- under normal vision and simulated deuteranopia
+     (Vienot 1999), in both palettes, sweeping the hue circle for the colour
+     whose WORST of those numbers is largest.
+
+     Keeping #139's green scored 23.6 in this palette and **10.4 in the dark
+     one**, both against the humidity card's red: a green and a red that merge
+     once red-green is gone, which is the one pair this card could not afford.
+     This one scores 29.2 / 22.2 against that red and 26.0 / 21.2 overall, in
+     the same range as the worst pair the dashboard already shipped (the
+     Bedroom card's old green beside its grey setpoint, 20.5 dark).
+
+     Note the method here reproduces #139's normal-vision figures exactly and
+     runs a few dE more generous on the dichromat side, so compare numbers
+     within this comment rather than across to that one. Change the pair only
+     against the same sweep. */
+  --series-dining-head: #0b8f5e;
+  /* The bedroom head (#156), on three cards: its temperature on the temp card
+     and the Bedroom card, its humidity on the humidity card. Its own colour
+     rather than the dining head's, because without one green would mean the
+     bedroom head on the temp card and the dining head one card away on the
+     humidity card.
+
+     Measured the same way, against every line it shares a card with: the temp
+     card's indoor orange, outdoor teal and basement magenta; the humidity
+     card's red, that magenta and the dining green; the Bedroom card's grey
+     setpoint, amber target and azure draw. Eight neighbours in each palette,
+     at one hue for both so the series reads as itself across themes.
+
+     This violet scores 43.6 light / 32.8 dark, nearest neighbour the azure
+     draw in both (64.4 normal / 43.8 deuteranopic in this palette, 64.0 / 32.5
+     in the dark one) -- which is the pair it meets on the Bedroom card, and
+     the one worth naming. The sweep's arithmetic winner was a plain blue
+     (#0266db / #437ef8) at 32.1 / 32.4, and it was rejected on the card
+     itself: rendered beside the azure draw it reads as two blues, because dE76
+     is a distance between patches and says nothing about two thin strokes on
+     one chart. The violet is a different hue family at every number the blue
+     beat it on, which is the thing the eye uses.
+
+     One thing this sweep surfaced and did not fix, recorded because the next
+     person to measure here will find it too: on the temp card the OUTDOOR teal
+     and the BASEMENT magenta score 5.9 light / 3.2 dark under this
+     simulation -- indistinguishable to a deuteranope. Both predate #156 and
+     already shared that card; #156 neither introduces nor worsens it, and
+     changing either would move a colour this file documents as measured
+     elsewhere. Worth its own look. */
+  --series-bedroom-head: #2135b6;
+  /* The mini split's metered draw (#139), now on both room cards' right-hand
+     watts axis rather than on the temp card. Measured the same way the greens
+     above were, and then once more: minimum CIELAB dE76 to the temp card's
      other four lines, under simulated deuteranopia (Vienot) AND under normal
-     vision, in BOTH palettes -- the green was chosen on the deuteranopia
+     vision, in BOTH palettes -- #139's green was chosen on the deuteranopia
      number alone, which can be improved at a trichromat's expense.
 
      Swept the whole hue circle for the pair whose WORST of those four numbers
@@ -43,10 +95,14 @@
      intuitive alternative, a strong blue (#2a2ad0 / #5f7ae8), is far better
      for normal vision (66.7 / 48.4) and much worse where it matters -- 20.6
      in the dark palette, because the dark outdoor cyan and a blue merge once
-     red-green is gone. Change the pair only against the same four numbers. */
+     red-green is gone. Change the pair only against the same four numbers.
+
+     Kept unchanged through #156 even though its own card changed: it is now
+     read beside the bedroom blue, and that blue was chosen against IT rather
+     than the other way round. */
   --series-minisplit-watts: #0098d9;
   /* The Bedroom card's setpoint and cycle target. Both are a dashed line and
-     the target dotted, so the pair reads apart from the head's solid green
+     the target dotted, so the pair reads apart from the head's solid line
      even where the colours do not. */
   --series-bedroom-setpoint: #52514e; --series-bedroom-target: #b8740b;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
@@ -59,8 +115,9 @@
     --series-co2: #3987e5; --series-voc: #008300; --series-pm25: #9085e9;
     --series-temp: #d95926; --series-humid: #e66767; --series-score: #c3c2b7;
     --series-outdoor-temp: #4bb9c3; --series-outdoor-precip: #6a95d8;
-    --series-outdoor-pressure: #b494e3; --series-basement-temp: #e07cc0;
-    --series-minisplit-temp: #5fc77f;
+    --series-outdoor-pressure: #b494e3; --series-basement: #e07cc0;
+    --series-dining-head: #43c898;
+    --series-bedroom-head: #7971fd;
     --series-minisplit-watts: #26beff;
     --series-bedroom-setpoint: #c3c2b7; --series-bedroom-target: #e6a23c;
   }
@@ -178,16 +235,16 @@ main {
   overflow: hidden;
 }
 /* A card carrying an overlay series has a fifth legend entry — #42's pressure
-   trace on precipitation, #109's outdoor trace on temp — and at phone widths
-   that wraps to three rows where every other card needs two. Reserved per-card
-   rather than raising the floor everywhere: two rows is the honest reservation
-   for the others, and the point of reserving at all is that the height never
-   changes, not that every card matches.
+   trace on precipitation — and at phone widths that wraps to three rows where
+   every other card needs two. Reserved per-card rather than raising the floor
+   everywhere: two rows is the honest reservation for the others, and the point
+   of reserving at all is that the height never changes, not that every card
+   matches.
 
    Keyed on `data-overlay`, which is the SAME attribute `dashboard.js` reads to
    decide whether to draw the overlay at all. One marker, two consumers: a card
    that loses it loses the fifth entry and its reservation together, rather
-   than keeping the entry and silently clipping it. Naming the two cards here
+   than keeping the entry and silently clipping it. Naming the cards here
    instead is what let #42's selector go stale the moment a second card grew an
    overlay. */
 .card[data-overlay] .u-legend { --legend-rows: 3; }
@@ -196,64 +253,49 @@ main {
    three-digit indoor value beside a negative outdoor one needs it at every
    width. `~=` matches one word of the space-separated `data-overlay`. */
 .card[data-overlay~="basement-temp"] .u-legend { --legend-rows: 4; }
-/* The mini split's room temperature is a seventh entry (#139) and needs the
-   same four rows, not a fifth -- measured against a real database with the
-   legend populated, at 1440/768/430/390/360: natural height 72px against the
-   74.8px four rows reserve, so a fifth row would be ~19px of permanent blank
-   space on this card at every width.
+/* The bedroom head's temperature is the temp card's seventh entry (#156, in
+   the slot #139's dining line held) and needs the same four rows, not a fifth
+   -- measured against a real database with the legend populated, at
+   1440/768/430/390/360: natural height 72px against the 74.8px four rows
+   reserve, so a fifth row would be ~19px of permanent blank space on this card
+   at every width.
 
    Say plainly what this rule does today: nothing. It and the basement's are
    both specificity (0,3,0) and both set 4, and the temp card carries both
    words, so deleting this changes no pixel right now. It is written anyway
    because the basement rule is keyed to a *different* overlay and would take
-   the fourth row with it if the basement line were ever dropped, leaving
-   seven entries in three rows. Forward insurance, not a live fix.
+   the fourth row with it if the basement line were ever dropped, leaving seven
+   entries in three rows. Forward insurance, not a live fix.
 
    Below ~330px of card (a 320px viewport) seven entries want six rows and
-   `overflow: hidden` clips them. That is where the paragraph above says the
-   line holds, and it is not new: origin/main's six entries already wanted
-   five rows there. Measured, not assumed -- a baseline checkout was served
-   the same database to check. */
-.card[data-overlay~="minisplit-temp"] .u-legend { --legend-rows: 4; }
-/* The mini split's metered draw is an eighth entry (#139) and it is the first
-   overlay on this card that costs a row -- but only on a narrow phone, so it
-   buys the row there and nowhere else.
+   `overflow: hidden` clips them. That is not new -- origin/main's six entries
+   already wanted five rows there.
 
-   Measured with the legend POPULATED (an idle legend reads "--" and packs two
-   entries narrower, so it answers a different question), and with the eighth
-   entry removed from the DOM as the control, so both counts come from the same
-   stylesheet, font and card width:
+   #139's eighth entry, the dining head's draw, is gone from this card (#156),
+   and so is the `@media (max-width: 379px)` rule that bought it a fifth row:
+   nothing on the page carries eight legend entries now. The draw's entry moved
+   to the Great room card, which has four. */
+.card[data-overlay~="bedroom-temp"] .u-legend { --legend-rows: 4; }
+/* The humidity card (#156) carries three overlays and so the same seven
+   entries the temp card does, and takes the same four rows. Not re-measured
+   from scratch and it does not need to be: this card's populated legend is
+   strictly NARROWER than the one those numbers came from -- `Basement`,
+   `Dining` and `Bedroom` against `Outdoor Temp`, `Basement` and `Bedroom`, and
+   a `54.1 %` value against a `-3.2 °F` one -- at the same font, the same card
+   width and the same entry count. Narrower entries cannot want more rows.
 
-     viewport  card   7 entries        8 entries
-       1440    340px  4 rows 71.9px    4 rows 71.9px
-        768    728px  2 rows 36.0px    2 rows 36.0px
-        430    390px  3 rows 54.0px    4 rows 71.9px
-        390    350px  4 rows 71.9px    4 rows 71.9px
-        380    340px  4 rows 71.9px    4 rows 71.9px
-        375    335px  4 rows 71.9px    5 rows 89.9px   <- the breakpoint
-        360    320px  4 rows 71.9px    5 rows 89.9px
-
-   So four rows (74.8px reserved) still carry eight entries at 380px and up,
-   and at 375px and below they clip one -- which would be the draw entry
-   itself, the only thing on the page that names that line. 375px is an
-   iPhone SE/8, not a hypothetical.
-
-   A viewport query rather than a container query because that is the
-   mechanism this stylesheet already uses (`max-width: 1024px` below) and the
-   card width is a pure function of it here. Scoped to the width that needs it
-   rather than raised everywhere: unconditional five rows would be ~18.7px of
-   permanent blank space on this card at 1440 and 390 alike, and a card
-   permanently taller than its row-mates grows the whole grid row.
-
-   Below ~320px of card eight entries want six rows and are clipped even at
-   five. Not new and not made materially worse: seven entries already wanted
-   five rows there on origin/main against the same four reserved. */
-@media (max-width: 379px) {
-  .card[data-overlay~="minisplit-watts"] .u-legend { --legend-rows: 5; }
-}
+   Two rules at four rows rather than one, for the reason the pair above gives:
+   either overlay could be dropped later, and a reservation keyed to the other
+   one would go with it. */
+.card[data-overlay~="basement-humid"] .u-legend { --legend-rows: 4; }
+.card[data-overlay~="bedroom-humid"] .u-legend { --legend-rows: 4; }
 /* The Bedroom card has five legend entries (time, Head, Setpoint, Target,
-   Draw) -- the same count as the precipitation card, so the same three rows. */
-.card[data-minisplit] .u-legend { --legend-rows: 3; }
+   Draw) -- the same count as the precipitation card, so the same three rows.
+   Keyed to that card by name rather than to `[data-room]`, because the Great
+   room card beside it has FOUR entries (time, Room, Head, Draw) and takes the
+   default two: the two room cards genuinely differ in how many lines they
+   draw, so one rule for both would be a blank row on one of them. */
+.card[data-room="bedroom"] .u-legend { --legend-rows: 3; }
 .u-legend .u-value { font-variant-numeric: tabular-nums; }
 .u-legend .u-series > * { padding: 0 4px !important; }
 #events { padding: 0 20px 24px; }
@@ -309,7 +351,18 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
   </section>
-  <section class="card" data-minisplit="bedroom">
+  {# The two room cards (#156). Hand-written like the precipitation card above,
+     for the same reason: they are not metric cards, so `web.METRIC_OVERLAYS`
+     cannot reach them. `data-room` is the marker `dashboard.js` looks up in
+     `ROOM_CARDS` -- a name here with no entry there draws nothing, and a name
+     there with no card here draws nowhere, which is what
+     `test_every_room_card_in_the_markup_has_a_config_and_the_other_way_round`
+     is for. #}
+  <section class="card" data-room="great-room">
+    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    <div class="plot"></div>
+  </section>
+  <section class="card" data-room="bedroom">
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
   </section>
@@ -324,28 +377,36 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   the <code>low</code> and <code>high</code> in a chart's legend are that
   bucket's, not the range's — the range's highest single reading is the
   <b>peak</b> beside the current value on each of the six indoor cards. Data: 30-second polls from
-  the Awair Element local API. The Temp card also carries the outdoor
-  temperature on the same axis, from quarter-hourly Open-Meteo readings held
-  between publishes — a break in that line is an outdoor-poller gap, not a
-  weather event — and the basement sensor's temperature, averaged per bucket;
-  a break in that line is a sensor or basement-poller gap — and the dining
-  room mini split head's own room temperature, read through the climate
-  bridge; a break in that line is a bridge or mini-split-poller gap. Those
-  four lines share one axis because they are all a temperature in the same
-  unit. <b>Draw</b> is the fifth line and the one exception: it is the head's
-  metered power draw in watts, read against the right-hand axis, so its height
-  is not comparable with any temperature on the card. It is the energy the head
-  reported over its own window divided by that window — not its spot reading,
-  which sat at a constant 30.0 W while the metered energy said 45–65 W. A break
-  in it is a window the head reported no energy for, or the same bridge or
-  mini-split-poller gap that breaks the Mini split line beside it; a flat zero
-  is a head that drew nothing, which is a reading rather than a gap.
-  The <b>Bedroom</b> card is the bedroom mini split head on its own: its
-  temperature, the setpoint it was sent and the climate bridge's target, with
-  its metered draw on the right-hand axis. The head's temperature is left off
-  once the head has been switched off for more than 30 minutes, because the
-  bridge keeps reporting an off head's last reading; a break in every line is
-  a bridge or mini-split-poller gap. A badge under the Temp card's header is
+  the Awair Element local API.
+  <b>Temp</b> is one temperature per place: the Awair's own room, the outdoor
+  temperature from quarter-hourly Open-Meteo readings held between publishes,
+  the basement sensor averaged per bucket, and the bedroom mini split head's
+  own reading read through the climate bridge. They share one axis because they
+  are all a temperature in the same unit, and the distance between them is what
+  the card is for. A break in a line is that source's own gap — an
+  outdoor-poller gap, a sensor or basement-poller gap, a bridge or
+  mini-split-poller gap — and never a weather event. The bedroom line is also
+  left off once that head has been switched off for more than 30 minutes,
+  because the bridge keeps reporting an off head's last reading.
+  <b>Humidity</b> is the same idea for the other quantity: the Awair's reading,
+  the basement sensor's, and each mini split head's own, all in percent on one
+  axis. A head's line is missing entirely if that head does not report
+  humidity — whether these units do has never been confirmed — so on this card
+  a flat absence is "no such reading", not necessarily an outage.
+  The two <b>room</b> cards are a room beside the mini split head that serves
+  it. <b>Great room</b> draws the Awair's average as its room line — the same
+  series the Temp card draws, from a sensor in the open hall rather than in the
+  room itself — with the dining head's own temperature beside it. <b>Bedroom</b>
+  draws that head's temperature, the setpoint it was sent and the climate
+  bridge's target. On both, <b>Draw</b> is the exception: it is the head's
+  metered power draw in watts, read against the <b>right-hand axis</b>, so its
+  height is not comparable with any temperature on the card. It is the energy
+  the head reported over its own window divided by that window — not its spot
+  reading, which sat at a constant 30.0 W while the metered energy said
+  45–65 W. A break in it is a window the head reported no energy for, or the
+  same bridge or mini-split-poller gap that breaks the temperature beside it; a
+  flat zero is a head that drew nothing, which is a reading rather than a gap.
+  A badge under the Temp card's header is
   the <b>basement watch</b>: the basement went above 62 °F during the hours the
   room is unoccupied, and the outdoor high of the 24 hours before that was
   below 62 °F too, so the weather does not account for it. It holds until a

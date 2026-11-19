@@ -29,6 +29,9 @@ The practical half of that choice: `last_decision.at` is published by the
 bridge **already on `origin/main`**, so this feed starts recording the dining
 head's temperature on the bridge deployed today and the draw columns fill in
 when parsons-pulse #182 lands.
+
+`humid` is read out of the head's raw SmartThings status (#156) and is the one
+column here whose source may not exist: see `_head_humidity`.
 """
 
 import http.client
@@ -66,6 +69,19 @@ DEFAULT_STATUS_URL = "http://127.0.0.1:8100/status"
 # inlined because it is the input to the one conversion in this project that
 # runs *into* storage.
 BRIDGE_UNIT = "F"
+
+# SmartThings' `relativeHumidityMeasurement` publishes its one attribute as
+# `humidity: {value, unit}`, and `%` is the only unit the capability defines.
+# Read out of the head's RAW status rather than from a bridge field, for the
+# same reason `_setpoint_celsius` reads the setpoint's unit there: the bridge
+# does not publish this one (#156, and the heads scope deliberately left it
+# inside `raw`).
+#
+# **Whether our heads report it at all is unverified.** The heads scope found
+# one illustrative line in homelab's docs and no raw dump, so a permanent NULL
+# in this column is one of the two answers this read exists to get.
+HUMIDITY_CAPABILITY = "relativeHumidityMeasurement"
+HUMIDITY_UNIT = "%"
 
 # The longest power-report window observed on the dining head: 800 s, against
 # the bridge's 300 s cycle (#139, three consecutive windows on 2026-10-26).
@@ -215,6 +231,33 @@ def _setpoint_celsius(head: dict) -> float | None:
     return units.to_celsius(_finite(head.get("setpoint")), BRIDGE_UNIT)
 
 
+def _head_humidity(head: dict) -> float | None:
+    """The head's relative humidity in percent, or None if it reports none.
+
+    None covers four cases that are all "no reading": a bridge that publishes
+    no raw status, a head without the capability, an attribute in some unit
+    other than percent, and a non-finite value. The unit is accepted when
+    **absent** and refused when present and not `%`: the capability defines
+    exactly one unit, so an omitted one is the ordinary shape, while a
+    different one is a capability this code does not understand.
+
+    No range clamp. A relative humidity outside 0–100 would be the device
+    lying, and this column records what the head said -- the same contract
+    `basement_readings.temp` keeps for a sensor reading 40 °C in a basement.
+    """
+    raw = head.get("raw")
+    try:
+        attribute = raw["components"]["main"][HUMIDITY_CAPABILITY]["humidity"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(attribute, dict):
+        return None
+    unit = attribute.get("unit")
+    if unit is not None and unit != HUMIDITY_UNIT:
+        return None
+    return _finite(attribute.get("value"))
+
+
 def _cycle_target(decision: dict) -> tuple[float | None, str | None]:
     """The target the cycle steered to, in °C, and where it came from.
 
@@ -330,6 +373,11 @@ def parse_reading(payload, received_at: str, head_name: str = DINING) -> dict | 
         if temperature_at is None
         else temperature_at.isoformat(),
         "raw": _raw_json(head),
+        # Read from the live payload's raw status, never from the stored one:
+        # `raw_to_store` drops a body identical to the last stored one, so a
+        # column filled from storage would be NULL on every cycle the head's
+        # status did not change -- which is most of them.
+        "humid": _head_humidity(head),
     }
 
 

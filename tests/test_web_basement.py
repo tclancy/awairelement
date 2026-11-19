@@ -21,15 +21,22 @@ def default_celsius(monkeypatch):
 
 
 def _seed_basement(db_path, samples):
-    """samples: [(datetime, celsius)] straight into basement_readings."""
+    """samples: [(datetime, celsius)] or [(datetime, celsius, percent)].
+
+    The humidity is optional because most callers are about the temperature
+    trace or the watch, and a sample that omits it stores NULL -- which is
+    exactly what a box stores for every minute polled before #156 (and for
+    every minute whose second GET failed).
+    """
     conn = db.connect(db_path)
-    for at, celsius in samples:
+    for at, celsius, *humid in samples:
         db.insert_basement_reading(
             conn,
             {
                 "ts": at.replace(second=0, microsecond=0).isoformat(),
                 "received_at": at.isoformat(),
                 "temp": celsius,
+                "humid": humid[0] if humid else None,
             },
         )
     conn.close()
@@ -48,14 +55,26 @@ def _client(tmp_path, monkeypatch, unit="C", basement=()):
 # --- the alignment, against hand-built grids ---
 
 
+def _rows(*samples):
+    """`basement_readings_since(..., _BASEMENT_SERIES_COLUMNS)`-shaped rows.
+
+    `(epoch, celsius)` or `(epoch, celsius, percent)`, so a test about the
+    temperature trace says nothing about the humidity column beside it (#156).
+    """
+    return [
+        (epoch, *rest, None)[:3] if len(rest) == 1 else (epoch, *rest)
+        for epoch, *rest in samples
+    ]
+
+
 def test_each_grid_stamp_takes_its_buckets_average_not_one_reading():
-    rows = [(0, 10.0), (60, 12.0), (120, 14.0), (300, 20.0)]
+    rows = _rows((0, 10.0), (60, 12.0), (120, 14.0), (300, 20.0))
     on_grid = web._basement_temp_on_grid(rows, [0, 300], 300, "C")
     assert on_grid == [12.0, 20.0]
 
 
 def test_one_missing_bucket_is_bridged_and_a_second_is_a_gap():
-    rows = [(0, 15.0)]
+    rows = _rows((0, 15.0))
     grid = [0, 60, 120, 180]
     assert web._basement_temp_on_grid(rows, grid, 60, "C") == [
         15.0,
@@ -70,25 +89,51 @@ def test_the_carry_window_is_two_buckets_wide_at_every_range():
         window = web._BASEMENT_CARRY_BUCKETS * bucket_seconds
         assert web._basement_carry_max_age_seconds(bucket_seconds) == window
         held, gone = web._basement_temp_on_grid(
-            [(0, 4.0)], [window, window + bucket_seconds], bucket_seconds, "C"
+            _rows((0, 4.0)), [window, window + bucket_seconds], bucket_seconds, "C"
         )
         assert held == 4.0
         assert gone is None
 
 
 def test_no_back_fill_before_the_first_reading():
-    assert web._basement_temp_on_grid([(600, 15.0)], [0, 600], 60, "C") == [
+    assert web._basement_temp_on_grid(_rows((600, 15.0)), [0, 600], 60, "C") == [
         None,
         15.0,
     ]
 
 
 def test_converted_to_the_display_unit():
-    assert web._basement_temp_on_grid([(0, 10.0)], [0], 60, "F") == [50.0]
+    assert web._basement_temp_on_grid(_rows((0, 10.0)), [0], 60, "F") == [50.0]
 
 
 def test_no_rows_is_a_full_length_run_of_nulls():
     assert web._basement_temp_on_grid([], [0, 60, 120], 60, "C") == [None] * 3
+
+
+# --- the humidity trace, off the same rows (#156) ---
+
+
+def test_the_humidity_rides_the_same_buckets_and_is_not_converted():
+    """Averaged per bucket like the temperature, and a percent in both units."""
+    rows = _rows((0, 10.0, 60.0), (60, 12.0, 62.0), (300, 20.0, 50.0))
+    assert web._basement_humid_on_grid(rows, [0, 300], 300) == [61.0, 50.0]
+
+
+def test_a_minute_with_no_humidity_contributes_nothing_rather_than_raising():
+    """Every row written before #156 has a NULL here, and `bucket` sums values.
+
+    So the null is dropped before the bucketing, and a bucket of nothing but
+    nulls is an empty bucket -- held for two, then a break, exactly as a minute
+    the sensor never answered is.
+    """
+    rows = _rows((0, 10.0, None), (60, 12.0, 62.0), (120, 14.0, None))
+    assert web._basement_humid_on_grid(rows, [0, 60, 120], 60) == [None, 62.0, 62.0]
+
+
+def test_the_temperature_survives_a_column_of_nulls_beside_it():
+    rows = _rows((0, 10.0, None), (60, 12.0, None))
+    assert web._basement_temp_on_grid(rows, [0, 60], 60, "C") == [10.0, 12.0]
+    assert web._basement_humid_on_grid(rows, [0, 60], 60) == [None, None]
 
 
 # --- the endpoint ---
@@ -139,9 +184,9 @@ def test_rows_are_read_from_one_carry_window_before_since(
     asked = []
     real = db.basement_readings_since
 
-    def spy(conn, since):
+    def spy(conn, since, *columns):
         asked.append(since)
-        return real(conn, since)
+        return real(conn, since, *columns)
 
     monkeypatch.setattr(db, "basement_readings_since", spy)
     before = datetime.now(UTC)
@@ -174,6 +219,7 @@ def test_the_range_read_returns_epoch_seconds_from_since(conn):
                 "ts": at.replace(minute=minute).isoformat(),
                 "received_at": at.replace(minute=minute).isoformat(),
                 "temp": temp,
+                "humid": None,
             },
         )
     assert db.basement_readings_since(conn, at.replace(minute=1)) == [

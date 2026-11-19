@@ -23,24 +23,30 @@ going down cannot wedge the others:
   heads scope, `docs/superpowers/specs/2026-10-31-minisplit-heads-scope.md`).
   Each row is one head's bridge *cycle*, keyed on `(head, ts)` with `ts` the
   cycle's own clock rather than our poll clock. It carries the head's
-  temperature, metered draw, setpoint and the cycle's target (both in °C), and
-  the head's raw SmartThings status as JSON, stored only when a value in it
-  changes. Loopback-only, so it runs on the bridge's box or not at all. The
-  **dining** head is the one that is charted: its temperature is drawn on the
-  temp card as a "Mini split" line on the same axis and its metered draw as a
-  "Draw" line on its own right-hand watts axis. Both are held for two report
-  windows, by one bound. The bedroom head is recorded and not charted.
+  temperature, metered draw, setpoint and the cycle's target (both in °C), its
+  own relative humidity where the head reports one (#156), and the head's raw
+  SmartThings status as JSON, stored only when a value in it
+  changes. Loopback-only, so it runs on the bridge's box or not at all. Since
+  #156 **both heads are charted, each on the card for the room it serves**: the
+  dining head's temperature and metered draw on the *Great room* card beside
+  the Awair's own average, the bedroom head's on the *Bedroom* card beside its
+  setpoint and target. The bedroom head's temperature is also the fourth line
+  on the temp card, and both heads' humidity rides the humidity card. Every
+  one of those traces is held for two report windows, by one bound.
 
-  Four things to expect on a box today. **The draw and the temperatures are not
+  Five things to expect on a box today. **The draw and the temperatures are not
   comparable by height.** They share a card and not an axis: the temperatures
   are drawn to the card's degree ruler, and the draw to a zero-anchored watts
   axis on the right, the way the precipitation card already carries pressure on
   an axis of its own (#42) — though pressure's is a *fixed* 28.5-31.0 inHg
   rather than anchored at zero, because a barometer has no meaningful zero and
-  a power draw does. An overlay on this card is admitted on one of two
-  grounds — it is a temperature in the card's own unit, or it declares its own
-  `scale` — and the footer says which axis the draw is read against, because
-  nothing on the chart does. **A bedroom zone configured off logs `bedroom
+  a power draw does. The footer says which axis the draw is read against,
+  because nothing on the chart does. **A head's humidity may never arrive.**
+  Whether these units carry SmartThings' `relativeHumidityMeasurement` has
+  never been confirmed — the heads scope found one illustrative line in
+  homelab's docs and no raw dump — so the column may stay NULL and the line
+  may stay absent, which on that card is a reading of sorts rather than an
+  outage. **A bedroom zone configured off logs `bedroom
   unkeyed` every poll**, which is the bridge publishing `bedroom: null`, not a
   fault. **The draw
   columns were NULL until parsons-pulse #182 deployed**; on the homelab they
@@ -56,14 +62,27 @@ going down cannot wedge the others:
   awairelement-minisplit`. Deliberate for a first cut, and the reason the log
   line is worth watching after a deploy.
 - **Basement** (`awair.basement`) — the basement ESPHome sensor's temperature
-  every 60 s, from `AWAIR_BASEMENT_URL` (default
-  `http://192.168.68.50/sensor/Temperature`). The payload has **no clock**, so
+  and humidity every 60 s, from `AWAIR_BASEMENT_URL` (default
+  `http://192.168.68.50/sensor/Temperature`) and the `Humidity` entity beside
+  it. The payload has **no clock**, so
   rows are keyed on our poll clock truncated to the minute: one row per
   poll-minute. An unavailable sensor (null/NaN `value`) stores nothing, so a
   gap in the table is a gap on the chart. Drawn on the temp card as a
   "Basement" line on the same axis, averaged per chart bucket and held for two
-  buckets. Like the mini split feed it has no
+  buckets — and since #156 on the humidity card the same way.
+  Like the mini split feed it has no
   health escalation; watch `journalctl --user -u awairelement-basement`.
+
+  **The humidity is a second GET and is subordinate to the first** (#156). The
+  module is an AHT-family temperature/humidity part, so the reading is there,
+  but the entity's *name* is a guess derived from the temperature URL and the
+  path is keyed on the entity, so a wrong guess is a 404. Nothing about that
+  fetch can cost the temperature: it happens only once the temperature has
+  parsed, every failure it can have stores NULL and logs, and the row is
+  written either way. If the entity turns out to be called something else,
+  `AWAIR_BASEMENT_HUMIDITY_URL` is the fix and no release is needed. Rows
+  written before this shipped have a NULL humidity and nothing backfills
+  them — the sensor publishes a current value and no history.
 
 The temp card also carries one derived verdict, the **basement watch**
 (parsons-pulse #205): a yellow badge under the card's header when the basement
@@ -157,6 +176,9 @@ omitted entirely to run without alerts.
 | `AWAIR_FAN_MAX_RUN_MINUTES` | `90` | Longest single fan run, regardless of CO2. |
 | `AWAIR_PM25_SUPPRESS` | `100` | pm25 (µg/m³) at or above which fans are blocked outright. |
 | `AWAIR_PM25_NEAR_MISS` | `50` | pm25 at or above which a watchpoint line is logged. Behaviour-neutral. |
+| `AWAIR_BASEMENT_URL` | `http://192.168.68.50/sensor/Temperature` | The basement ESPHome sensor's temperature entity. |
+| `AWAIR_BASEMENT_HUMIDITY_URL` | *(derived)* | The humidity entity. Defaults to `AWAIR_BASEMENT_URL` with `Temperature` swapped for `Humidity`; set it when the entity is named something else. Unset and underivable means no humidity is polled, which is the pre-#156 behaviour. |
+| `AWAIR_BASEMENT_POLL_SECONDS` | `60` | Seconds between basement polls. The module's own publish interval. |
 | `AWAIR_MINISPLIT_URL` | `http://127.0.0.1:8100/status` | The parsons-pulse climate bridge's status endpoint. Loopback-only, so the mini split poller has to run on the bridge's box. |
 | `AWAIR_MINISPLIT_POLL_SECONDS` | `300` | Seconds between mini split polls. The bridge's own control cycle — polling faster re-reads one report window. |
 | `AWAIR_WEB_SLOW_MS` | `1000` | Dashboard requests at or above this many milliseconds log at `WARNING` instead of `INFO`. See [Response times](#response-times). |
@@ -184,7 +206,8 @@ ingestion, so a wrong URL or 401 just gets logged.)
 - **Dashboard** — small multiples for CO2, TVOC, PM2.5, temp, humidity, and
   score over today, 7d or 30d, opening on today (#108). "Today" is since local
   midnight, not the last 24 h. Detected events overlay as shaded spans.
-  LAN-only by default (no auth).
+  LAN-only by default (no auth). Three cards beside those six: the composite
+  precipitation/pressure card (#42) and the two **room** cards (#156).
 - **Each card's range peak** (#116) — the header carries two numbers: the
   current reading, and `peak N`, the highest single reading over the range on
   screen. It exists because the card previously had no way to tell you that.
@@ -204,6 +227,30 @@ ingestion, so a wrong URL or 401 just gets logged.)
   (#109) and in summer the axis top is the outdoor line. The composite
   precipitation card has no peak — its header already carries two numbers of
   two different quantities, and a third wrapped it onto a second line.
+- **One temperature per place, and a card per room** (#156) — Tom's report was
+  that the temp card had become "barely readable" once everything was on it:
+  five lines, two quantities, eight legend entries. It is four lines now and
+  one quantity, one per *place* — the Awair's own room, outdoors, the basement
+  sensor, the bedroom head — because that is the comparison a single shared
+  axis is for. What came off it is the dining head's temperature and its
+  metered draw, and they did not go away: they are the **Great room** card,
+  which draws the Awair's bucket average as its room line beside the head that
+  serves that room and that head's draw on a right-hand watts axis. Its sibling
+  is the existing **Bedroom** card. The pair is drawn by one factory from a
+  `ROOM_CARDS` entry each, and the Great room card reads `/api/series` rather
+  than an endpoint of its own: all three of its traces are already on that
+  payload, on one grid, converted once. Screenshots in `docs/screenshots/`
+  (`156-*`), taken against a seeded database at 1440 and 390, light and dark.
+- **One humidity chart** (#156) — the same idea for the other quantity, and it
+  needed two new feeds rather than a rearrangement: the basement sensor's
+  humidity (a second GET against the AHT module's other entity) and each mini
+  split head's own (out of the raw SmartThings status the bridge already
+  publishes). The Awair's reading is the card's own line and the other three
+  ride it, all in percent on one axis. Two caveats, both real: **the heads may
+  report no humidity at all** — the capability is unverified on these units, so
+  a missing line there means "no such reading" as often as it means an
+  outage — and **nothing is backfilled**, so both new traces start at the
+  deploy rather than at the left edge of a 30-day range.
 - **One temperature chart, indoors and out** (#109) — the outdoor trace is
   drawn on the indoor temp card rather than on a card of its own, **sharing its
   Y axis**: both are a temperature in the same unit, and the distance between

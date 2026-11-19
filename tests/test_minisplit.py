@@ -672,3 +672,118 @@ def test_a_bridge_without_raw_stores_the_row_with_null_raw():
     del old["head"]["raw"]
     row = minisplit.parse_reading(old, RECEIVED, "bedroom")
     assert row["raw"] is None and row["temp"] == 13.89
+    # And no humidity, which is read from that same body (#156).
+    assert row["humid"] is None
+
+
+# -- the head's own humidity (#156) -------------------------------------------
+
+
+def test_the_heads_humidity_is_read_out_of_its_raw_status():
+    """The one column here whose source the bridge does not publish.
+
+    `relativeHumidityMeasurement` is a SmartThings capability and the bridge
+    keeps nine fields that do not include it, so this reads the raw status the
+    same way `_setpoint_celsius` reads the setpoint's unit. Percent, stored as
+    published: there is no conversion to make.
+    """
+    assert minisplit.parse_reading(zone(), RECEIVED, "bedroom")["humid"] == 30.0
+
+
+def test_the_humidity_comes_from_the_live_payload_not_from_the_stored_raw(conn):
+    """`raw_to_store` drops an unchanged body; the humidity must not go with it.
+
+    The sequence is the one `test_raw_is_stored_when_it_changes_...` uses: a
+    second cycle whose status differs only in its per-attribute stamps stores
+    `raw` as NULL. A humidity read out of storage would be NULL on that row --
+    on most rows, in fact, since a head's status rarely changes -- and the line
+    on the humidity card would be a dotted half of a trace.
+    """
+
+    def poll(at, raw):
+        minisplit.poll_once(conn, fetcher(body(bedroom=zone(at=at, raw=raw))))
+
+    poll("2026-10-31T17:00:00+00:00", smartthings(humidity=30))
+    poll(
+        "2026-10-31T17:05:00+00:00", smartthings(humidity=30, at="2026-10-31T17:04:00Z")
+    )
+    rows = conn.execute(
+        "SELECT raw, humid FROM minisplit_readings WHERE head = 'bedroom' ORDER BY ts"
+    ).fetchall()
+    assert [row[1] for row in rows] == [30.0, 30.0]
+    assert rows[1][0] is None, "the fixture no longer exercises the unchanged-raw path"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # Not `None`: `zone()` reads that as "use the default raw status". The
+        # no-raw case is `test_a_bridge_without_raw_stores_the_row_with_null_raw`.
+        {},
+        "not an object",
+        {"components": {"main": {}}},
+        {"components": {"main": {"relativeHumidityMeasurement": {}}}},
+        {"components": {"main": {"relativeHumidityMeasurement": {"humidity": None}}}},
+        {
+            "components": {
+                "main": {"relativeHumidityMeasurement": {"humidity": {"value": None}}}
+            }
+        },
+        {
+            "components": {
+                "main": {
+                    "relativeHumidityMeasurement": {
+                        "humidity": {"value": float("nan"), "unit": "%"}
+                    }
+                }
+            }
+        },
+        {
+            "components": {
+                "main": {
+                    "relativeHumidityMeasurement": {
+                        "humidity": {"value": 0.3, "unit": "fraction"}
+                    }
+                }
+            }
+        },
+    ],
+    ids=[
+        "empty-raw",
+        "raw-not-an-object",
+        "no-capability",
+        "no-attribute",
+        "null-attribute",
+        "null-value",
+        "nan",
+        "another-unit",
+    ],
+)
+def test_a_head_that_reports_no_usable_humidity_stores_null_and_keeps_its_row(raw):
+    """**The expected shape on these heads until the first real poll says otherwise.**
+
+    Nobody has seen a full raw dump of either unit; the heads scope recorded
+    one illustrative line in homelab's docs as the only evidence the capability
+    is there at all. So "no capability" is not a defensive branch here, it is a
+    live possibility -- and it must cost the humidity alone. `another-unit` is
+    the one case that is a refusal rather than an absence: the capability
+    defines percent, and a fraction stored as a percent is a 100x.
+    """
+    row = minisplit.parse_reading(zone(raw=raw), RECEIVED, "bedroom")
+    assert row["humid"] is None
+    assert row["temp"] == 13.89, "the temperature must survive a missing humidity"
+
+
+def test_a_humidity_with_no_unit_is_taken_as_percent():
+    """The capability defines exactly one unit, and devices do omit it.
+
+    Refusing an absent unit would throw away the reading over a field that can
+    only say one thing -- the opposite call from the setpoint, where the bridge
+    publishes a number that genuinely comes in two scales.
+    """
+    raw = {
+        "components": {
+            "main": {"relativeHumidityMeasurement": {"humidity": {"value": 41}}}
+        }
+    }
+    assert minisplit.parse_reading(zone(raw=raw), RECEIVED, "bedroom")["humid"] == 41.0

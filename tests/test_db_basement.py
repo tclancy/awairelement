@@ -18,6 +18,7 @@ def row(ts="2026-10-30T12:34:00+00:00", **overrides):
         "ts": ts,
         "received_at": "2026-10-30T12:34:56.789000+00:00",
         "temp": 15.1268,
+        "humid": 48.2,
     }
     return {**base, **overrides}
 

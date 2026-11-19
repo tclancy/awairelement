@@ -134,6 +134,12 @@ def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
     silently: the new card drew its fifth entry into a two-row box and clipped
     it, with nothing failing. A selector keyed on the marker covers the next
     one without an edit.
+
+    The seventh-entry rules are one per overlay rather than one per card, and
+    `test_every_overlay_card_reserves_four_rows` (in
+    `tests/test_web_overlay_cards.py`) is what holds the pair in step with
+    `web.METRIC_OVERLAYS`. Here they are only checked to exist: the temp card's
+    (#109, #156) and the humidity card's (#156).
     """
     body = _rule_body(html, ".card[data-overlay] .u-legend")
     assert body is not None, (
@@ -145,12 +151,18 @@ def test_a_card_carrying_an_overlay_reserves_an_extra_legend_row(html):
     # legend is populated (measured at 375px, and at every width worst-case).
     both = _rule_body(html, '.card[data-overlay~="basement-temp"] .u-legend')
     assert both is not None and re.search(r"--legend-rows:\s*4\s*;", both)
-    # The mini split's room temperature is a seventh entry and needs the same
-    # four rows, not a fifth (#139) -- measured against a real database at
-    # 1440/768/430/390/360, natural 72px against the 74.8px four reserve.
-    # Its own rule, because the basement's is keyed to a different overlay.
-    three = _rule_body(html, '.card[data-overlay~="minisplit-temp"] .u-legend')
+    # The bedroom head's temperature is the temp card's seventh entry (#156, in
+    # the slot #139's dining line held) and needs the same four rows, not a
+    # fifth -- measured against a real database at 1440/768/430/390/360,
+    # natural 72px against the 74.8px four reserve. Its own rule, because the
+    # basement's is keyed to a different overlay.
+    three = _rule_body(html, '.card[data-overlay~="bedroom-temp"] .u-legend')
     assert three is not None and re.search(r"--legend-rows:\s*4\s*;", three)
+    # The humidity card carries the same seven entries (#156) and takes the
+    # same four rows -- its populated legend is strictly narrower than the one
+    # those widths were measured on.
+    humid = _rule_body(html, '.card[data-overlay~="basement-humid"] .u-legend')
+    assert humid is not None and re.search(r"--legend-rows:\s*4\s*;", humid)
     assert not re.search(r'\.card\[data-outdoor="[a-z]+"\]\s*\.u-legend', html), (
         "a legend reservation is still keyed to one named card; key it on "
         "`[data-overlay]` so every overlay card is covered"
@@ -171,82 +183,77 @@ def _overlay_push_block(js_code):
     return match.group(0)
 
 
-def _overlay_loop_body(js_code):
-    """The whole `for (const overlay of overlays)` body, not just the push.
-
-    `_overlay_push_block` stops at the `seriesConfig.push` call because that is
-    what the scale guard is about. The axis guard needs the statements after
-    it, so it gets its own accessor rather than a widened regex that would
-    quietly change what the scale guard reads.
-    """
-    start = js_code.index("for (const overlay of overlays) {")
-    depth, i = 0, js_code.index("{", start)
-    while i < len(js_code):
-        if js_code[i] == "{":
-            depth += 1
-        elif js_code[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return js_code[start : i + 1]
-        i += 1
-    raise AssertionError("unbalanced braces in the overlay loop")
-
-
-def test_the_overlay_loop_never_names_a_scale_of_its_own(js_code):
-    """The loop carries `overlay.scale` and may not spell a scale itself.
+def test_the_overlay_loop_names_no_scale_at_all(js_code):
+    """Every metric-card overlay is drawn against its card's own y axis.
 
     The guarantee #109 needs is that its outdoor trace shares the indoor
     temperature's y axis: both series are a temperature in the same unit, the
     gap between them IS the thing the chart was asked for, and two auto-fitted
     axes draw a 1° indoor drift and a 20° outdoor swing as the same stroke.
+    Since #156 the humidity card wants the same thing of its three traces.
 
-    Until #139's watts line this was enforced by banning `scale:` from the push
-    block outright. That is no longer the rule, because the block now draws a
-    second quantity too — so the rule became: **the claim about which ruler a
-    trace belongs on is made once, on the trace's own `TEMP_OVERLAYS` entry,
-    and this loop only carries it.** A literal here would apply to every
-    overlay the loop draws, including the three temperatures, which is exactly
-    the #109 regression under a new spelling.
+    **This rule has been round the loop once and is back where it started.**
+    It began as "no `scale:` in the push block, ever". #139 put the dining
+    head's metered draw on the temp card in watts, which made the rule "the
+    claim is made once, per entry, as `scale: overlay.scale`". #156 took the
+    draw off that card -- it rides the Great room card now, beside the head
+    that produces it -- so no overlay on any metric card is anything but that
+    card's own quantity, and the outright ban is the honest guard again. A
+    per-entry scale would be a second unit on a shared AXIS, which was never
+    the fix; a literal here would be the #109 regression under a new spelling.
 
-    `test_every_temp_card_overlay_is_a_temperature_in_the_cards_unit` is the
-    other half: it holds every scale-LESS entry to the card's unit. Neither
-    test is sufficient alone — this one permits a per-entry scale, that one
-    says what omitting it promises.
+    A card that genuinely carries two quantities still exists, two of them, and
+    neither goes through this loop:
+    `test_a_card_drawing_a_second_quantity_gives_it_its_own_right_hand_axis`
+    covers those.
     """
     declared = [
         d.strip()
         for d in re.findall(r"\bscale\s*:\s*([^,\n}]+)", _overlay_push_block(js_code))
     ]
-    assert declared == ["overlay.scale"], (
-        f"the overlay push block declares {declared or 'no'} scale(s); it must "
-        "declare exactly `scale: overlay.scale` and never a literal, or the "
-        "ruler a trace is drawn to stops being a property of that trace (#139)"
+    assert declared == [], (
+        f"the overlay push block declares scale(s) {declared}; an overlay on a "
+        "metric card is that card's own quantity in that card's own unit, so "
+        "it is drawn against that card's axis and names no scale (#156). A "
+        "card carrying a second quantity declares it in its own factory"
     )
 
 
-def test_an_overlay_with_its_own_scale_gets_its_own_right_hand_axis(js_code):
+def test_a_card_drawing_a_second_quantity_gives_it_its_own_right_hand_axis(js_code):
     """A named scale with no axis is a trace drawn against nothing visible.
 
     uPlot will happily autoscale a series onto an unlabelled scale: the line
     renders, at a height no reader can convert into a number, and the only hint
     that it is not a temperature is the unit in the hover value. #42's pressure
-    overlay pairs its scale with a `side: 1` axis for this reason, and the
-    temperature-overlay loop has to do the same now that one of its entries
-    brings a scale (#139).
+    overlay pairs its scale with a `side: 1` axis for this reason, and the room
+    cards' metered draw does the same.
 
-    Asserted on the axis push inside the same loop, keyed on `overlay.scale` so
-    the axis cannot end up describing a different scale than the series.
+    Both sites are checked by harvesting every series that names a scale and
+    every axis that names one, and asserting the two sets agree: a series on a
+    scale with no axis is the failure above, and an axis for a scale no series
+    uses is a ruler for nothing. Keyed on the scale NAMES rather than on the
+    factories, so the next card that carries a second unit is covered without
+    an edit here.
     """
-    loop = _overlay_loop_body(js_code)
-    axis_push = re.search(r"axes\.push\(\{(.*?)\}\);", loop, re.S)
-    assert axis_push, (
-        "the overlay loop pushes no axis, so an overlay declaring `scale:` "
-        "draws against a scale with no axis (#139)"
+    on_series = set(re.findall(r'scale:\s*"(\w+)"', js_code))
+    assert on_series, (
+        "no series names a scale any more -- the precipitation card's pressure "
+        "trace and the room cards' draw both should (#42, #139)"
     )
-    body = axis_push.group(1)
-    assert re.search(r"side:\s*1\b", body), "the overlay axis is not on side 1"
-    assert re.search(r"scale:\s*overlay\.scale\b", body), (
-        "the overlay axis names a scale other than the overlay's own"
+    axes = [body for body in re.findall(r"axes\.push\(\{(.*?)\}\);", js_code, re.S)]
+    assert axes, "no chart pushes a right-hand axis"
+    on_axes = set()
+    for body in axes:
+        named = re.search(r'scale:\s*"(\w+)"', body)
+        assert named, f"a right-hand axis names no scale: {body.strip()[:80]!r}"
+        assert re.search(r"side:\s*1\b", body), (
+            f"a second-quantity axis is not on side 1: {body.strip()[:80]!r}"
+        )
+        on_axes.add(named.group(1))
+    assert on_series == on_axes, (
+        f"series are drawn on scales {sorted(on_series)} and axes are drawn "
+        f"for {sorted(on_axes)} -- a scale with no axis is a line at a height "
+        "no reader can convert into a number"
     )
 
 
@@ -260,21 +267,24 @@ def test_an_axis_is_only_drawn_for_a_trace_that_has_a_reading(js_code):
     `1.00` (measured 2026-11-06; `0` and `1` when that was first written,
     before `tickValues` began writing a label to its increment) down
     the right-hand edge of a temperature chart. With the gate, two. The legend
-    entry stays in both, which is how the temperature overlays already render
-    a dead source; it is the axis that has nothing to say.
+    entry stays in both, which is how a dead source already renders here; it is
+    the axis that has nothing to say.
 
+    The gate lives in the room-card factory since #156, where the draw now is.
     Keyed on the guard being in the axis push's condition rather than on the
     helper existing somewhere in the file: `hasReading` defined and not called
-    here is exactly the regression.
+    there is exactly the regression. The precipitation card's pressure axis
+    takes a FIXED range rather than a data-backed one, so it has nothing to
+    gate -- an empty pressure trace still leaves a ruler that reads correctly.
     """
-    loop = _overlay_loop_body(js_code)
+    factory = _function_source(js_code, "makeRoomPlot")
     condition = re.search(
-        r"if \(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*\{\s*scales\[", loop, re.S
+        r"if \(([^)]*(?:\([^)]*\)[^)]*)*)\)\s*\{\s*scales\.", factory, re.S
     )
-    assert condition, "the axis push is no longer guarded by an `if (...)`"
-    assert "hasReading(payload[overlay.payload])" in condition.group(1), (
-        "the overlay axis is created without checking the trace has a "
-        f"reading; condition is `{condition.group(1).strip()}`"
+    assert condition, "the room card's axis push is no longer guarded by an `if`"
+    assert "hasReading(payload.watts)" in condition.group(1), (
+        "the room card's watts axis is created without checking the trace has "
+        f"a reading; condition is `{condition.group(1).strip()}`"
     )
 
 
@@ -780,15 +790,19 @@ def test_no_x_axis_carries_the_y_tick_spacing(js_code):
 def test_every_right_hand_overlay_axis_carries_the_y_tick_spacing(js_code):
     """A second ruler on a card is a y axis too, and has to agree with the first.
 
-    These are the `axes.push({...})` sites: the temp and bedroom cards' watts
-    axes and the precipitation card's pressure axis. Built from the bare style
-    they would fit ticks to a different rule than the axis facing them across
-    the same chart — two rulers on one card, disagreeing about how dense a
-    ruler is.
+    These are the `axes.push({...})` sites: the room cards' shared watts axis
+    and the precipitation card's pressure axis. Built from the bare style they
+    would fit ticks to a different rule than the axis facing them across the
+    same chart — two rulers on one card, disagreeing about how dense a ruler
+    is.
+
+    Two since #156, where it was three: the temp card's watts axis went with
+    the draw it was for, and the Bedroom card's became the shared room-card
+    factory's, which the Great room card now draws through as well.
     """
     pushes = re.findall(r"axes\.push\(\{(.*?)\}\);", js_code, re.S)
-    assert len(pushes) == 3, (
-        f"expected 3 right-hand axis pushes (temp watts, bedroom watts, "
+    assert len(pushes) == 2, (
+        f"expected 2 right-hand axis pushes (the room cards' watts, "
         f"pressure), found {len(pushes)} — a new one needs a decision here"
     )
     for body in pushes:
