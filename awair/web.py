@@ -9,7 +9,17 @@ from datetime import UTC, datetime, timedelta
 
 from flask import Flask, abort, jsonify, render_template, request
 
-from awair import db, minisplit, outdoor, solar, spikes, timing, units, weather_alerts
+from awair import (
+    basement_watch,
+    db,
+    minisplit,
+    outdoor,
+    solar,
+    spikes,
+    timing,
+    units,
+    weather_alerts,
+)
 from awair.series import break_gaps, bucket, carry_forward, peak
 
 METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
@@ -18,6 +28,15 @@ METRIC_NAMES = ("co2", "voc", "pm25", "temp", "humid", "score")
 # Y-axis autoscaled to a peak doesn't visually collapse "still elevated" into
 # "cleared" (#25). Metrics without an entry in spikes.METRICS get no line.
 CEILINGS = {name: cfg.ceiling for name, cfg in spikes.METRICS.items()}
+
+# Which card carries the basement watch's badge (parsons-pulse #205). Named
+# here and handed to the template, so the one place "temp" is written down for
+# this feature is beside the code that derives it -- the same reason
+# `DEFAULT_RANGE` is a constant rather than an `aria-pressed` typed into the
+# markup. The basement sensor's trace is already an overlay on this card, so
+# the badge lands next to the line it is about.
+WATCH_METRIC = "temp"
+
 
 # Indoor metric cards that carry overlaid series (#109), and the names of the
 # overlays. Rendered onto the card as a space-separated `data-overlay`, which is the one
@@ -491,6 +510,53 @@ def _basement_temp_on_grid(rows, grid, bucket_seconds, unit):
     )
 
 
+def _basement_watch(conn, now):
+    """The basement watch (parsons-pulse #205), read with its own windows.
+
+    **Deliberately not the chart's range.** Every other block on
+    `/api/series` is a view of whatever span the reader clicked; this one is a
+    verdict about *now*, and a verdict whose evidence shrank when somebody
+    pressed "Today" would be a different rule on each button. Both windows
+    come from `basement_watch`, which derives them from its own constants.
+
+    Takes the open connection rather than the rows, because the two queries
+    here answer to this function alone — nothing else on the page reads a
+    window this wide.
+    """
+    since = datetime.fromtimestamp(now, UTC) - basement_watch.history_lookback()
+    outdoor_since = datetime.fromtimestamp(now, UTC) - timedelta(
+        seconds=basement_watch.attribution_lookback_seconds()
+    )
+    return basement_watch.watch(
+        db.basement_readings_since(conn, since),
+        db.outdoor_readings_since(conn, ("temp",), outdoor_since),
+        now,
+    )
+
+
+def _watch_payload(watch, unit):
+    """One `basement_watch.Watch` as JSON, temperatures in display units.
+
+    Converted here and not in `basement_watch`, which stays in the units the
+    rows are stored in — the same boundary every other temperature on this
+    endpoint crosses, so the badge cannot print a Celsius number beside a
+    Fahrenheit line.
+
+    `status` is the whole contract for the card: `"on"` draws the badge,
+    `"clear"` and `"unknown"` draw nothing. They are two keys rather than one
+    boolean because they are two different facts — "the basement is fine" and
+    "we have no reading to judge" — and a dashboard with no grey state can
+    render them identically without the payload having to pretend they are
+    the same.
+    """
+    return {
+        "status": watch.status,
+        "since": watch.since,
+        "basement": units.from_celsius(watch.basement, unit),
+        "outdoor_high": units.from_celsius(watch.outdoor_high, unit),
+    }
+
+
 def _metered_watts_of(delta_wh, window_start, window_close):
     """`minisplit.metered_watts` over two stored ISO stamps, or None.
 
@@ -667,6 +733,7 @@ def create_app(db_path=None):
             range_labels=RANGE_LABELS,
             default_range=DEFAULT_RANGE,
             overlays=METRIC_OVERLAYS,
+            watch_metric=WATCH_METRIC,
         )
 
     @app.get("/api/series")
@@ -704,6 +771,10 @@ def create_app(db_path=None):
                 since
                 - timedelta(seconds=_basement_carry_max_age_seconds(bucket_seconds)),
             )
+            # Its own windows, not this request's range -- see
+            # `_basement_watch`. Inside the `try` so it shares the one
+            # connection the endpoint opens.
+            watch = _basement_watch(conn, datetime.now(UTC).timestamp())
         finally:
             conn.close()
         unit = temp_unit()
@@ -757,6 +828,10 @@ def create_app(db_path=None):
                 "basement_temp": _basement_temp_on_grid(
                     basement_rows, metrics["temp"]["t"], bucket_seconds, unit
                 ),
+                # parsons-pulse #205. A verdict rather than a series, and
+                # the only block here whose window does not follow the
+                # range buttons.
+                "basement_watch": _watch_payload(watch, unit),
                 "temp_unit_symbol": units.symbol(unit),
             }
         )

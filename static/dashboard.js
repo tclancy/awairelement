@@ -204,6 +204,63 @@ const METRICS = {
     return peak == null ? "" : " · peak " + fmt(peak, digits);
   }
 
+  // The basement watch's badge (parsons-pulse #205): the basement is above
+  // 62 degrees while the outdoor high of the last day cannot account for it.
+  //
+  // Its own line under the header rather than another segment in it — the
+  // temp card's header already carries six numbers, and the badge is a
+  // sentence. Drawn only on `status === "on"`: `"clear"` and `"unknown"` are
+  // both silence here, because this card has no grey state and inventing one
+  // for "we have no reading" would say more than the payload knows.
+  //
+  // Composed here rather than shipped as a sentence from the server, so the
+  // endpoint keeps publishing facts and the wording is a presentation
+  // decision — the same split `/api/latest` keeps when it ships open events
+  // instead of a colour.
+  function renderWatch(card, watch, unit) {
+    const badge = card.querySelector(".watch");
+    if (!badge) return;
+    const on = watch && watch.status === "on";
+    badge.hidden = !on;
+    if (!on) {
+      badge.textContent = "";
+      return;
+    }
+    // Both numbers, because either alone is half the claim: the basement
+    // reading without the outdoor high reads as a thermostat complaint, and
+    // the high without the basement reading does not say what is warm.
+    //
+    // "now" and "then" are load-bearing, not filler. `basement` is the newest
+    // reading and `outdoor_high` is the high as of the TRIP, which the latch
+    // can hold up to 42 hours behind it — so a standing watch can show
+    // "41 °F" through an afternoon that actually reached 77 °F. Stating the
+    // two tenses is cheaper than publishing a second high, and it is the
+    // honest sentence: the watch's claim has always been about the day
+    // behind the trip.
+    badge.textContent =
+      "Warm for the weather" + sinceSuffix(watch.since) +
+      " — now " + fmt(watch.basement, 1) + " " + unit +
+      ", outdoor high then " + fmt(watch.outdoor_high, 1) + " " + unit;
+  }
+
+  // When the watch was raised, in the reader's own clock. Omitted rather than
+  // guessed at if the payload carries no stamp: a badge that said "since
+  // Invalid Date" would be worse than one that said nothing about when.
+  //
+  // The date is dropped when the trip was today, which is the ordinary case
+  // and the one that costs the most: the badge is a sentence on a card that
+  // is 330px wide on a phone, and "11/14/2026, 5:52:00 PM" is most of a line
+  // on its own. The latch can hold overnight, so the date is kept when it
+  // actually says something.
+  function sinceSuffix(since) {
+    if (since == null) return "";
+    const at = new Date(since * 1000);
+    if (Number.isNaN(at.getTime())) return "";
+    const clock = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const sameDay = at.toDateString() === new Date().toDateString();
+    return " since " + (sameDay ? clock : at.toLocaleDateString() + " " + clock);
+  }
+
   // Wash alert-event spans onto a chart, clipped to the plotting area.
   function eventWashPlugin(metric) {
     return {
@@ -991,6 +1048,10 @@ const METRICS = {
         seriesPayload,
         seriesPayload.peaks[metric]
       );
+      // Only the card the template gave a `.watch` element has one, so this
+      // is a no-op on the other five without naming which card is which
+      // twice (`web.WATCH_METRIC` is the one place that decides).
+      renderWatch(card, seriesPayload.basement_watch, seriesPayload.temp_unit_symbol);
     }
     for (const card of document.querySelectorAll(".card[data-outdoor]")) {
       const metric = card.dataset.outdoor;
