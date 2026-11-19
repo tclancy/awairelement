@@ -203,6 +203,7 @@ MINISPLIT_COLUMNS_DDL = """
     decision_reason TEXT,
     temperature_at TEXT,
     raw TEXT,
+    humid REAL,
     PRIMARY KEY (head, ts)
 """
 
@@ -260,6 +261,19 @@ MINISPLIT_COLUMNS = (
     # so an old stamp on a running head is a steady room, not a stale reading).
     "temperature_at",
     "raw",
+    # The head's own relative humidity in percent, out of its raw status's
+    # `relativeHumidityMeasurement` (#156). Last in this list because it
+    # reaches a deployed table through an ALTER and a migrated table may only
+    # append -- the same rule `OUTDOOR_MIGRATED_COLUMNS` records, and
+    # `test_the_physical_columns_are_the_published_list_in_order` is what keeps
+    # the two installs one table.
+    #
+    # NULL means *not reported*, and on these heads that may be permanent: the
+    # heads scope found no evidence beyond one illustrative line in homelab's
+    # docs that these units carry the capability at all, and the first rows
+    # written after deploy are what settle it. NULL also covers every row
+    # stored before this column existed; nothing backfills them out of `raw`.
+    "humid",
 )
 
 # The basement ESPHome sensor (`awair.basement`). Its payload carries NO clock,
@@ -272,14 +286,28 @@ MINISPLIT_COLUMNS = (
 BASEMENT_COLUMNS_DDL = """
     ts TEXT NOT NULL PRIMARY KEY,
     received_at TEXT NOT NULL,
-    temp REAL NOT NULL
+    temp REAL NOT NULL,
+    humid REAL
 """
 
 SCHEMA += (
     "\nCREATE TABLE IF NOT EXISTS basement_readings (" + BASEMENT_COLUMNS_DDL + ");\n"
 )
 
-BASEMENT_COLUMNS = ("ts", "received_at", "temp")
+BASEMENT_COLUMNS = (
+    "ts",
+    "received_at",
+    "temp",
+    # The AHT module's relative humidity in percent, from the sensor's second
+    # entity (#156). Nullable where `temp` is not, and the asymmetry is the
+    # point: the row's reason to exist is a temperature, and the humidity is a
+    # second GET with its own failures. A poll that reads the temperature and
+    # cannot read the humidity stores the row with a NULL here rather than
+    # dropping the temperature with it. NULL therefore means one of three
+    # things -- the entity did not answer, it answered in a unit we refuse, or
+    # the row predates this column -- and in none of them is it a reading.
+    "humid",
+)
 
 OUTDOOR_COLUMNS = (
     "ts",
@@ -567,6 +595,17 @@ def _migrate(conn) -> None:
     # Independent of the outdoor work above; after it only so the outdoor
     # comment's "last" stays true of the outdoor ALTERs.
     _migrate_minisplit_heads(conn)
+    # The head's own humidity (#156). **After the rebuild above, and that
+    # ordering is load-bearing**: the rebuild copies a legacy table's columns
+    # and refuses any column it does not know, so adding this one first turns
+    # every legacy install's next connect into "refusing to rebuild
+    # minisplit_readings: it carries column(s) ['humid']". A rebuilt table
+    # already has it from the DDL, which this ALTER reads as a duplicate.
+    _add_column(conn, "minisplit_readings", "humid REAL")
+    # The basement sensor's humidity (#156). Nullable, no DEFAULT: a row
+    # written before the second entity was polled genuinely does not know the
+    # humidity, and `0` would assert bone-dry across the whole history.
+    _add_column(conn, "basement_readings", "humid REAL")
 
 
 def _minisplit_is_legacy(conn) -> bool:
@@ -904,13 +943,26 @@ def insert_basement_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     return cursor.rowcount == 1
 
 
-def basement_readings_since(conn, since) -> list:
-    """[(epoch_seconds, celsius)] ascending, for poll-minutes at or after `since`."""
+def basement_readings_since(conn, since, columns=("temp",)) -> list:
+    """[(epoch_seconds, col1, ...)] ascending, for poll-minutes at or after `since`.
+
+    `columns` defaults to the temperature alone, which is what the basement
+    watch and this table's first two readers want, so a caller that needs only
+    that is unchanged by the humidity column arriving beside it (#156). Named
+    columns rather than `SELECT *` for the reason `outdoor_readings_since` and
+    `minisplit_readings_since` name theirs: the physical order is a migration
+    artefact, and a positional read of it would start meaning something else
+    the next time a column is appended.
+    """
+    unknown = set(columns) - set(BASEMENT_COLUMNS)
+    if unknown:
+        raise ValueError(f"unknown basement columns {unknown}")
     rows = conn.execute(
-        "SELECT ts, temp FROM basement_readings WHERE ts >= ? ORDER BY ts",
+        f"SELECT ts, {', '.join(columns)} FROM basement_readings"
+        " WHERE ts >= ? ORDER BY ts",
         (since.isoformat(),),
     )
-    return [(datetime.fromisoformat(ts).timestamp(), temp) for ts, temp in rows]
+    return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
 
 def latest_minisplit_raw(conn, head: str) -> str | None:

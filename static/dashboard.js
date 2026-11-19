@@ -37,86 +37,96 @@ const METRICS = {
     },
   };
 
-  // The temperature overlays the indoor temp card can carry, in draw order.
-  // `key` is the word in the card's space-separated `data-overlay`; `payload`
-  // is the `/api/series` key holding the trace, already on `metrics.temp.t`;
-  // `prefix` labels its latest value in the card header, and an overlay with
-  // no prefix stays out of the header. The basement has none: a fourth number
-  // needs ~265px against the ~245px the header has at the card's 330-340px
-  // (measured at 1440 and 390), and the wrapped header pushed the temp chart
-  // ~19px below its row-mates' and grew the whole row. The mini split has
-  // none for the same measured reason -- it would be the same fourth number,
-  // one overlay later.
+  // The overlays each metric card can carry, keyed by the card's metric and in
+  // draw order. `key` is the word in the card's space-separated
+  // `data-overlay`; `payload` is the `/api/series` key holding the trace,
+  // already on that card's own x-grid; `prefix` labels its latest value in the
+  // card header, and an overlay with no prefix stays out of the header.
   //
-  // `scale` is what lets one card carry two quantities, and an entry that
-  // omits it is making a claim: this trace is the card's own metric in the
-  // card's own unit, so it belongs on the card's axis. The three temperatures
-  // omit it deliberately -- the distance between an indoor line and an outdoor
-  // one IS the answer #109 asked for, and two auto-fitted axes would draw a 1
-  // degree indoor drift and a 20 degree outdoor swing as the same stroke.
+  // **Every entry is its card's own quantity in its card's own unit, drawn
+  // against the card's own y axis**, and that shared axis is the whole point:
+  // the distance between an indoor line and an outdoor one IS the answer #109
+  // asked for, where two auto-fitted axes would draw a 1 degree indoor drift
+  // and a 20 degree outdoor swing as the same stroke. `web.METRIC_OVERLAYS`
+  // carries the rule; the push loop below has no `scale:` to declare, which is
+  // what makes it true of every entry rather than of the ones that remembered.
   //
-  // The mini split's metered draw is the first entry here that declares one
-  // (#139). It is in watts, so the shared-axis claim is false for it: on the
-  // card's degree ruler a 600 W trace puts every temperature on the floor.
-  // It gets its own right-hand axis, the way #42's pressure overlay already
-  // does on the precipitation card -- a second unit on a shared card was
-  // never the problem, a second unit on a shared *axis* is.
+  // The `scale:` machinery that used to live here arrived with #139's metered
+  // draw and left with it in #156: the draw now rides the Great room card
+  // beside the head that produces it, where a second quantity is declared in
+  // the chart factory rather than in a list whose other entries share one
+  // ruler. Two cards still carry two units -- precipitation's pressure trace
+  // and the room cards' draw -- and both say so in their own factory.
   //
-  // `unit` and `digits` ride with the scale and are read by the hover
-  // formatter, because an overlay off the card's axis can no longer borrow
-  // the card's `METRICS` entry for them. An entry that declares `scale` and
-  // omits either one is caught by
-  // `test_an_overlay_off_the_cards_axis_brings_its_own_unit`.
-  const TEMP_OVERLAYS = [
-    {
-      key: "outdoor-temp",
-      payload: "outdoor_temp",
-      label: OUTDOOR_METRICS.temp.name,
-      colorVar: OUTDOOR_METRICS.temp.colorVar,
-      prefix: "out",
-    },
-    {
-      key: "basement-temp",
-      payload: "basement_temp",
-      label: "Basement",
-      colorVar: "--series-basement-temp",
-      prefix: null,
-    },
-    {
-      key: "minisplit-temp",
-      payload: "minisplit_temp",
-      label: "Mini split",
-      colorVar: "--series-minisplit-temp",
-      prefix: null,
-    },
-    {
-      key: "minisplit-watts",
-      payload: "minisplit_watts",
-      // "Draw", not "power": the series is the energy the head metered over
-      // its own report window divided by that window -- GLOSSARY.md's
-      // **metered draw**, which is what `minisplit.metered_watts` publishes.
-      // The head's spot `power` reading sat at a constant 30.0 W across three
-      // windows whose metered energy implied 45, 54 and 65 W, and
-      // `/api/series` deliberately does not carry it.
-      //
-      // One word rather than the glossary's two, and shorter than the first
-      // draft deliberately -- but be accurate about what that bought, because
-      // it is less than it looks. Measured with the entry removed from the DOM
-      // as the control: "Mini split draw" was the longest label on the card
-      // and wanted a sixth row at a 300px card, where "Draw" wants five. At a
-      // 320px card both want five. So the shortening did NOT keep eight
-      // entries inside the four rows already reserved -- the media query in
-      // `dashboard.html` is what covers that, and this only moved the
-      // narrowest measured case by one row. It reads in context (the entry
-      // above it is "Mini split") and the value carries its own `W`.
-      label: "Draw",
-      colorVar: "--series-minisplit-watts",
-      prefix: null,
-      scale: "watts",
-      unit: "W",
-      digits: 0,
-    },
-  ];
+  // Only `outdoor-temp` has a header prefix, and it is a measured limit rather
+  // than a preference: a fourth number needs ~265px against the ~245px the
+  // header has at the card's 330-340px (measured at 1440 and 390), and the
+  // wrapped header pushed the temp chart ~19px below its row-mates' and grew
+  // the whole grid row. Every other overlay on either card is read from the
+  // chart and its legend.
+  const CARD_OVERLAYS = {
+    // One temperature per place (#156): the Awair's own room is the card's
+    // line, and outdoors, the basement and the bedroom head ride it. The
+    // dining head is NOT here -- it reads the same room the Awair does, so the
+    // two belong on the Great room card together.
+    temp: [
+      {
+        key: "outdoor-temp",
+        payload: "outdoor_temp",
+        label: OUTDOOR_METRICS.temp.name,
+        colorVar: OUTDOOR_METRICS.temp.colorVar,
+        prefix: "out",
+      },
+      {
+        key: "basement-temp",
+        payload: "basement_temp",
+        label: "Basement",
+        colorVar: "--series-basement",
+        prefix: null,
+      },
+      {
+        key: "bedroom-temp",
+        payload: "bedroom_temp",
+        label: "Bedroom",
+        colorVar: "--series-bedroom-head",
+        prefix: null,
+      },
+    ],
+    // The house's humidity in one place (#156). The Awair's reading is the
+    // card's own series; the basement sensor and both heads ride it. All four
+    // are a relative humidity in percent, so there is nothing to convert and
+    // nothing that could want a second axis.
+    //
+    // **A head that reports no humidity draws as nothing at all**, which is
+    // the honest rendering and may well be what both heads do: whether these
+    // units carry SmartThings' `relativeHumidityMeasurement` has never been
+    // verified (see `minisplit._head_humidity`). The entry stays either way,
+    // the same way the temperature overlays stay through a dead poller -- a
+    // break means "no reading", and here that covers "no such sensor" too.
+    humid: [
+      {
+        key: "basement-humid",
+        payload: "basement_humid",
+        label: "Basement",
+        colorVar: "--series-basement",
+        prefix: null,
+      },
+      {
+        key: "minisplit-humid",
+        payload: "minisplit_humid",
+        label: "Dining",
+        colorVar: "--series-dining-head",
+        prefix: null,
+      },
+      {
+        key: "bedroom-humid",
+        payload: "bedroom_humid",
+        label: "Bedroom",
+        colorVar: "--series-bedroom-head",
+        prefix: null,
+      },
+    ],
+  };
 
   // The words of a card's `data-overlay`, which is space-separated so one card
   // can carry more than one overlay.
@@ -604,13 +614,13 @@ const METRICS = {
     return Array.isArray(trace) && trace.some((v) => v != null);
   }
 
-  // The hover value for one overlay. An overlay on the card's own axis borrows
-  // the card's unit and precision from `METRICS`; one with its own `scale` is
-  // a different quantity and cannot, so it carries `unit` and `digits`.
-  function overlayFormatter(overlay, meta) {
-    const unit = overlay.scale ? overlay.unit : meta.unit;
-    const digits = overlay.scale ? overlay.digits : meta.digits;
-    return (u, v) => (v == null ? "–" : v.toFixed(digits) + (unit ? " " + unit : ""));
+  // The hover value for one overlay: the card's own unit and precision, read
+  // from `METRICS`, because that is exactly what an overlay on a metric card
+  // now is. The variant that read a scaled overlay's own `unit`/`digits` went
+  // with the draw it was written for (#139, removed in #156).
+  function overlayFormatter(meta) {
+    return (u, v) =>
+      v == null ? "–" : v.toFixed(meta.digits) + (meta.unit ? " " + meta.unit : "");
   }
 
   function makePlot(card, metric, series, payload, peak) {
@@ -619,19 +629,20 @@ const METRICS = {
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
 
-    // #109: the outdoor (and now basement) temperature traces ride on the
-    // indoor temp card. Dispatched on `data-overlay`, not on
-    // `metric === "temp"`, because the CSS reserves this card's extra legend
-    // rows from the same attribute — one marker, so the entries and the space
-    // for them cannot disagree.
+    // #109, and since #156 two cards do this: the outdoor, basement and
+    // bedroom temperatures ride the temp card, and the basement's and both
+    // heads' humidity ride the humidity card. Dispatched on `data-overlay`,
+    // not on the metric name, because the CSS reserves each card's extra
+    // legend rows from the same attribute — one marker, so the entries and the
+    // space for them cannot disagree.
     //
-    // The server ships each trace already on `series.t` (see
-    // `web._outdoor_temp_on_grid`, `web._basement_temp_on_grid`): uPlot takes
-    // one x array per chart. Nothing here resamples, interpolates or holds
-    // anything — that is a decision about what a stale reading means, and it
-    // belongs in Python where it is tested.
+    // The server ships each trace already on this card's own `series.t` (see
+    // `web._outdoor_temp_on_grid` and its siblings): uPlot takes one x array
+    // per chart. Nothing here resamples, interpolates or holds anything — that
+    // is a decision about what a stale reading means, and it belongs in Python
+    // where it is tested.
     const keys = overlayKeys(card);
-    const overlays = TEMP_OVERLAYS.filter(
+    const overlays = (CARD_OVERLAYS[metric] || []).filter(
       (o) => keys.includes(o.key) && Array.isArray(payload[o.payload])
     );
 
@@ -679,14 +690,15 @@ const METRICS = {
         label: overlay.label,
         stroke: cssVar(overlay.colorVar),
         width: 1.5,
-        // The scale is `overlay.scale` and never a literal spelled here: the
-        // claim about which ruler a trace belongs on is made once, in
-        // `TEMP_OVERLAYS` beside the trace it is about, and this loop only
-        // carries it. An overlay that omits it shares the card's own axis,
-        // which is what #109's three temperatures want and what
-        // `test_the_overlay_loop_never_names_a_scale_of_its_own` pins.
-        ...(overlay.scale ? { scale: overlay.scale } : {}),
-        value: overlayFormatter(overlay, meta),
+        // No `scale:`, and its absence is the claim: every overlay on a metric
+        // card is that card's own quantity in that card's own unit, so it is
+        // drawn against the card's own ruler. A literal here would apply to
+        // every overlay the loop draws, which is the #109 regression under a
+        // new spelling, and a per-entry one would be a second unit on a shared
+        // AXIS -- the thing that was never the fix. A card that genuinely
+        // carries two quantities declares the second in its own factory; see
+        // `makeRoomPlot` and `makeOutdoorPlot`.
+        value: overlayFormatter(meta),
         points: { show: false },
         // The server nulls the trace once the last observation goes stale, so
         // a dead poller has to render as a break. Spanned,
@@ -694,35 +706,6 @@ const METRICS = {
         // missing one.
         spanGaps: false,
       });
-      // One axis per distinct scale, not per overlay: two overlays declaring
-      // the same scale are two traces on one ruler, which is the point of
-      // naming it. Note the ordering this buys for free -- `scales[...]` is
-      // written only where the axis is pushed, so if the first overlay on a
-      // scale has an empty trace, a later one with readings still gets the
-      // axis rather than inheriting the first one's silence.
-      //
-      // And only when the trace has something in it. A trace that is entirely
-      // null is what every box ran before parsons-pulse #182 shipped the
-      // window fields, and what any box runs when the bridge is down -- and
-      // measured against such a database the axis renders as the literal
-      // labels `0.00` through `1.00` down the right-hand edge of a
-      // temperature chart,
-      // a ruler for a line that is not there. The series stays in the legend
-      // either way, which is how the temperature overlays already render a
-      // dead source; it is the axis that has nothing to say. uPlot
-      // auto-creates the named scale for the series, so nothing is drawn
-      // against an undefined one.
-      if (overlay.scale && hasReading(payload[overlay.payload])
-          && !(overlay.scale in scales)) {
-        scales[overlay.scale] = { range: overlayScaleRange };
-        axes.push({
-          ...yAxisStyle(),
-          side: 1,
-          scale: overlay.scale,
-          size: 44,
-          values: tickValues(overlay.digits),
-        });
-      }
     }
 
     const plot = new uPlot(
@@ -940,26 +923,89 @@ const METRICS = {
     card.querySelector(".now").textContent = nowText;
   }
 
-  // The Bedroom card's temperature lines, in draw order (scope 2026-10-31,
-  // step 4). `trace` is the `/api/bedroom-series` key -- not `payload`, which
-  // is the `/api/series` contract `TEMP_OVERLAYS` entries are checked against. All three share the
-  // card's degree axis because they are one quantity in one unit; the draw is
-  // pushed separately below because it is not. The server has already nulled
-  // the head temperature for a long-off head and broken every line at a gap,
-  // so nothing here decides what a stale reading means.
-  const BEDROOM_SERIES = [
-    { trace: "temp", label: "Head", colorVar: "--series-minisplit-temp", width: 2 },
-    { trace: "setpoint", label: "Setpoint", colorVar: "--series-bedroom-setpoint", width: 1.5, dash: [5, 3] },
-    { trace: "target", label: "Target", colorVar: "--series-bedroom-target", width: 1.5, dash: [1, 3] },
-  ];
+  // The room cards: one room, the mini split head that serves it, and that
+  // head's metered draw (#156). The Bedroom card (scope 2026-10-31, step 4)
+  // was the first of these and the Great room card is the second, built from
+  // the same factory rather than a fourth one -- they differ in which traces
+  // they draw, not in how a room card works.
+  //
+  // `trace` is a key on the payload this card is handed, which is NOT the same
+  // payload for both cards:
+  //
+  // - `bedroom` reads `/api/bedroom-series`, the bedroom head on its own rows.
+  // - `great-room` reads `/api/series`, re-shaped by `greatRoomPayload` below.
+  //   The three traces that card needs are already on that payload, on one
+  //   grid, converted once: the Awair's bucket average is the room line and
+  //   the dining head's temperature and draw are carried onto the same stamps
+  //   (`web._minisplit_on_grid`). An endpoint of its own would re-run the
+  //   heaviest query on the page to publish numbers the browser already holds.
+  //
+  // Every `lines` entry shares the card's degree axis because they are one
+  // quantity in one unit. The draw is pushed separately below, against a
+  // right-hand watts axis, because it is not -- on a degree ruler a 600 W
+  // trace puts every temperature on the floor.
+  //
+  // `header` is the card's "now" text, in order: the first segment bare, the
+  // rest prefixed, because two bare numbers in one unit read as a range.
+  //
+  // The server has already nulled what must not be drawn -- a long-off head's
+  // temperature, a stale carry -- and broken every line at a gap, so nothing
+  // here decides what a stale reading means.
+  const ROOM_CARDS = {
+    "great-room": {
+      name: "Great room",
+      dotVar: "--series-temp",
+      lines: [
+        // The Awair's own bucket average: the same series the Temp card draws
+        // as its indoor line, which is what #156 asked this card to show.
+        { trace: "room", label: "Room", colorVar: "--series-temp", width: 2 },
+        { trace: "head", label: "Head", colorVar: "--series-dining-head", width: 1.5 },
+      ],
+      header: [
+        { trace: "room", digits: 1 },
+        { trace: "head", prefix: "head", digits: 1 },
+      ],
+    },
+    bedroom: {
+      name: "Bedroom",
+      dotVar: "--series-bedroom-head",
+      lines: [
+        { trace: "temp", label: "Head", colorVar: "--series-bedroom-head", width: 2 },
+        { trace: "setpoint", label: "Setpoint", colorVar: "--series-bedroom-setpoint", width: 1.5, dash: [5, 3] },
+        { trace: "target", label: "Target", colorVar: "--series-bedroom-target", width: 1.5, dash: [1, 3] },
+      ],
+      header: [
+        { trace: "temp", digits: 1 },
+        { trace: "setpoint", prefix: "set", digits: 0 },
+      ],
+    },
+  };
 
-  function makeBedroomPlot(card, payload) {
+  // The Great room card's traces, out of the `/api/series` payload the metric
+  // cards are already drawn from. Field selection only: every decision about
+  // bucketing, carrying and what a stale reading means was made in Python.
+  //
+  // `t` is the temp card's grid, which is what the dining head's two traces
+  // are carried onto -- so these three columns are aligned by construction
+  // rather than by this function hoping they are.
+  function greatRoomPayload(payload) {
+    return {
+      t: payload.metrics.temp.t,
+      room: payload.metrics.temp.avg,
+      head: payload.minisplit_temp,
+      watts: payload.minisplit_watts,
+      temp_unit_symbol: payload.temp_unit_symbol,
+      watts_unit: payload.minisplit_watts_unit,
+    };
+  }
+
+  function makeRoomPlot(card, config, payload) {
     const plotEl = card.querySelector(".plot");
     plotEl.innerHTML = "";
     const tempUnit = payload.temp_unit_symbol;
     const seriesConfig = [{ value: "{M}/{D} {h}:{mm}{aa}" }];
     const data = [payload.t];
-    for (const line of BEDROOM_SERIES) {
+    for (const line of config.lines) {
       seriesConfig.push({
         label: line.label,
         stroke: cssVar(line.colorVar),
@@ -981,12 +1027,20 @@ const METRICS = {
       spanGaps: false,
     });
     data.push(payload.watts);
-    // The server anchors `t` at both ends of the range, so this auto-fits to
-    // the range the other cards show and drag-zoom still works.
+    // On the Bedroom card the server anchors `t` at both ends of the range, so
+    // this auto-fits to the range the other cards show and drag-zoom still
+    // works. The Great room card inherits the temp card's own grid, which
+    // spans the Awair's readings, so the two cards agree about the x axis
+    // without either of them being told what the range is.
     const scales = { x: { time: true } };
     const axes = [axisStyle(), { ...yAxisStyle(), size: 52 }];
-    // The same rule as the temp card's draw: no right-hand ruler for a trace
-    // with nothing on it.
+    // No right-hand ruler for a trace with nothing on it. Measured against a
+    // copy of the homelab database with every `delta_wh` NULLed -- which is
+    // what every box ran before parsons-pulse #182 and what any box runs with
+    // the bridge down -- an ungated axis renders as the literal labels `0.00`
+    // through `1.00` down the right-hand edge of a temperature chart: a ruler
+    // for a line that is not there. The legend entry stays in both cases,
+    // which is how a dead source already renders here.
     if (hasReading(payload.watts)) {
       scales.watts = { range: overlayScaleRange };
       axes.push({
@@ -1012,16 +1066,21 @@ const METRICS = {
       plotEl
     );
     state.plots.push(plot);
-    card.querySelector(".name").textContent = "Bedroom";
+    card.querySelector(".name").textContent = config.name;
     card.querySelector(".unit").textContent = tempUnit;
-    card.querySelector(".dot").style.background = cssVar("--series-minisplit-temp");
-    // Latest head temperature and setpoint, prefixed for the reason the temp
-    // card prefixes its outdoor value: two bare numbers in one unit read as a
-    // range.
+    card.querySelector(".dot").style.background = cssVar(config.dotVar);
+    // No range peak on either room card, and that is a decision rather than
+    // an omission (#116): a peak head temperature answers no "how bad did it
+    // get" question, and the header already carries two numbers.
     const latestOf = (trace) => [...trace].reverse().find((v) => v != null);
-    card.querySelector(".now").textContent =
-      fmt(latestOf(payload.temp), 1) + " " + tempUnit +
-      " · set " + fmt(latestOf(payload.setpoint), 0) + " " + tempUnit;
+    card.querySelector(".now").textContent = config.header
+      .map(
+        (segment) =>
+          (segment.prefix ? segment.prefix + " " : "") +
+          fmt(latestOf(payload[segment.trace]), segment.digits) +
+          " " + tempUnit
+      )
+      .join(" · ");
   }
 
   async function load() {
@@ -1062,8 +1121,17 @@ const METRICS = {
         outdoorPayload.metrics
       );
     }
-    for (const card of document.querySelectorAll(".card[data-minisplit]")) {
-      makeBedroomPlot(card, bedroomPayload);
+    // One loop for both room cards, each handed the payload its `ROOM_CARDS`
+    // entry is written against. A `data-room` the JS has no entry for draws
+    // nothing rather than throwing; `test_every_room_card_in_the_markup_has_a_
+    // config_and_the_other_way_round` is what keeps that unreachable.
+    const roomPayloads = {
+      "great-room": greatRoomPayload(seriesPayload),
+      bedroom: bedroomPayload,
+    };
+    for (const card of document.querySelectorAll(".card[data-room]")) {
+      const config = ROOM_CARDS[card.dataset.room];
+      if (config) makeRoomPlot(card, config, roomPayloads[card.dataset.room]);
     }
     renderEvents();
     document.getElementById("updated").textContent =

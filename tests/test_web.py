@@ -173,23 +173,29 @@ def test_dashboard_page_renders(client):
     assert "uplot" in html
 
 
-def test_the_temp_card_is_the_only_card_marked_to_carry_an_overlay(client):
+def test_only_the_temp_and_humidity_cards_are_marked_to_carry_overlays(client):
     """`data-overlay` is read by two consumers that must not disagree.
 
-    The CSS reserves a third legend row for `.card[data-overlay]`, and
-    `dashboard.js` decides whether to draw a fifth series from the same
+    The CSS reserves the extra legend rows from `.card[data-overlay]`, and
+    `dashboard.js` decides whether to draw each extra series from the same
     attribute. Rendered from `web.METRIC_OVERLAYS` rather than typed onto a
     card, so the marker cannot be added in the template without the constant
     that names what to draw.
 
     Order matters and is asserted whole rather than as a set: `data-overlay`
-    is the draw order too, and the draw (#139) has to come last so a watts
-    line on its own axis paints over the temperatures rather than under them.
+    is the draw order too. On the temp card the places read outward from the
+    Awair -- outdoors, the basement, the bedroom -- and on the humidity card
+    the same, which is the order a reader scans the legend in.
+
+    Two cards since #156, and the pair is asserted together: the humidity card
+    is the one #156 asked for, and the temp card is the one it took the dining
+    head and the draw off (`web.METRIC_OVERLAYS`).
     """
     html = client.get("/").get_data(as_text=True)
     marked = re.findall(r'data-metric="(\w+)"[^>]*data-overlay="([\w -]+)"', html)
     assert marked == [
-        ("temp", "outdoor-temp basement-temp minisplit-temp minisplit-watts")
+        ("temp", "outdoor-temp basement-temp bedroom-temp"),
+        ("humid", "basement-humid minisplit-humid bedroom-humid"),
     ]
     # The precipitation card carries #42's pressure overlay and must keep the
     # same marker — the reservation rule has no other way to reach it.
@@ -204,7 +210,7 @@ def test_no_metric_card_is_marked_for_an_overlay_the_page_cannot_draw(client):
     that is the silent half, because the chart itself still looks right.
     """
     drawable = set(re.findall(r'key:\s*"([\w-]+)"', DASHBOARD_JS))
-    assert drawable, "dashboard.js no longer lists TEMP_OVERLAYS keys"
+    assert drawable, "dashboard.js no longer lists CARD_OVERLAYS keys"
     marked = {key for keys in web.METRIC_OVERLAYS.values() for key in keys}
     assert marked <= drawable
 
@@ -1912,11 +1918,28 @@ def test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships(
     without an edit here.
     """
     read = set(re.findall(r"seriesPayload\.(\w+)", DASHBOARD_JS))
-    # The overlay traces are read by name through `TEMP_OVERLAYS[].payload`.
+    # The overlay traces are read by name through `CARD_OVERLAYS[].payload`.
     read |= set(re.findall(r'payload:\s*"(\w+)"', DASHBOARD_JS))
-    assert {"outdoor_temp", "basement_temp", "minisplit_temp"} <= read, (
-        "dashboard.js no longer reads the overlay traces by name — if the "
-        "overlays moved, this guard has to move with them"
+    # And the Great room card's three traces are read inside
+    # `greatRoomPayload`, which is handed the same payload under another name
+    # (#156). Without this the harvest misses exactly the card that has no
+    # endpoint of its own -- the keys it depends on would be renameable in
+    # Python with nothing red.
+    great_room = DASHBOARD_JS[DASHBOARD_JS.index("function greatRoomPayload") :]
+    great_room = great_room[: great_room.index("\n  }")]
+    read |= set(re.findall(r"payload\.(\w+)", great_room))
+    assert {
+        "outdoor_temp",
+        "basement_temp",
+        "basement_humid",
+        "bedroom_temp",
+        "bedroom_humid",
+        "minisplit_temp",
+        "minisplit_humid",
+        "minisplit_watts",
+    } <= read, (
+        "dashboard.js no longer reads the overlay and room-card traces by "
+        "name — if they moved, this guard has to move with them"
     )
     shipped = set(client.get("/api/series?range=7d").get_json())
     assert read <= shipped, (
@@ -1989,6 +2012,7 @@ def _seed_minisplit(db_path, samples, head="dining"):
                 "decision_reason": None,
                 "temperature_at": None,
                 "raw": None,
+                "humid": 46.0,
             },
         )
     conn.close()
@@ -2078,7 +2102,7 @@ def test_the_mini_split_carry_window_is_two_report_windows_wide(client, tmp_path
     """
     window = web._MINISPLIT_CARRY_INTERVALS * minisplit.MAX_REPORT_WINDOW_SECONDS
     temps, watts = web._minisplit_on_grid(
-        [(0, 4.0, 10.0, None, None)], [window, window + 1], "C"
+        [(0, 4.0, 46.0, 10.0, None, None)], [window, window + 1], "C"
     )
     assert temps == [4.0, None], (
         f"an observation exactly {web._MINISPLIT_CARRY_INTERVALS} report "

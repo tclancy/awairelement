@@ -49,6 +49,7 @@ def _row(
         "decision_reason": "step",
         "temperature_at": None,
         "raw": raw,
+        "humid": 44.0,
     }
 
 
@@ -260,21 +261,45 @@ class TestBreakGaps:
         assert break_gaps([], {"a": []}, 10) == {"t": [], "a": []}
 
 
-def test_every_payload_key_the_card_reads_is_one_the_endpoint_ships(seed, client_for):
-    """Rename either side and the card draws nothing, silently."""
-    import re
+def _grid(html):
+    """The `<main>` card grid, without the stylesheet above it.
+
+    The CSS names cards too -- `.card[data-room="bedroom"] .u-legend` -- and it
+    comes first in the document, so an unscoped `index()` finds a legend
+    reservation and reads it as a card's position.
+    """
+    return html[html.index("<main") : html.index("</main>")]
+
+
+def _dashboard_js():
     from pathlib import Path
 
     from tests._helpers import strip_js_comments
 
-    js = strip_js_comments(
+    return strip_js_comments(
         (Path(__file__).resolve().parent.parent / "static" / "dashboard.js").read_text()
     )
-    body = js[js.index("function makeBedroomPlot") :]
+
+
+def test_every_payload_key_the_card_reads_is_one_the_endpoint_ships(seed, client_for):
+    """Rename either side and the card draws nothing, silently.
+
+    Both halves of what the Bedroom card reads: the shared room-card factory's
+    own `payload.*` reads (`t`, `watts`, the unit labels) and the trace names
+    its `ROOM_CARDS.bedroom` entry lists. Since #156 the factory is shared with
+    the Great room card, which reads a payload this endpoint does not serve --
+    so the trace names are harvested from the bedroom entry alone, and
+    `tests/test_web.py::test_every_series_payload_key_dashboard_js_reads_is_one_the_endpoint_ships`
+    covers the other card against the endpoint it actually reads.
+    """
+    import re
+
+    js = _dashboard_js()
+    body = js[js.index("function makeRoomPlot") :]
     body = body[: body.index("async function load")]
     read = set(re.findall(r"payload\.(\w+)", body))
-    bedroom_block = js[js.index("const BEDROOM_SERIES") :]
-    bedroom_block = bedroom_block[: bedroom_block.index("];")]
+    bedroom_block = js[js.index("    bedroom: {", js.index("const ROOM_CARDS")) :]
+    bedroom_block = bedroom_block[: bedroom_block.index("\n    },")]
     read |= set(re.findall(r'trace:\s*"(\w+)"', bedroom_block))
     assert {"t", "temp", "setpoint", "target", "watts"} <= read
     seed(_row(_recent(10)))
@@ -282,12 +307,49 @@ def test_every_payload_key_the_card_reads_is_one_the_endpoint_ships(seed, client
     assert read <= shipped, f"card reads {sorted(read - shipped)} the endpoint lacks"
 
 
-def test_the_bedroom_card_is_on_the_page_after_precipitation(seed, client_for):
+def test_every_room_card_in_the_markup_has_a_config_and_the_other_way_round(
+    seed, client_for
+):
+    """`data-room` is the whole binding between the two surfaces (#156).
+
+    A name in the markup with no `ROOM_CARDS` entry renders an empty card with
+    a heading and no chart; a name in `ROOM_CARDS` with no card in the markup
+    is a feature nothing draws. Neither says anything at run time, which is why
+    the pair is asserted rather than either side alone.
+    """
+    import re
+
     seed()
-    html = client_for().get("/").get_data(as_text=True)
+    # The card grid alone: the stylesheet also names a room
+    # (`.card[data-room="bedroom"] .u-legend`), and a reservation is not a card.
+    html = _grid(client_for().get("/").get_data(as_text=True))
+    in_markup = set(re.findall(r'data-room="([\w-]+)"', html))
+    js = _dashboard_js()
+    block = js[js.index("const ROOM_CARDS = {") :]
+    block = block[: block.index("\n  };")]
+    configured = set(re.findall(r'^    "?([\w-]+)"?: \{', block, re.MULTILINE))
+    assert in_markup == configured == {"great-room", "bedroom"}, (
+        f"the markup renders {sorted(in_markup)} and dashboard.js configures "
+        f"{sorted(configured)}"
+    )
+
+
+def test_the_room_cards_come_after_precipitation_with_the_bedroom_last(
+    seed, client_for
+):
+    """The two room cards sit together at the end of the grid (#156).
+
+    The Great room card goes beside the Bedroom one rather than next to the
+    Temp card it shares a series with: both are "a room and its head", and
+    reading them side by side is the comparison they exist for. The bedroom
+    stays last, which is where the mini split scope put it.
+    """
+    seed()
+    html = _grid(client_for().get("/").get_data(as_text=True))
     precipitation = html.index('data-outdoor="precipitation"')
-    bedroom = html.index('data-minisplit="bedroom"')
-    assert precipitation < bedroom
+    great_room = html.index('data-room="great-room"')
+    bedroom = html.index('data-room="bedroom"')
+    assert precipitation < great_room < bedroom
     assert html.rindex('<section class="card"') < bedroom, (
         "the Bedroom card must be the last card in the grid"
     )

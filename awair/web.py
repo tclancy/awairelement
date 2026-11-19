@@ -39,39 +39,48 @@ WATCH_METRIC = "temp"
 
 
 # Indoor metric cards that carry overlaid series (#109), and the names of the
-# overlays. Rendered onto the card as a space-separated `data-overlay`, which is the one
-# marker the CSS legend reservation and `dashboard.js` both read -- so a card
-# cannot end up drawing a fifth legend entry it has not reserved room for.
+# overlays. Rendered onto the card as a space-separated `data-overlay`, which is
+# the one marker the CSS legend reservation and `dashboard.js` both read -- so a
+# card cannot end up drawing a legend entry it has not reserved room for.
 #
-# Only temp today, and the first three entries are all one quantity: an overlay
-# with no `scale` of its own shares the card's Y axis, which is sound exactly
-# when both series are the same quantity in the same unit. Outdoor humidity onto
-# `humid` would be the other honest candidate; an outdoor temperature onto `co2`
-# would not, and this constant is not the place that would stop it -- see
-# `_outdoor_temp_on_grid`. The basement sensor is the second temperature on the
-# same card, in the same unit, for the same reason, and the mini split head's
-# own room temperature is the third (#139).
+# **The rule for what may ride a metric card is one sentence: an overlay is the
+# card's own quantity, in the card's own unit, on the card's own axis.** That is
+# what an entry here claims, and it is what makes a shared y axis sound -- the
+# distance between an indoor line and an outdoor one IS the answer #109 asked
+# for, where two auto-fitted axes would draw a 1 degree indoor drift and a 20
+# degree outdoor swing as the same stroke.
 #
-# `minisplit-watts` is the fourth, and it is the first entry here that is NOT a
-# temperature. It is the mini split's metered draw, in watts, and it rides this
-# card because that is what #139 asked for -- the question is "what is the head
-# doing to this room", and the draw and the room temperature answer it together.
+# That rule was briefly wider. #139 put the dining head's metered draw on the
+# temp card, in watts, against a right-hand axis of its own, which made the
+# admission test a disjunction ("in the card's unit, or declares its own
+# scale"). #156 took the draw off this card -- Tom's reading of the temp card
+# is "barely readable", and the draw now has a card where it belongs beside the
+# head that makes it -- so the disjunction is gone and the single sentence is
+# back. A second unit on a card is still perfectly possible and two cards do
+# it: the precipitation card's pressure trace (#42) and the room cards' draw.
+# Both declare that second axis in their own chart factory, which is where a
+# claim about a second ruler is legible, rather than in a list of overlays
+# whose other entries share one.
 #
-# What makes that sound is that the draw is drawn against its own right-hand
-# axis, declared as `scale: "watts"` on its `TEMP_OVERLAYS` entry in
-# `dashboard.js`, the way #42's pressure trace already rides the precipitation
-# card. A second unit on a shared *card* was never the problem; a second unit on
-# a shared *axis* is, and on the card's degree ruler a 600 W trace would put
-# every temperature on the floor.
+# Two cards carry overlays now, and each entry is the same quantity as the card
+# it rides:
 #
-# So the rule this constant enforces is no longer "temperatures only". It is:
-# an overlay is either in the card's own unit, or it declares its own scale.
-# Membership here is not that promise -- `test_every_temp_card_overlay_is_a_
-# temperature_in_the_cards_unit` makes it for the scale-less entries and
-# `test_an_overlay_off_the_cards_axis_brings_its_own_unit` for the rest, and
-# the pair is what a fifth entry has to satisfy.
+# - `temp` is one temperature per *place* (#156): the Awair's own room, outdoors,
+#   the basement sensor, and the bedroom head. The dining head is not here --
+#   it reads the same room as the Awair, so the two belong on the Great room
+#   card together rather than as a fifth line here.
+# - `humid` is the house's humidity in one place, which is what #156 asked for:
+#   the Awair's reading is the card's own series, and the basement sensor and
+#   both heads ride it. `outdoor_readings.humid` is recorded and is the obvious
+#   next line; nobody asked for it, so the card stays the three sources #156
+#   names.
+#
+# `test_every_overlay_is_its_cards_own_quantity_in_its_cards_unit` is what holds
+# the sentence above: a temperature overlay has to move with `TEMPERATURE_UNIT`
+# and a humidity overlay has to stay put under it.
 METRIC_OVERLAYS = {
-    "temp": ("outdoor-temp", "basement-temp", "minisplit-temp", "minisplit-watts")
+    "temp": ("outdoor-temp", "basement-temp", "bedroom-temp"),
+    "humid": ("basement-humid", "minisplit-humid", "bedroom-humid"),
 }
 
 # Metric fields on an alert_event whose value carries the same unit as the
@@ -395,7 +404,13 @@ _MINISPLIT_CARRY_INTERVALS = 2
 # as epoch seconds -- and `ts` is the bridge CYCLE's clock, which is why the
 # window's own bounds have to be read as columns. The draw is measured over the
 # window; the row is drawn at the cycle that reported it.
-_MINISPLIT_SERIES_COLUMNS = ("temp", "delta_wh", "window_start", "window_close")
+_MINISPLIT_SERIES_COLUMNS = (
+    "temp",
+    "humid",
+    "delta_wh",
+    "window_start",
+    "window_close",
+)
 
 
 def _minisplit_carry_max_age_seconds():
@@ -424,7 +439,13 @@ def _minisplit_on_grid(rows, grid, unit):
     and `grid` is `metrics["temp"]["t"]`, the stamps the indoor temperature
     chart is already drawn against. Returns `(temperature, watts)`, two flat
     lists each exactly as long as `grid` -- the same shape, and for the same
-    uPlot reason, as `_outdoor_temp_on_grid`.
+    uPlot reason, as `_outdoor_temp_on_grid`. Since #156 these two are the
+    Great room card's head lines rather than overlays on the temp card; the
+    grid is the same one either way, because that card draws the Awair's own
+    bucketed average as its room line.
+
+    The head's humidity travels in the same rows and is not read here: it
+    belongs to the humidity card, whose grid is its own (`_head_humid_on_grid`).
 
     **The draw published here is the metered mean over each report window, not
     the head's spot reading.** The spot value read 30.0 W across three
@@ -455,7 +476,7 @@ def _minisplit_on_grid(rows, grid, unit):
     temps = []
     watts = []
     max_age = _minisplit_carry_max_age_seconds()
-    for epoch, temp, delta_wh, window_start, window_close in rows:
+    for epoch, temp, _humid, delta_wh, window_start, window_close in rows:
         if unit != "C":
             temp = units.from_celsius(temp, unit)
         temps.append((epoch, temp))
@@ -466,11 +487,44 @@ def _minisplit_on_grid(rows, grid, unit):
     )
 
 
+def _head_humid_on_grid(rows, columns, grid):
+    """One head's own relative humidity, carried onto a card's grid (#156).
+
+    `columns` is the column tuple `rows` was read with, so the humidity's
+    position is derived rather than typed -- the two heads are read with
+    different column lists and an index literal here would be right for one of
+    them.
+
+    No unit conversion and none possible: a relative humidity is a percent on
+    every surface this project has. It shares the humidity card's own y axis
+    for the same reason the outdoor temperature shares the temp card's -- same
+    quantity, same unit, and the gap between the lines is the point.
+
+    Carried, not bucketed, and held by the same bound as the head's
+    temperature: the source is one reading per bridge cycle, so there is no
+    sub-bucket detail to average away. A head that reports no humidity at all
+    -- which may be both of ours, see `minisplit._head_humidity` -- produces a
+    full-length run of None, which draws as nothing and reads as a break.
+    """
+    index = 1 + columns.index("humid")
+    return carry_forward(
+        [(row[0], row[index]) for row in rows],
+        grid,
+        _minisplit_carry_max_age_seconds(),
+    )
+
+
 # How many indoor buckets one basement average stays on the temperature chart
 # after the bucket that should have replaced it came up empty. Two, for the
 # reason `_OUTDOOR_CARRY_INTERVALS` is two: one missed poll is bridged, a
 # longer silence is a break.
 _BASEMENT_CARRY_BUCKETS = 2
+
+# The basement columns `/api/series` reads, in the order its two grid helpers
+# unpack them. One query for both cards: the sensor publishes a temperature and
+# a humidity from the same part a moment apart, stored on one row, and reading
+# the row twice to draw two cards would be two scans of the same minutes.
+_BASEMENT_SERIES_COLUMNS = ("temp", "humid")
 
 
 def _basement_carry_max_age_seconds(bucket_seconds):
@@ -484,29 +538,61 @@ def _basement_carry_max_age_seconds(bucket_seconds):
     return _BASEMENT_CARRY_BUCKETS * bucket_seconds
 
 
-def _basement_temp_on_grid(rows, grid, bucket_seconds, unit):
-    """The basement temperature trace, in display units, on the indoor x-grid.
+def _basement_on_grid(points, grid, bucket_seconds):
+    """One basement series, bucket-averaged, then held onto a card's x-grid.
 
-    `rows` is `db.basement_readings_since(...)`, `[(epoch_seconds, celsius)]`,
-    and `grid` is `metrics["temp"]["t"]`. **Averaged into `bucket_seconds`
-    first**, the same buckets the indoor line is drawn from, so on 7 d and
-    30 d each stamp is the mean of its bucket rather than whichever single
-    minute happened to land at its start. Then held by `carry_forward`, whose
-    stamps line up exactly because `bucket` snaps both series to the same
-    boundaries.
+    **Averaged into `bucket_seconds` first**, the same buckets the card's own
+    line is drawn from, so on 7 d and 30 d each stamp is the mean of its bucket
+    rather than whichever single minute happened to land at its start. Then
+    held by `carry_forward`, whose stamps line up exactly because `bucket`
+    snaps both series to the same boundaries.
 
-    The grid only spans the indoor temperature's own data range, so an Awair
-    outage hides the basement line over the same stretch. That is a property
-    of drawing onto the indoor card, stated here rather than fixed.
+    Nulls are dropped before bucketing, not carried into it: `bucket` sums the
+    values in a window, so one None would raise. For the temperature that
+    cannot happen (the column is NOT NULL); for the humidity it is the ordinary
+    state of every row polled before #156 and of every row whose second GET
+    failed, and dropping it is the same rule the rest of this module keeps --
+    an empty window is "nothing landed", never a held value.
+
+    The grid only spans the card's own data range, so an Awair outage hides the
+    basement line over the same stretch. That is a property of drawing onto an
+    indoor card, stated here rather than fixed.
     """
-    points = list(rows)
-    if unit != "C":
-        points = [(t, units.from_celsius(value, unit)) for t, value in points]
-    bucketed = bucket(points, bucket_seconds)
+    bucketed = bucket([(t, v) for t, v in points if v is not None], bucket_seconds)
     return carry_forward(
         zip(bucketed["t"], bucketed["avg"], strict=True),
         grid,
         _basement_carry_max_age_seconds(bucket_seconds),
+    )
+
+
+def _basement_temp_on_grid(rows, grid, bucket_seconds, unit):
+    """The basement temperature trace, in display units, on the temp card's grid.
+
+    `rows` is `db.basement_readings_since(conn, since, _BASEMENT_SERIES_COLUMNS)`
+    -- `[(epoch_seconds, celsius, percent)]` -- and `grid` is
+    `metrics["temp"]["t"]`. Converted before the bucketing so each reading is
+    converted once rather than once per stamp it is held across.
+    """
+    return _basement_on_grid(
+        [(t, _in_unit(celsius, unit)) for t, celsius, _humid in rows],
+        grid,
+        bucket_seconds,
+    )
+
+
+def _basement_humid_on_grid(rows, grid, bucket_seconds):
+    """The basement humidity trace on the humidity card's grid (#156).
+
+    The same rows as `_basement_temp_on_grid` read in the same query, and no
+    conversion: a percent is a percent whatever `TEMPERATURE_UNIT` says. The
+    grid is the humidity card's own -- `metrics["humid"]["t"]`, which is not
+    `metrics["temp"]["t"]`: the two are bucketed from the same readings but
+    each drops the rows where its own column is null, so a reading that carried
+    a temperature and no humidity shortens one grid and not the other.
+    """
+    return _basement_on_grid(
+        [(t, humid) for t, _celsius, humid in rows], grid, bucket_seconds
     )
 
 
@@ -667,6 +753,78 @@ def _anchored(drawn, since_epoch, until_epoch):
     }
 
 
+# The bedroom columns the temp and humidity cards read, in the order
+# `_bedroom_overlays` unpacks them. A strict subset of `_BEDROOM_SERIES_COLUMNS`
+# -- the Bedroom card's own setpoint, target and draw are its own business --
+# and `switch` is here for the same reason it is there: `/status` keeps
+# publishing an off head's last reading, so the grace rule needs it.
+_BEDROOM_OVERLAY_COLUMNS = ("temp", "humid", "switch")
+
+
+def _masked_carry(points, visible, grid):
+    """`points` held onto `grid`, nulled wherever the newest row is hidden.
+
+    Two carries over the same rows rather than one, and the second one is what
+    makes the first honest. Dropping a hidden row from `points` would leave the
+    previous *shown* row to carry across it -- up to a full report window of an
+    off head's last temperature, drawn as live -- because `carry_forward`
+    treats a None as "nothing landed in this window" rather than as "the
+    reading ends here". Carrying the visibility beside the value asks the
+    question the grid stamp actually poses: what is the newest row at or before
+    this stamp, and may it be drawn?
+
+    `visible` is `[(epoch, 1.0 or 0.0)]` -- numbers rather than bools because
+    `carry_forward` holds values, and a float is what every other series it
+    holds looks like.
+    """
+    max_age = _minisplit_carry_max_age_seconds()
+    held = carry_forward(points, grid, max_age)
+    shown = carry_forward(visible, grid, max_age)
+    return [value if flag else None for value, flag in zip(held, shown, strict=True)]
+
+
+def _bedroom_overlays(rows, temp_grid, humid_grid, unit):
+    """The bedroom head's temperature and humidity, each on its card's grid (#156).
+
+    `rows` is `db.minisplit_readings_since(conn, BEDROOM, _BEDROOM_OVERLAY_COLUMNS,
+    ...)`, read from one grace window *and* one carry window before the range so
+    that a row before the left edge can both start the grace and hold the first
+    stamps.
+
+    Both traces obey the Bedroom card's off-head grace rule
+    (`_bedroom_temp_shown`), and that is the whole reason this is one function:
+    the bridge republishes an off head's last reading, so an unmasked line
+    would draw yesterday evening's bedroom across a morning the head spent off.
+    Dining's traces need no such rule and have none -- that head runs.
+
+    The temperature is converted and the humidity is not; see
+    `_head_humid_on_grid` for why there is nothing to convert.
+    """
+    shown = _bedroom_temp_shown([(epoch, switch) for epoch, _t, _h, switch in rows])
+    temps, humids, visible = [], [], []
+    for (epoch, temp, humid, _switch), show in zip(rows, shown, strict=True):
+        temps.append((epoch, _in_unit(temp, unit)))
+        humids.append((epoch, humid))
+        visible.append((epoch, 1.0 if show else 0.0))
+    return (
+        _masked_carry(temps, visible, temp_grid),
+        _masked_carry(humids, visible, humid_grid),
+    )
+
+
+def _bedroom_overlay_lookback():
+    """How far before the range `/api/series` reads the bedroom head.
+
+    The grace window **and** a carry window, because the two answer different
+    questions about the same row: the grace decides whether a row in range may
+    be drawn at all (a head switched off needs an on reading up to 30 minutes
+    earlier), and the carry decides whether the first grid stamps have anything
+    to hold. Either one alone leaves a correct-looking line that is missing its
+    left edge or showing an off head.
+    """
+    return BEDROOM_TEMP_GRACE_SECONDS + _minisplit_carry_max_age_seconds()
+
+
 def _bootstrap_schema(db_path, logger) -> None:
     """Run the schema bootstrap once, at app construction rather than per request.
 
@@ -765,11 +923,22 @@ def create_app(db_path=None):
                 _MINISPLIT_SERIES_COLUMNS,
                 since - timedelta(seconds=_minisplit_carry_max_age_seconds()),
             )
+            # The bedroom head, for its line on the temp card and its line on
+            # the humidity card (#156). Its own read rather than a widened
+            # dining one: `minisplit_readings_since` filters by head, and the
+            # two heads want different columns.
+            bedroom_rows = db.minisplit_readings_since(
+                conn,
+                minisplit.BEDROOM,
+                _BEDROOM_OVERLAY_COLUMNS,
+                since - timedelta(seconds=_bedroom_overlay_lookback()),
+            )
             # And again for the basement sensor, whose window is in buckets.
             basement_rows = db.basement_readings_since(
                 conn,
                 since
                 - timedelta(seconds=_basement_carry_max_age_seconds(bucket_seconds)),
+                _BASEMENT_SERIES_COLUMNS,
             )
             # Its own windows, not this request's range -- see
             # `_basement_watch`. Inside the `try` so it shares the one
@@ -788,8 +957,13 @@ def create_app(db_path=None):
                         units.from_celsius(v, unit) for v in series_data[key]
                     ]
             metrics[name] = series_data
+        temp_grid = metrics["temp"]["t"]
+        humid_grid = metrics["humid"]["t"]
         minisplit_temp, minisplit_watts = _minisplit_on_grid(
-            minisplit_rows, metrics["temp"]["t"], unit
+            minisplit_rows, temp_grid, unit
+        )
+        bedroom_temp, bedroom_humid = _bedroom_overlays(
+            bedroom_rows, temp_grid, humid_grid, unit
         )
         return jsonify(
             {
@@ -807,14 +981,24 @@ def create_app(db_path=None):
                 # `t` beside it would be the same value published twice with
                 # nothing holding the copies in step, and the browser would
                 # have to reconcile them before it could draw one chart.
-                "outdoor_temp": _outdoor_temp_on_grid(
-                    outdoor_rows, metrics["temp"]["t"], unit
-                ),
-                # #139, and flat lists on `metrics["temp"]["t"]` for the same
-                # reason `outdoor_temp` is one. Two keys rather than a nested
-                # block because they are two quantities: `minisplit_temp` is a
-                # temperature in `temp_unit_symbol` and shares the temp card's
-                # axis, while `minisplit_watts` is a draw in watts and cannot.
+                #
+                # Every flat list below is on one of the two grids and which
+                # one is not negotiable: a `*_temp` rides `metrics["temp"]["t"]`
+                # and a `*_humid` rides `metrics["humid"]["t"]`. The two are
+                # bucketed from the same readings and are usually identical,
+                # which is exactly why the pairing is written down rather than
+                # left to look obvious -- they diverge the moment one column is
+                # null where the other is not.
+                "outdoor_temp": _outdoor_temp_on_grid(outdoor_rows, temp_grid, unit),
+                # #139, and flat lists on the temp grid for the same reason
+                # `outdoor_temp` is one. The dining head's, and since #156 they
+                # are the Great room card's two head lines rather than overlays
+                # on the temp card -- the keys and their grid are unchanged,
+                # which is why that card needs no endpoint of its own. Two keys
+                # rather than a nested block because they are two quantities:
+                # `minisplit_temp` is a temperature in `temp_unit_symbol`,
+                # while `minisplit_watts` is a draw in watts and is read
+                # against that card's right-hand axis.
                 # `minisplit_watts_unit` is named here rather than implied
                 # because every other unit this app publishes is (see
                 # `/api/outdoor-latest`), and an unlabelled number a consumer
@@ -822,11 +1006,30 @@ def create_app(db_path=None):
                 "minisplit_temp": minisplit_temp,
                 "minisplit_watts": minisplit_watts,
                 "minisplit_watts_unit": "W",
+                # The dining head's own humidity, on the HUMIDITY grid (#156).
+                # `minisplit_humid` rather than `dining_humid` because every
+                # other `minisplit_*` key on this payload is already dining's
+                # alone, and a second spelling for one head would read as a
+                # third feed.
+                "minisplit_humid": _head_humid_on_grid(
+                    minisplit_rows, _MINISPLIT_SERIES_COLUMNS, humid_grid
+                ),
+                # The bedroom head (#156): its temperature is the temp card's
+                # fourth line and its humidity the humidity card's fourth.
+                # Both masked by the off-head grace rule -- see
+                # `_bedroom_overlays`.
+                "bedroom_temp": bedroom_temp,
+                "bedroom_humid": bedroom_humid,
                 # The basement ESPHome sensor, a flat list on the same grid
                 # for the same reason as `outdoor_temp`, and on the temp
                 # card's axis because it is a temperature in the same unit.
                 "basement_temp": _basement_temp_on_grid(
-                    basement_rows, metrics["temp"]["t"], bucket_seconds, unit
+                    basement_rows, temp_grid, bucket_seconds, unit
+                ),
+                # The same sensor's humidity, from the same rows, on the
+                # humidity card's own grid (#156).
+                "basement_humid": _basement_humid_on_grid(
+                    basement_rows, humid_grid, bucket_seconds
                 ),
                 # parsons-pulse #205. A verdict rather than a series, and
                 # the only block here whose window does not follow the

@@ -6,7 +6,7 @@
 #   ln -sf ~/sources/awairelement/systemd/awairelement-basement.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now awairelement-basement
 [Unit]
-Description=Awair Element basement (ESPHome) temperature poller
+Description=Awair Element basement (ESPHome) temperature and humidity poller
 After=network-online.target
 
 [Service]

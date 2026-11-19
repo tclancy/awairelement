@@ -41,6 +41,7 @@ def row(ts, **overrides):
         "decision_reason": "in-band",
         "temperature_at": "2026-10-26T07:20:00+00:00",
         "raw": None,
+        "humid": 46.0,
     }
     return {**base, **overrides}
 

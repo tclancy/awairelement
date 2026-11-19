@@ -156,11 +156,13 @@ def strip_markup_comments(source):
     from a commented-out construct that is still in the text. This one protects
     *presence* assertions — a guard that reads `dashboard.html` raw and asserts
     a rule or a custom property is there passes while that line sits inside
-    `/* */` and the browser ignores it. Measured on this file: wrapping
-    `.card[data-overlay~="minisplit-temp"] .u-legend` in a CSS comment, and
-    separately deleting nothing but commenting out the dark-mode
-    `--series-minisplit-temp`, left every guard in
-    `test_web_minisplit_overlay.py` green.
+    `/* */` and the browser ignores it. Measured on this file: wrapping a
+    card's `[data-overlay~=...] .u-legend` rule in a CSS comment, and
+    separately deleting nothing but commenting out that overlay's dark-mode
+    `--series-*` colour, left every guard in what is now
+    `test_web_overlay_cards.py` green. That file's
+    `test_a_commented_out_declaration_reads_as_absent` keeps the measurement
+    live against whichever overlay it names today.
 
     Deliberately simple, because `templates/dashboard.html` is simple: one
     `<style>` block, two `<script src=...>` tags with no inline body, and no
