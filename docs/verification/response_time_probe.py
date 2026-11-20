@@ -79,12 +79,18 @@ UNRANGED = (
     ("api/outdoor-today", "/api/outdoor-today"),
     ("api/weather-alerts", "/api/weather-alerts"),
 )
+# Routes no page load makes, kept apart from `UNRANGED` so that tuple's comment
+# stays true. `/health` is polled by the deploy check rather than the browser
+# (#158), and it is the one route here whose cost grows with the table: it takes
+# `MAX(received_at)` on four tables and `received_at` is indexed on none, so
+# this is the measurement that says whether that is affordable.
+OFFPAGE = (("health", "/health"),)
 
 
 def assert_covers_every_route(app):
     """Refuse to report on a subset of the app's routes.
 
-    The three tuples above are written out by hand, because which of them take
+    The four tuples above are written out by hand, because which of them take
     a `?range=` and which the browser fires concurrently is not introspectable
     from the url map. A hand-written list is one route behind the day someone
     adds a route, and a probe reporting on four endpoints out of five reads
@@ -97,13 +103,13 @@ def assert_covers_every_route(app):
         for rule in app.url_map.iter_rules()
         if "GET" in rule.methods and rule.endpoint != "static"
     }
-    probed = {path for _, path in (DOCUMENT, *RANGED, *UNRANGED)}
+    probed = {path for _, path in (DOCUMENT, *RANGED, *UNRANGED, *OFFPAGE)}
     missing = routed - probed
     extra = probed - routed
     if missing or extra:
         raise SystemExit(
             f"probe does not cover the app's routes: missing={sorted(missing)} "
-            f"unknown={sorted(extra)} -- update DOCUMENT/RANGED/UNRANGED"
+            f"unknown={sorted(extra)} -- update DOCUMENT/RANGED/UNRANGED/OFFPAGE"
         )
 
 
@@ -127,7 +133,13 @@ def rows_in(db_path):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         counts = {}
-        for table in ("readings", "outdoor_readings", "alert_events"):
+        for table in (
+            "readings",
+            "outdoor_readings",
+            "minisplit_readings",
+            "basement_readings",
+            "alert_events",
+        ):
             try:
                 counts[table] = conn.execute(
                     f"SELECT COUNT(*) FROM {table}"
@@ -168,7 +180,7 @@ def probe(db_path, repeat):
             print(
                 f"{label:<22} {name:<6} {p50:>8.1f} {mx:>8.1f} {size / 1024:>9.1f} {status:>4}"
             )
-    for label, path in UNRANGED:
+    for label, path in (*UNRANGED, *OFFPAGE):
         p50, mx, size, status = time_get(client, path, repeat)
         print(
             f"{label:<22} {'-':<6} {p50:>8.1f} {mx:>8.1f} {size / 1024:>9.1f} {status:>4}"

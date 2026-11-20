@@ -12,6 +12,7 @@ from flask import Flask, abort, jsonify, render_template, request
 from awair import (
     basement_watch,
     db,
+    feeds,
     minisplit,
     outdoor,
     solar,
@@ -893,6 +894,41 @@ def create_app(db_path=None):
             overlays=METRIC_OVERLAYS,
             watch_metric=WATCH_METRIC,
         )
+
+    @app.get("/health")
+    def health():
+        """Is every feed still recording? 200 if so, 503 if not (#158).
+
+        The deploy check for this app was `GET /`, which proves the web process
+        is up and the database opens and nothing whatever about the four
+        pollers that fill it. This answers the question that one could not.
+
+        **Unauthenticated, like every route here, and it publishes nothing the
+        dashboard does not.** Four feed names, four timestamps already drawn as
+        points on the page, and the cadences the README documents. No URL, no
+        device identifier, no `minisplit_readings.raw` -- ADR-019's rule, and
+        the reason `_BEDROOM_SERIES_COLUMNS` excludes that column too.
+
+        **Database only.** No device, no bridge, no Open-Meteo. A check that
+        reached for the network could not tell "the feed stopped recording"
+        from "the check could not ask", and would fail during the outage it
+        exists to describe.
+
+        **The body is the same either way**, so a consumer that follows
+        redirects, swallows the status, or is a human with `curl` gets the same
+        answer; the code is for the deploy, the body is for whoever reads the
+        failure. An unopenable database is deliberately NOT special-cased to a
+        503 here -- it raises, and 500s, exactly as every sibling route does
+        (`test_unopenable_database_does_not_abort_app_startup`). Both codes
+        fail a check, and a second meaning for 503 would cost the one this
+        endpoint is for: 503 means "the feeds are not recording".
+        """
+        conn = connect()
+        try:
+            payload = feeds.report(conn, datetime.now(UTC))
+        finally:
+            conn.close()
+        return jsonify(payload), 503 if payload["stale"] else 200
 
     @app.get("/api/series")
     def series():

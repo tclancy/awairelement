@@ -54,6 +54,18 @@ FETCH_TIMEOUT_SECONDS = 10
 # endpoint republishes the same value until the module's next update.
 DEFAULT_POLL_SECONDS = 60
 
+
+def poll_seconds() -> int:
+    """Seconds between basement polls, per `AWAIR_BASEMENT_POLL_SECONDS`.
+
+    The one reader of that name in this repo, so `/health` can judge this
+    feed's staleness against the same cadence `main()` polls at instead of
+    restating it (#158). Read per call rather than bound at import, for the
+    reason `poller.poll_seconds` explains.
+    """
+    return int(os.environ.get("AWAIR_BASEMENT_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+
+
 # Reserved in the Deco by MAC, so an IP literal is stable and needs no mDNS.
 DEFAULT_SENSOR_URL = "http://192.168.68.50/sensor/Temperature"
 
@@ -223,7 +235,7 @@ def main() -> None:
     )
     sensor_url = os.environ.get("AWAIR_BASEMENT_URL", DEFAULT_SENSOR_URL)
     humidity = os.environ.get("AWAIR_BASEMENT_HUMIDITY_URL") or humidity_url(sensor_url)
-    interval = int(os.environ.get("AWAIR_BASEMENT_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+    interval = poll_seconds()
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)

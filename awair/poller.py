@@ -51,6 +51,25 @@ DEVICE_FIELDS = (
 
 FETCH_TIMEOUT_SECONDS = 5
 
+# The indoor cadence. A constant beside a reader, rather than the bare `"30"`
+# this used to be inside `main()`, because `/health` judges this feed against
+# the cadence and has to read it from the poller that sets it rather than
+# restate it (#158). Its three sibling pollers were already shaped this way;
+# this is the one that was not.
+DEFAULT_POLL_SECONDS = 30
+
+
+def poll_seconds() -> int:
+    """Seconds between indoor polls, per `AWAIR_POLL_SECONDS`.
+
+    The one reader of that name in this repo. Read per call, never bound at
+    import, for the reason `web._outdoor_carry_max_age_seconds` is a function:
+    a caller deriving a window from this has to be *observably* tracking the
+    cadence, and a value frozen at import makes `6 * 30` and a literal `180`
+    indistinguishable to every test that can be written.
+    """
+    return int(os.environ.get("AWAIR_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+
 
 def parse_reading(payload: dict, received_at: str) -> dict:
     """Map one /air-data/latest payload to a readings row.
@@ -219,7 +238,7 @@ def main(argv=None) -> None:
     db_path = os.environ.get(
         "AWAIR_DB", os.path.expanduser("~/data/awairelement/awair.db")
     )
-    interval = int(os.environ.get("AWAIR_POLL_SECONDS", "30"))
+    interval = poll_seconds()
     notifier = Notifier(
         base_url=os.environ.get(
             "AWAIR_NTFY_URL", "https://notifications.tomclancy.info"

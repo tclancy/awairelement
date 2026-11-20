@@ -965,6 +965,71 @@ def basement_readings_since(conn, since, columns=("temp",)) -> list:
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
 
+#: The tables a reading lands in, keyed by nothing -- a whitelist, because
+#: `newest_received_at` interpolates a table name into SQL and every other
+#: query in this module names its table literally. It is not a definition of
+#: "the feeds this app records"; that lives in `awair.feeds`, which names a
+#: table per feed and is the thing to edit when a fifth feed arrives.
+READING_TABLES = frozenset(
+    {"readings", "basement_readings", "outdoor_readings", "minisplit_readings"}
+)
+
+
+def newest_received_at(conn, table: str, head: str | None = None) -> datetime | None:
+    """When the newest row in `table` was WRITTEN, by our clock, or None (#158).
+
+    `MAX(received_at)` deliberately, and not the `received_at` of the row with
+    the greatest `ts`. On three of these four tables `ts` is the *source's*
+    clock -- the Element's own, Open-Meteo's publish time, the bridge's report
+    window close -- and `/api/latest`'s contract already says in so many words
+    that measuring age off `ts` is a subtraction across two machines. The
+    failure that matters to a staleness check is a source clock stepping
+    *backwards*: rows newer by arrival then sort below an older one,
+    `ORDER BY ts DESC LIMIT 1` hands back the older row, and a feed that is
+    recording perfectly reads as dead. Our own clock cannot do that to us.
+
+    Lexicographic MAX is chronological here because all four writers stamp this
+    column with `datetime.now(UTC).isoformat()`: one fixed `+00:00` offset
+    spelling, so the date-and-time prefix dominates every comparison. A
+    microsecond of exactly zero prints with no fractional part at all, and `+`
+    sorts below `.`, so such a row sorts earliest within its second -- which is
+    where it belongs.
+
+    The returned datetime is tz-aware. A stored value with no offset is read as
+    UTC rather than rejected, for `web._iso_utc`'s reason: every writer in this
+    app is UTC, and raising here would take the health endpoint down over a row
+    it can describe correctly.
+
+    **This is a full scan**, since `received_at` carries no index on any of the
+    four tables. Measured by `docs/verification/response_time_probe.py`, which
+    times `/health` for this reason: 29 ms p50 for all four tables, against a
+    78 MB database of 580,000 rows (320k `readings`, 150k basement, 80k mini
+    split, 30k outdoor) -- an eighth of what the dashboard's own
+    `/api/series?range=30d` costs on the same file, and this is a check the
+    deploy makes rather than something a page load waits on.
+
+    An index on `received_at` would make it instant and is deliberately not
+    here: it would be four indexes, written on every insert by all four
+    pollers, to save milliseconds on one endpoint. `ORDER BY rowid DESC LIMIT
+    1` would too, and is the tempting one -- but it answers "the last row
+    *inserted*", which is the same thing only for as long as nothing deletes
+    or rebuilds a table, and `_rebuild_minisplit_readings` and
+    `_migrate_outdoor_ts_not_null` both do exactly that, in `ts` order. Revisit
+    when the measurement says to, not before.
+    """
+    if table not in READING_TABLES:
+        raise ValueError(f"unknown reading table {table!r}")
+    sql = f"SELECT MAX(received_at) FROM {table}"
+    params = () if head is None else (head,)
+    if head is not None:
+        sql += " WHERE head = ?"
+    (newest,) = conn.execute(sql, params).fetchone()
+    if newest is None:
+        return None
+    parsed = datetime.fromisoformat(newest)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def latest_minisplit_raw(conn, head: str) -> str | None:
     """The most recent `raw` stored for `head`, or None if none ever was."""
     row = conn.execute(
