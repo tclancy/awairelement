@@ -181,6 +181,7 @@ omitted entirely to run without alerts.
 | `AWAIR_BASEMENT_POLL_SECONDS` | `60` | Seconds between basement polls. The module's own publish interval. |
 | `AWAIR_MINISPLIT_URL` | `http://127.0.0.1:8100/status` | The parsons-pulse climate bridge's status endpoint. Loopback-only, so the mini split poller has to run on the bridge's box. |
 | `AWAIR_MINISPLIT_POLL_SECONDS` | `300` | Seconds between mini split polls. The bridge's own control cycle — polling faster re-reads one report window. |
+| `AWAIR_HEALTH_STALE_POLLS` | `6` | How many polls a feed may miss in a row before `GET /health` calls it stale. Multiplied by **each feed's own** `*_POLL_SECONDS`, so one number here is four different windows. See [Is it still recording?](#is-it-still-recording) |
 | `AWAIR_WEB_SLOW_MS` | `1000` | Dashboard requests at or above this many milliseconds log at `WARNING` instead of `INFO`. See [Response times](#response-times). |
 
 To disable ntfy entirely, leave `AWAIR_NTFY_TOKEN` unset and pick a topic
@@ -438,6 +439,79 @@ ingestion, so a wrong URL or 401 just gets logged.)
   actually hangs off the alert feed — at which point the absent check becomes
   testable from the hub's side, which is the better place to decide it.
 
+- **`GET /health`** — whether each feed is still recording (#158). The deploy
+  check for this app used to be `GET /`, which proves the web process is up and
+  the database opens and says nothing whatever about the four pollers that fill
+  it: every feed could have stopped a week ago and that check would still pass.
+
+  One entry per feed — the Awair device, the basement sensor, the outdoor
+  weather, and each mini split head — with the time of its newest stored
+  reading, that reading's age in seconds, and the window it is judged against.
+  **200 when every feed is fresh, 503 when any is stale or has no rows at all**,
+  and `stale` at the top level names the ones that failed. The body is the same
+  either way: the code is for the deploy, the body is for whoever reads the
+  failure.
+
+  ```console
+  $ curl -s localhost:8097/health | jq '{status, stale}'
+  { "status": "ok", "stale": [] }
+  ```
+
+  **It reads the database and nothing else** — no device, no bridge, no
+  Open-Meteo. Not an optimisation: a check that reaches for the network cannot
+  tell "the feed stopped recording" from "the check could not ask", and goes
+  red in exactly the outage it exists to describe. It needs no login, like
+  every route here, and publishes nothing the dashboard does not — four names,
+  four timestamps already drawn as points on the page, and the cadences
+  documented above. Not `minisplit_readings.raw`, which carries device
+  identifiers (ADR-019).
+
+  Age is measured against `received_at`, **our** clock, for the reason
+  `/api/latest` gives for publishing both: `ts` is the source's on three of
+  the four tables, and a source clock stepping backwards would age a healthy
+  feed by an hour it was recording through.
+
+### Is it still recording?
+
+Each feed is judged against **its own cadence**, because the pollers run 30x
+apart at the extremes and one wall-clock threshold for all of them is either
+blind indoors or permanently red outdoors. The rule is one missed-poll count
+(`AWAIR_HEALTH_STALE_POLLS`, default 6) times each feed's own
+`*_POLL_SECONDS`, which is read from the poller that sets it rather than
+restated:
+
+| feed | cadence | stale after |
+|---|---|---|
+| Awair Element | 30 s | 3 min |
+| basement sensor | 60 s | 6 min |
+| each mini split head | 300 s | 30 min |
+| outdoor weather | 900 s | 90 min |
+
+Six, and this repo's own numbers bracket it. Below it, the carry-forward
+windows are **two** intervals (`web._OUTDOOR_CARRY_INTERVALS`,
+`monitor.HEALTH_RUN_MAX_AGE_INTERVALS`) — the floor for "this observation is
+still evidence about now", and a verdict that can fail a deploy wants more
+margin than a gap in a chart. Above it, the pollers' own ntfy alerting fires at
+**ten** indoor polls and **four** outdoor ones. Six is also what the mini split
+needs: `minisplit.MAX_REPORT_WINDOW_SECONDS` is 800, so the bridge can
+legitimately leave 800 s between two rows, and two or three polls would call a
+healthy bridge dead.
+
+Two consequences worth knowing before the first 503:
+
+- **A mini split head configured off is stale, not excused.** `minisplit.zones`
+  reads `bedroom: null` as "the zone is off" and writes no row, which this
+  endpoint cannot tell from a dead bridge — and deliberately does not try to,
+  since a feed quietly dropped off a health check is the failure mode the whole
+  thing exists to remove. Turn a head off for good and either `AWAIR_HEALTH_STALE_POLLS`
+  or `awair.feeds.FEEDS` has to say so on purpose.
+- **The web process resolves the pollers' cadences from its own environment.**
+  That is the pollers' cadence only because all five units load one
+  `EnvironmentFile`; `tests/test_web_health.py::test_every_unit_reads_the_same_environment_file`
+  pins the assumption where this repo can pin it, and the canonical units are
+  templated in the homelab repo.
+
+
 ## Running as a systemd user service
 
 The `systemd/` directory ships five unit files you can drop into
@@ -604,6 +678,13 @@ against a real database. Run on the homelab, 2026-10-30, 319,836 readings in a
 | `/api/events` | 30d | 0.7 ms | 11 KB |
 | every unranged `/api/*` | — | 0.4 ms | < 1 KB |
 
+`/health` is timed by the same probe and is the one route whose cost grows with
+the table: it takes `MAX(received_at)` on four tables and `received_at` is
+indexed on none. **29 ms p50** against a synthetic 78 MB file at homelab scale
+(580,000 rows), which is an eighth of `/api/series?range=30d` on the same file
+and a cost the deploy pays rather than a page load. `db.newest_received_at`
+records why there is no index.
+
 So on a quiet box the server is not the delay. **Two costs sit outside what
 any in-app timer can see**, and both are named in `awair/timing.py`:
 
@@ -654,6 +735,7 @@ awair/
 ├── basement.py  # the basement ESPHome sensor: one row per poll-minute
 ├── units.py     # temperature conversion, in both directions
 ├── timing.py    # one log line + a Server-Timing header per web request
+├── feeds.py     # what `/health` checks: one entry per recorded feed
 └── web.py       # Flask app + JSON endpoints
 ```
 

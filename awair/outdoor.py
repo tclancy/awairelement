@@ -50,6 +50,18 @@ log = logging.getLogger("awair.outdoor")
 FETCH_TIMEOUT_SECONDS = 10
 DEFAULT_POLL_SECONDS = 900
 
+
+def poll_seconds() -> int:
+    """Seconds between outdoor polls, per `AWAIR_OUTDOOR_POLL_SECONDS`.
+
+    The one reader of that name in this repo, so `/health` can judge this
+    feed's staleness against the same cadence `main()` polls at instead of
+    restating it (#158). Read per call rather than bound at import, for the
+    reason `poller.poll_seconds` explains.
+    """
+    return int(os.environ.get("AWAIR_OUTDOOR_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+
+
 # What Open-Meteo's `current` block says its own window is, in seconds. Every
 # accumulating field in that block -- `precipitation`, `snowfall` -- sums over
 # exactly this many seconds, and the source publishes the figure back to us as
@@ -573,7 +585,7 @@ def main() -> None:
     db_path = os.environ.get(
         "AWAIR_DB", os.path.expanduser("~/data/awairelement/awair.db")
     )
-    interval = int(os.environ.get("AWAIR_OUTDOOR_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+    interval = poll_seconds()
     weather_base = os.environ.get("AWAIR_OUTDOOR_WEATHER_URL", DEFAULT_WEATHER_URL)
     air_quality_base = os.environ.get(
         "AWAIR_OUTDOOR_AIR_QUALITY_URL", DEFAULT_AIR_QUALITY_URL

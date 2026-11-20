@@ -27,6 +27,18 @@ FIXTURE = json.loads(FIXTURE_TEXT)
 RECEIVED = "2026-07-11T01:24:20+00:00"
 
 
+def test_the_poll_cadence_matches_the_devices_refresh_interval():
+    """The sibling of the basement and mini split pins, which this lacked.
+
+    The Element refreshes internally every ~10 s, so polling faster buys only
+    duplicate-timestamp skips -- what README's `AWAIR_POLL_SECONDS` row says.
+    It is pinned now because a second reader appeared: `/health` sizes this
+    feed's staleness window at six of these (#158), so the number is no longer
+    only this loop's business.
+    """
+    assert poller.DEFAULT_POLL_SECONDS == 30
+
+
 def test_parse_reading_maps_device_fields():
     reading = parse_reading(FIXTURE, received_at=RECEIVED)
     assert reading["ts"] == "2026-07-11T01:24:22.662Z"

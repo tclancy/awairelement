@@ -55,6 +55,18 @@ FETCH_TIMEOUT_SECONDS = 10
 # same window until the bridge's next cycle reads a new one.
 DEFAULT_POLL_SECONDS = 300
 
+
+def poll_seconds() -> int:
+    """Seconds between mini split polls, per `AWAIR_MINISPLIT_POLL_SECONDS`.
+
+    The one reader of that name in this repo, so `/health` can judge this
+    feed's staleness against the same cadence `main()` polls at instead of
+    restating it (#158). Read per call rather than bound at import, for the
+    reason `poller.poll_seconds` explains.
+    """
+    return int(os.environ.get("AWAIR_MINISPLIT_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+
+
 # Loopback, deliberately — the bridge binds `127.0.0.1:8100` and exposes no
 # authentication, so it is reachable only from the box it runs on.
 DEFAULT_STATUS_URL = "http://127.0.0.1:8100/status"
@@ -435,7 +447,7 @@ def main() -> None:
         "AWAIR_DB", os.path.expanduser("~/data/awairelement/awair.db")
     )
     status_url = os.environ.get("AWAIR_MINISPLIT_URL", DEFAULT_STATUS_URL)
-    interval = int(os.environ.get("AWAIR_MINISPLIT_POLL_SECONDS", DEFAULT_POLL_SECONDS))
+    interval = poll_seconds()
 
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = db.connect(db_path)
