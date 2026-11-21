@@ -12,7 +12,9 @@ from flask import Flask, abort, jsonify, render_template, request
 from awair import (
     basement_watch,
     db,
+    dewpoint,
     feeds,
+    main_zone,
     minisplit,
     outdoor,
     solar,
@@ -826,6 +828,322 @@ def _bedroom_overlay_lookback():
     return BEDROOM_TEMP_GRACE_SECONDS + _minisplit_carry_max_age_seconds()
 
 
+# ---------------------------------------------------------------------------
+# The humidity view: dew point per place, and the main zone against a target
+# (#161). Served by `/api/humidity`, which draws two cards.
+# ---------------------------------------------------------------------------
+
+#: One colour and one label per PLACE, keyed by the feed name.
+#:
+#: The colours are the ones those places already have on the temp and humidity
+#: cards -- "one colour per place rather than per trace" is the rule
+#: `--series-basement` records, and the dew point card is a third trace for
+#: five of these six places. Only the humidifier needed a new one.
+#:
+#: `test_every_feed_has_a_place_on_the_dew_point_card` holds this against
+#: `feeds.FEEDS`: the card draws one line per feed, so a seventh feed either
+#: gets a colour here on purpose or fails that test. It cannot quietly not
+#: appear, which is what a hand-written list of places on the card would have
+#: allowed.
+PLACE_SERIES = {
+    "awair": ("Great room (Awair)", "--series-temp"),
+    "basement": ("Basement", "--series-basement"),
+    "outdoor": ("Outdoor", "--series-outdoor-temp"),
+    "minisplit-dining": ("Dining head", "--series-dining-head"),
+    "minisplit-bedroom": ("Bedroom head", "--series-bedroom-head"),
+    "humidifier": ("Humidifier", "--series-humidifier"),
+}
+
+#: The dew point card's series, in `feeds.FEEDS` order, as the template
+#: renders them: one `<span class="place">` per entry, read back by
+#: `dashboard.js`. The server owns the list for the same reason it owns the
+#: range buttons (#108) -- a copy in the JS is a copy nothing keeps in step.
+DEWPOINT_PLACES = tuple(
+    {
+        "key": feed.name,
+        "label": PLACE_SERIES[feed.name][0],
+        "color_var": PLACE_SERIES[feed.name][1],
+    }
+    for feed in feeds.FEEDS
+    if feed.name in PLACE_SERIES
+)
+
+#: The two columns every feed's dew point is computed from. Every table a feed
+#: writes has both, which is what makes one loop over `feeds.FEEDS` possible.
+_MOISTURE_COLUMNS = ("temp", "humid")
+
+#: How many of the coarser of (a feed's cadence, the chart's bucket) one
+#: observation is held for on the humidity view's grid. Two, for
+#: `_OUTDOOR_CARRY_INTERVALS`' reason: one missed poll is bridged, a longer
+#: silence is a break.
+#:
+#: The `max` is what makes one rule serve six feeds whose cadences differ by
+#: 30x. Two *cadences* alone would null almost every stamp for the Awair on
+#: the 30 d view (60 s of carry across 900 s stamps); two *buckets* alone
+#: would hold an outdoor reading for half an hour on the `today` view, which
+#: is less than its own publish interval and so draws a healthy feed as
+#: dashes.
+_MOISTURE_CARRY_INTERVALS = 2
+
+#: The humidifier columns the shading spans are read from, in the order
+#: `main_zone.spans` unpacks them after the epoch.
+_HUMIDIFIER_SPAN_COLUMNS = ("switch", "water_lacks", "water_tank_lifted")
+
+
+def _moisture_carry_max_age_seconds(feed, bucket_seconds):
+    """How long one of `feed`'s observations may be held on the shared grid.
+
+    A function, not a constant, so the derivation from each poller's own
+    `poll_seconds` is observable: a test can move
+    `AWAIR_HUMIDIFIER_POLL_SECONDS` and watch this window follow, which is the
+    only way to tell a derivation from a coincidence while the number happens
+    to be 300 (#109's review, applied to a sixth feed).
+    """
+    return _MOISTURE_CARRY_INTERVALS * max(feed.poll_seconds(), bucket_seconds)
+
+
+def _grid(since_epoch, until_epoch, bucket_seconds):
+    """The humidity view's x stamps: the whole range, on bucket boundaries.
+
+    Built from the RANGE rather than from any one feed's data, which is the
+    difference between this view and the metric cards. Those borrow the
+    Awair's own bucket stamps, so an Awair outage shrinks the x axis and takes
+    every overlay on the card with it -- stated as a known property in
+    `_basement_on_grid`. Here the subject is a comparison between six sources,
+    no one of which owns the axis, and a reader needs "the humidifier was dry
+    from Tuesday" to be in the same place on the chart whatever the Awair was
+    doing.
+
+    One consequence worth knowing: both cards always span the full range, so
+    an empty database draws an empty week rather than nothing at all.
+    """
+    start = int(since_epoch // bucket_seconds) * bucket_seconds
+    return list(range(start, int(until_epoch) + 1, bucket_seconds))
+
+
+def _on_grid(points, grid, max_age_seconds, bucket_seconds):
+    """`[(epoch, value)]` bucket-averaged, then held onto `grid`.
+
+    The pattern `_basement_on_grid` established: average into the chart's own
+    buckets first, so a stamp on the 30 d view is the mean of its fifteen
+    minutes rather than whichever single reading landed on its boundary, then
+    hold by `carry_forward` -- whose stamps line up exactly because `bucket`
+    snaps to the same boundaries this grid is built on.
+
+    Nulls are dropped before bucketing, never carried into it: `bucket` sums a
+    window's values and one None would raise, and a None here means "this row
+    had no reading", which is not a value.
+    """
+    bucketed = bucket([(t, v) for t, v in points if v is not None], bucket_seconds)
+    return carry_forward(
+        zip(bucketed["t"], bucketed["avg"], strict=True), grid, max_age_seconds
+    )
+
+
+def _dew_point_on_grid(rows, grid, feed, bucket_seconds, unit):
+    """One place's dew point, in display units, on the shared grid.
+
+    `rows` is `[(epoch, temp_c, humid)]` for one feed. Converted AFTER the
+    dew point is computed and before the bucketing: the formula is a Celsius
+    one (`awair.dewpoint`), and converting each observation once rather than
+    once per stamp it is held across is the same ordering `_outdoor_temp_on_grid`
+    uses.
+    """
+    points = [(epoch, _in_unit(value, unit)) for epoch, value in dewpoint.series(rows)]
+    return _on_grid(
+        points,
+        grid,
+        _moisture_carry_max_age_seconds(feed, bucket_seconds),
+        bucket_seconds,
+    )
+
+
+def _target_on_grid(outdoor_rows, grid):
+    """The target in force at each grid stamp, in percent.
+
+    One step line, not two constants: the target drops when it is very cold
+    out, so the line itself has to move with the outdoor temperature rather
+    than the reader having to hold both numbers and the threshold in mind.
+
+    A stamp with no outdoor reading gets the warm target -- see
+    `main_zone.target_for`, which owns that choice and the reason for it.
+    """
+    temps = carry_forward(outdoor_rows, grid, _outdoor_carry_max_age_seconds())
+    return [main_zone.target_for(temp) for temp in temps]
+
+
+def _hours_below_target(conn, feed, now):
+    """Hours the main zone was observed below target in the last 7 days.
+
+    Its own fixed window, not the range the reader clicked, for
+    `_basement_watch`'s reason: it is a figure about the past week, and one
+    that shrank when somebody pressed "Today" would be a different statistic
+    under the same label.
+
+    The target is evaluated at each reading's own moment, because a week in
+    January contains both of its values. Outdoor temperatures are put onto the
+    readings' own stamps by the same carry the charts use, so a stretch with
+    no outdoor reading is judged against the warm target rather than skipped.
+
+    **The gap bound is the feed's own staleness window** (`AWAIR_HEALTH_STALE_POLLS`
+    times its cadence, the figure `/health` already judges it by) rather than
+    the two intervals the charts carry a line for. The two numbers answer
+    different questions and the wider one is right here: a chart asks "is
+    this observation still worth drawing", where a total asks "was the feed
+    recording across this stretch at all", and `/health` is where this app
+    has already written down its answer to the second. At the Awair's 30 s
+    cadence that is three minutes, so an ordinary restart costs nothing and a
+    real outage still contributes no hours.
+
+    **This is the one deliberately expensive thing on the humidity view**: a
+    7-day read of the main zone feed's humidity column, which is about 20,000
+    rows at the Awair's 30 s cadence. It is one column and one index-ordered
+    scan, it is in an endpoint of its own that the page fetches in parallel
+    with the other four, and the figure is the one thing on the card that
+    cannot be read off the chart.
+    """
+    since = now - timedelta(days=main_zone.BELOW_TARGET_DAYS)
+    points = db.feed_readings_since(conn, feed.table, feed.head, ("humid",), since)
+    outdoor_rows = db.outdoor_readings_since(
+        conn, ("temp",), since - timedelta(seconds=_outdoor_carry_max_age_seconds())
+    )
+    stamps = [epoch for epoch, _humid in points]
+    temps = carry_forward(outdoor_rows, stamps, _outdoor_carry_max_age_seconds())
+    targets = dict(zip(stamps, (main_zone.target_for(t) for t in temps), strict=True))
+    return main_zone.hours_below_target(
+        points, lambda epoch: targets[epoch], feed.stale_after_seconds()
+    )
+
+
+def _feed_named(name):
+    """The `feeds.Feed` with this name. Raises if there is none.
+
+    Raising is right here and wrong in `main_zone.feed`: this is called with a
+    literal from three places on the humidity view, so a miss means the name
+    in this file has drifted from `feeds.FEEDS` -- a bug, not a
+    misconfiguration, and one a 500 on one endpoint reports better than a
+    quietly empty trace.
+    """
+    return next(feed for feed in feeds.FEEDS if feed.name == name)
+
+
+def _latest_of(values):
+    """The newest non-null entry of a grid-aligned series, or None."""
+    return next((value for value in reversed(values) if value is not None), None)
+
+
+def _moisture_rows(conn, since, bucket_seconds):
+    """Every feed's `(epoch, temp_c, humid)` rows for the range, by feed name.
+
+    One read per feed, each from one carry window before `since`, for the
+    reason `/api/series` reads its overlays that way: the observation current
+    at the left edge was published before it, so reading from `since` leaves
+    the first stamps with nothing at or before them and draws a healthy feed
+    with a blank first bucket.
+    """
+    return {
+        feed.name: main_zone.humidity_rows(
+            conn,
+            feed,
+            since
+            - timedelta(seconds=_moisture_carry_max_age_seconds(feed, bucket_seconds)),
+        )
+        for feed in feeds.FEEDS
+    }
+
+
+def _dew_point_series(rows, grid, bucket_seconds, unit):
+    """One dew point trace per feed, on the shared grid, in display units.
+
+    Keyed and ordered by `feeds.FEEDS`, which is what makes the dew point
+    card a card about *every* place that records a temperature and a humidity
+    rather than about the five somebody remembered.
+    """
+    return {
+        feed.name: _dew_point_on_grid(rows[feed.name], grid, feed, bucket_seconds, unit)
+        for feed in feeds.FEEDS
+    }
+
+
+def _humid_on_grid(rows, grid, feed, bucket_seconds):
+    """One feed's relative humidity on the shared grid.
+
+    No conversion and none possible: a relative humidity is a percent on
+    every surface this project has.
+    """
+    return _on_grid(
+        [(epoch, humid) for epoch, _temp, humid in rows],
+        grid,
+        _moisture_carry_max_age_seconds(feed, bucket_seconds),
+        bucket_seconds,
+    )
+
+
+def _main_zone_payload(rows, outdoor_rows, span_rows, grid, bucket_seconds, zone, unit):
+    """The main zone card: three humidity traces, a target line, and shading.
+
+    The three traces are the three sensors in the great room -- see
+    `awair.main_zone`, which owns the reason they disagree. Which one is the
+    zone's own is `AWAIR_MAIN_ZONE_FEED`; the other two are named here
+    because their identity is the point of the comparison rather than a
+    setting.
+
+    A reader who points `AWAIR_MAIN_ZONE_FEED` at the humidifier or the
+    dining head gets that sensor drawn twice, once as the zone and once as
+    itself. Deliberately not special-cased: the card's legend names all
+    three, so the duplicate is visible, and suppressing one would make the
+    card's shape depend on a setting.
+    """
+    humidifier_feed = _feed_named("humidifier")
+    return {
+        "name": zone.name,
+        "label": zone.label,
+        # The zone sensor's own place colour, so the card's zone line is the
+        # same colour that sensor is everywhere else on the page -- and so it
+        # follows `AWAIR_MAIN_ZONE_FEED` rather than being a colour the JS
+        # pins to whichever feed was the default when it was written.
+        "color_var": PLACE_SERIES[zone.name][1],
+        "humid": _humid_on_grid(rows[zone.name], grid, zone, bucket_seconds),
+        "humidifier_humid": _humid_on_grid(
+            rows["humidifier"], grid, humidifier_feed, bucket_seconds
+        ),
+        "dining_humid": _humid_on_grid(
+            rows["minisplit-dining"],
+            grid,
+            _feed_named("minisplit-dining"),
+            bucket_seconds,
+        ),
+        "target": _target_on_grid(outdoor_rows, grid),
+        # Shading, not a series: "the humidifier was off" and "it was out of
+        # water" are states with a duration, and drawing them as a line at
+        # some height on a humidity axis would be a number nobody can read.
+        "spans": main_zone.spans(
+            span_rows,
+            _moisture_carry_max_age_seconds(humidifier_feed, bucket_seconds),
+        ),
+        "below_target_days": main_zone.BELOW_TARGET_DAYS,
+        # The three numbers #161 put in the environment, published so the card
+        # can label its own target line and the footer can state the rule
+        # instead of restating the defaults.
+        **_humidity_rule(unit),
+    }
+
+
+def _humidity_rule(unit):
+    """The target rule as configured: both targets and where it switches.
+
+    One reader for the payload and for the page's own explanation of the
+    card, so the sentence under the charts states the numbers in the
+    environment rather than the defaults they happened to have when it was
+    written. The threshold is in the display unit; the targets are percent.
+    """
+    return {
+        "target_warm": main_zone.target(),
+        "target_cold": main_zone.cold_target(),
+        "cold_outdoor_temp": _in_unit(main_zone.cold_outdoor_temp(), unit),
+    }
+
+
 def _bootstrap_schema(db_path, logger) -> None:
     """Run the schema bootstrap once, at app construction rather than per request.
 
@@ -893,6 +1211,14 @@ def create_app(db_path=None):
             default_range=DEFAULT_RANGE,
             overlays=METRIC_OVERLAYS,
             watch_metric=WATCH_METRIC,
+            # The dew point card's series, one per feed (#161). Rendered into
+            # the markup and read back by `dashboard.js`, so the list of
+            # places lives in exactly one place -- here, derived from
+            # `feeds.FEEDS`.
+            dewpoint_places=DEWPOINT_PLACES,
+            # The humidity target as configured (#161), for the page's own
+            # explanation of the Main zone card.
+            humidity_rule=_humidity_rule(temp_unit()),
         )
 
     @app.get("/health")
@@ -1102,6 +1428,73 @@ def create_app(db_path=None):
                 ),
                 "temp_unit_symbol": units.symbol(unit),
                 "watts_unit": "W",
+            }
+        )
+
+    @app.get("/api/humidity")
+    def humidity():
+        """The humidity view: a dew point per place, and the main zone vs target.
+
+        Two cards, one endpoint, one x grid (`_grid`). They are one request
+        because they are one question asked two ways -- "is there enough water
+        in the air in the room we heat" -- and because the dew points the main
+        zone card prints beside its three humidity traces are the same numbers
+        the dew point card draws. Served separately they would read the same
+        rows twice and could print a dew point from one request beside a
+        humidity from another.
+
+        Its own endpoint rather than more keys on `/api/series`, which is
+        already the heaviest query on the page: `dashboard.js` fetches the
+        five in parallel, so this one's cost (see `_hours_below_target`) is
+        paid alongside that one rather than after it.
+
+        Temperatures -- the dew points and the cold-weather threshold -- are
+        in `TEMPERATURE_UNIT`, like every other temperature a browser gets
+        here. Humidities and the target are percent, which has no unit to
+        pick.
+        """
+        since, bucket_seconds = _range_params()
+        now = datetime.now(UTC)
+        zone = main_zone.feed()
+        grid = _grid(since.timestamp(), now.timestamp(), bucket_seconds)
+        unit = temp_unit()
+        conn = connect()
+        try:
+            rows = _moisture_rows(conn, since, bucket_seconds)
+            outdoor_rows = db.outdoor_readings_since(
+                conn,
+                ("temp",),
+                since - timedelta(seconds=_outdoor_carry_max_age_seconds()),
+            )
+            span_rows = db.feed_readings_since(
+                conn, "humidifier_readings", None, _HUMIDIFIER_SPAN_COLUMNS, since
+            )
+            hours_below = _hours_below_target(conn, zone, now)
+        finally:
+            conn.close()
+        dew_points = _dew_point_series(rows, grid, bucket_seconds, unit)
+        return jsonify(
+            {
+                "bucket_seconds": bucket_seconds,
+                # One x array for both cards and every series on them, for the
+                # reason `/api/series` ships its overlays as flat lists: the x
+                # values ARE this, and a copy per series would be the same
+                # numbers published seven times with nothing holding them in
+                # step.
+                "t": grid,
+                "dew_points": dew_points,
+                # The newest value of each, so the main zone card can print
+                # three of them side by side without the browser deciding what
+                # "newest" means. Read off the drawn series, so a number in
+                # that header cannot disagree with a line on this card.
+                "dew_point_latest": {
+                    name: _latest_of(values) for name, values in dew_points.items()
+                },
+                "main_zone": _main_zone_payload(
+                    rows, outdoor_rows, span_rows, grid, bucket_seconds, zone, unit
+                )
+                | {"hours_below_target": hours_below},
+                "temp_unit_symbol": units.symbol(unit),
             }
         )
 

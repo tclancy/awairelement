@@ -71,6 +71,11 @@ RANGED = (
     ("api/events", "/api/events"),
     ("api/outdoor-series", "/api/outdoor-series"),
     ("api/bedroom-series", "/api/bedroom-series"),
+    # #161, and the one here worth watching: besides six feeds' worth of
+    # temperature-and-humidity rows over the range, it computes the main
+    # zone's hours below target over a FIXED seven days, so its cost does not
+    # fall when the reader presses "Today" the way every other row's does.
+    ("api/humidity", "/api/humidity"),
 )
 # Endpoints the page polls without a range.
 UNRANGED = (

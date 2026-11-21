@@ -309,6 +309,88 @@ BASEMENT_COLUMNS = (
     "humid",
 )
 
+# The Levoit Superior 6000S humidifier on VeSync (`awair.humidifier`, #161).
+#
+# `ts` is OUR poll clock truncated to the minute, for the basement's reason
+# and not the Awair's: the library hands us a state object with no clock in
+# it at all -- `getHumidifierStatus` returns a snapshot, not an observation
+# time -- so there is no source clock to key on. At a 300 s cadence the
+# truncation means a poll-minute, which is unique per poll in ordinary
+# running; what it buys is the same guard the other three unkeyed-source
+# tables have, that a restart inside one minute re-polls and writes nothing.
+#
+# `temp` is CELSIUS like every other temperature column here, and the device
+# publishes FAHRENHEIT: pyvesync's `Superior6000SResult.temperature` is
+# tenths of a degree F and the library's own `_set_state` divides by ten
+# (`state.temperature`, commented "Fahrenheit but without decimals"). The
+# conversion happens once, at ingest, in `humidifier.reading_from_state` --
+# the second place in this project that converts INTO storage, and it reads
+# `awair.units.to_celsius` for the same reason the mini split does.
+#
+# `switch` is the device's on/off state, named as the mini split's is and for
+# the same reason: beside `mist_level` a column called `power` reads as watts.
+# It stores what the device said -- 'on', 'off', or 'unknown' -- rather than a
+# boolean, because `DeviceStatus.UNKNOWN` is a real answer the library gives
+# and `0` would file it as off.
+#
+# `water_lacks` and `water_tank_lifted` are the two out-of-service states and
+# they are NOT the same fact: an empty reservoir stops the mist, a lifted tank
+# is somebody refilling it (and reads as lifted for as long as it is out). The
+# dashboard shades both, the humidity chart needs to tell a dry house from a
+# dry *humidifier*, and collapsing them would lose which one it was.
+#
+# `filter_life` is the percentage the device reports, stored as REAL. The
+# device publishes an integer; REAL costs nothing and a future firmware that
+# reports one decimal place does not need a migration.
+#
+# Everything but the two clocks is NULLABLE, unlike `basement_readings.temp`.
+# The row's reason to exist here is the *state* -- which includes "off, out of
+# water, reporting no humidity" -- so a reading with nulls in it is still the
+# answer to "what was the humidifier doing", where a basement row with no
+# temperature would be no observation at all.
+HUMIDIFIER_COLUMNS_DDL = """
+    ts TEXT NOT NULL PRIMARY KEY,
+    received_at TEXT NOT NULL,
+    humid REAL,
+    temp REAL,
+    target_humid REAL,
+    mist_level INTEGER,
+    mode TEXT,
+    switch TEXT,
+    water_lacks INTEGER,
+    water_tank_lifted INTEGER,
+    filter_life REAL
+"""
+
+SCHEMA += (
+    "\nCREATE TABLE IF NOT EXISTS humidifier_readings ("
+    + HUMIDIFIER_COLUMNS_DDL
+    + ");\n"
+)
+
+HUMIDIFIER_COLUMNS = (
+    "ts",
+    "received_at",
+    # The device's own relative humidity in percent -- the great room measured
+    # at living level, which is the thing the Awair above the fireplace cannot
+    # see (#161).
+    "humid",
+    "temp",
+    # What the humidifier itself is aiming at (`auto_target_humidity`), which
+    # is NOT the dashboard's target: that one is this repo's own
+    # `AWAIR_HUMIDITY_TARGET*` and lives nowhere in this table. Both are
+    # recorded on the same chart on purpose, because "the machine is set to 45
+    # and we want 40" and "the machine is set to 40 and cannot get there" look
+    # identical in the humidity trace alone.
+    "target_humid",
+    "mist_level",
+    "mode",
+    "switch",
+    "water_lacks",
+    "water_tank_lifted",
+    "filter_life",
+)
+
 OUTDOOR_COLUMNS = (
     "ts",
     "received_at",
@@ -383,6 +465,26 @@ READING_COLUMNS = (
     "pm25",
     "pm10_est",
 )
+
+#: Every table a feed's rows land in, and that table's published column list.
+#:
+#: One mapping, three consumers: `READING_TABLES` below (the whitelist
+#: `newest_received_at` interpolates a table name against), `feed_readings_since`
+#: (which validates a caller's columns against the table it was handed), and
+#: `awair.feeds`, whose entries name one of these tables each. Before #161
+#: those were three independent lists and a sixth feed would have had to be
+#: added to all of them.
+#:
+#: It is still not a definition of "the feeds this app records" -- that lives
+#: in `awair.feeds`, which is the thing to edit when a seventh feed arrives.
+#: This says only which tables exist and what is in them.
+FEED_COLUMNS = {
+    "readings": READING_COLUMNS,
+    "basement_readings": BASEMENT_COLUMNS,
+    "outdoor_readings": OUTDOOR_COLUMNS,
+    "minisplit_readings": MINISPLIT_COLUMNS,
+    "humidifier_readings": HUMIDIFIER_COLUMNS,
+}
 
 
 BUSY_TIMEOUT_MS = 5000
@@ -943,6 +1045,33 @@ def insert_basement_reading(conn: sqlite3.Connection, reading: dict) -> bool:
     return cursor.rowcount == 1
 
 
+def insert_humidifier_reading(conn: sqlite3.Connection, reading: dict) -> bool:
+    """Insert one humidifier reading. False if this poll-minute is stored (#161).
+
+    `ON CONFLICT(ts) DO NOTHING` rather than `INSERT OR IGNORE`, for the reason
+    written out on `insert_outdoor_reading`: `OR IGNORE` would report a NOT
+    NULL violation as rowcount 0, which this function's caller reads as
+    "already stored" -- the one status that means nothing is wrong.
+
+    Five writers share one `AWAIR_DB` now, so the rollback on the way out
+    matters a little more than it did: an unresolved implicit transaction here
+    holds the write lock against four other pollers and the web process's
+    schema bootstrap.
+    """
+    placeholders = ", ".join(f":{col}" for col in HUMIDIFIER_COLUMNS)
+    try:
+        cursor = conn.execute(
+            f"INSERT INTO humidifier_readings ({', '.join(HUMIDIFIER_COLUMNS)})"
+            f" VALUES ({placeholders}) ON CONFLICT(ts) DO NOTHING",
+            reading,
+        )
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    conn.commit()
+    return cursor.rowcount == 1
+
+
 def basement_readings_since(conn, since, columns=("temp",)) -> list:
     """[(epoch_seconds, col1, ...)] ascending, for poll-minutes at or after `since`.
 
@@ -965,14 +1094,15 @@ def basement_readings_since(conn, since, columns=("temp",)) -> list:
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 
 
-#: The tables a reading lands in, keyed by nothing -- a whitelist, because
-#: `newest_received_at` interpolates a table name into SQL and every other
-#: query in this module names its table literally. It is not a definition of
-#: "the feeds this app records"; that lives in `awair.feeds`, which names a
-#: table per feed and is the thing to edit when a fifth feed arrives.
-READING_TABLES = frozenset(
-    {"readings", "basement_readings", "outdoor_readings", "minisplit_readings"}
-)
+#: The tables a reading lands in -- a whitelist, because `newest_received_at`
+#: and `feed_readings_since` interpolate a table name into SQL and every other
+#: query in this module names its table literally.
+#:
+#: Derived from `FEED_COLUMNS` rather than retyped (#161): the two said the
+#: same thing in two places, and the version of this that was a literal set
+#: would have let a sixth table be queryable by one function and not the
+#: other.
+READING_TABLES = frozenset(FEED_COLUMNS)
 
 
 def newest_received_at(conn, table: str, head: str | None = None) -> datetime | None:
@@ -1208,6 +1338,55 @@ def readings_since(conn, columns, since) -> list:
     rows = conn.execute(
         f"SELECT ts, {', '.join(columns)} FROM readings WHERE ts >= ? ORDER BY ts",
         (iso_z(since),),
+    )
+    return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
+
+
+#: How `since` is spelled for each table's own `ts` column.
+#:
+#: `readings.ts` is the Element's own `...T18:00:00.000Z`; the other four are
+#: written by us as `...T18:00:00+00:00`. Both compare lexicographically
+#: against their own table's values, and neither compares correctly against
+#: the other's at sub-second distances -- which is why this is a per-table
+#: function rather than one spelling `feed_readings_since` picks.
+_SINCE_SPELLING = {"readings": iso_z}
+
+
+def feed_readings_since(conn, table, head, columns, since) -> list:
+    """`[(epoch_seconds, col1, ...)]` ascending, for any one feed's table (#161).
+
+    The generic form of `readings_since` and its three siblings, added for the
+    dew point card: that card draws one line per feed, and five
+    table-specific readers with five different signatures cannot be called in
+    a loop over `awair.feeds.FEEDS` -- so the card would have carried its own
+    list of places and the next feed would not have appeared on it.
+
+    `head` is NULL for every table but `minisplit_readings`, whose rows share
+    one table keyed `(head, ts)`, exactly as `awair.feeds.Feed` records it.
+    Passing a head for another table is a programming error and raises, rather
+    than quietly returning every row: `WHERE head = ?` against a table with no
+    such column is an OperationalError, which is what you want to see.
+
+    The four named readers stay. Each documents a semantic its callers rely on
+    -- `basement_readings_since`'s default column, `minisplit_readings_since`'s
+    ruling about a window that closed inside the range -- and this function
+    makes no such promises beyond "rows at or after `since`, in `ts` order".
+    """
+    if table not in FEED_COLUMNS:
+        raise ValueError(f"unknown reading table {table!r}")
+    unknown = set(columns) - set(FEED_COLUMNS[table])
+    if unknown:
+        raise ValueError(f"unknown {table} columns {unknown}")
+    spelling = _SINCE_SPELLING.get(table, datetime.isoformat)
+    params = [spelling(since)]
+    filter_sql = ""
+    if head is not None:
+        filter_sql = " AND head = ?"
+        params.append(head)
+    rows = conn.execute(
+        f"SELECT ts, {', '.join(columns)} FROM {table}"
+        f" WHERE ts >= ?{filter_sql} ORDER BY ts",
+        params,
     )
     return [(datetime.fromisoformat(ts).timestamp(), *values) for ts, *values in rows]
 

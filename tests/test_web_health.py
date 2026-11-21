@@ -47,9 +47,36 @@ POLL_SECONDS_ENV = {
     "outdoor": "AWAIR_OUTDOOR_POLL_SECONDS",
     "minisplit-dining": "AWAIR_MINISPLIT_POLL_SECONDS",
     "minisplit-bedroom": "AWAIR_MINISPLIT_POLL_SECONDS",
+    "humidifier": "AWAIR_HUMIDIFIER_POLL_SECONDS",
 }
 
+#: The cadence each feed is probed with in the derivation test below, and the
+#: humidifier is why this exists at all: its poller CLAMPS anything under five
+#: minutes (`humidifier.MIN_POLL_SECONDS`, #161's "poll no faster than every 5
+#: minutes"), so probing it with 7 would assert that the clamp is broken.
+#:
+#: A value per feed rather than one for all, and NOT read back from the code
+#: under test: `poll_seconds()` would agree with any answer it gave, which is
+#: the whole thing this test is for.
+#: `tests/test_humidifier.py::test_a_cadence_under_the_floor_is_raised_to_it`
+#: owns the clamp itself; `test_the_humidifiers_floor_reaches_health` below is
+#: what pins that `/health` sees the clamped number rather than the asked-for
+#: one.
+POLL_SECONDS_PROBE = {name: 7 for name in POLL_SECONDS_ENV} | {"humidifier": 700}
+
 FEED_IDS = [feed.name for feed in feeds.FEEDS]
+
+#: The feeds whose absence is a fault, and the one whose absence is not.
+#:
+#: Every poller here talks to something on the LAN and needs no secret, so an
+#: empty table can only mean it stopped -- except the humidifier's, which
+#: needs a VeSync login this repo does not hold (#161). A box with no such
+#: account must not fail its own deploy check, so a `Feed(optional=True)` with
+#: no rows reads as "not set up" instead of stale. See `feeds.verdict`.
+REQUIRED_FEEDS = [feed for feed in feeds.FEEDS if not feed.optional]
+OPTIONAL_FEEDS = [feed for feed in feeds.FEEDS if feed.optional]
+REQUIRED_IDS = [feed.name for feed in REQUIRED_FEEDS]
+OPTIONAL_IDS = [feed.name for feed in OPTIONAL_FEEDS]
 
 
 def _record(conn, feed, received_at):
@@ -85,6 +112,11 @@ def _record(conn, feed, received_at):
             "INSERT INTO minisplit_readings (head, ts, received_at, temp)"
             " VALUES (?, ?, ?, ?)",
             (feed.head, stamp, stamp, 20.0),
+        )
+    elif feed.table == "humidifier_readings":
+        conn.execute(
+            "INSERT INTO humidifier_readings (ts, received_at, humid) VALUES (?, ?, ?)",
+            (stamp, stamp, 38.0),
         )
     else:
         raise AssertionError(
@@ -171,7 +203,7 @@ def test_one_stale_feed_is_503_and_names_it(stale_feed, tmp_path):
     assert entry["age_seconds"] > entry["stale_after_seconds"]
 
 
-@pytest.mark.parametrize("missing_feed", feeds.FEEDS, ids=FEED_IDS)
+@pytest.mark.parametrize("missing_feed", REQUIRED_FEEDS, ids=REQUIRED_IDS)
 def test_a_feed_with_no_rows_is_503_and_names_it(missing_feed, tmp_path):
     """An empty table is stale, not unknown, and not quietly skipped.
 
@@ -196,11 +228,79 @@ def test_a_feed_with_no_rows_is_503_and_names_it(missing_feed, tmp_path):
 
 
 def test_an_empty_database_names_every_feed(tmp_path):
-    """A fresh box, before any poller has run: all of them, not just the first."""
+    """A fresh box, before any poller has run: all of them, not just the first.
+
+    "Every feed" means every REQUIRED feed since #161. The humidifier is in
+    the other list on the same payload -- see the three tests below, which are
+    what keep that from being a feed quietly dropped off the check.
+    """
     status, payload = _get(_database(tmp_path, {}))
 
     assert status == 503
-    assert payload["stale"] == FEED_IDS
+    assert payload["stale"] == REQUIRED_IDS
+    assert payload["not_configured"] == OPTIONAL_IDS
+
+
+@pytest.mark.parametrize("feed", OPTIONAL_FEEDS, ids=OPTIONAL_IDS)
+def test_an_optional_feed_with_no_rows_is_not_configured_not_stale(feed, tmp_path):
+    """The humidifier on a box with no VeSync account must not fail a deploy.
+
+    This is the half of #161 that `/health` exists to get right, and the
+    parametrized sibling above is its control: for every other feed an empty
+    table is a 503, and the difference is `Feed.optional` rather than a name
+    written into the route.
+    """
+    ages = {other: timedelta(seconds=1) for other in REQUIRED_FEEDS}
+
+    status, payload = _get(_database(tmp_path, ages))
+
+    assert status == 200
+    assert payload["status"] == "ok"
+    assert payload["stale"] == []
+    assert payload["not_configured"] == [feed.name]
+    entry = next(f for f in payload["feeds"] if f["name"] == feed.name)
+    assert entry["verdict"] == feeds.NOT_CONFIGURED
+    assert entry["newest_reading_at"] is None
+
+
+@pytest.mark.parametrize("feed", OPTIONAL_FEEDS, ids=OPTIONAL_IDS)
+def test_an_optional_feed_that_has_recorded_and_stopped_is_stale(feed, tmp_path):
+    """One row, ever, and this feed is held to everything the others are.
+
+    The pair with the test above is the whole distinction #161 asked for:
+    "never recorded" is not set up, "recorded and went quiet" stopped
+    recording. Rows on disk are what tell them apart, which is why this test
+    differs from that one by a single row.
+    """
+    ages = {other: timedelta(seconds=1) for other in REQUIRED_FEEDS}
+    ages[feed] = timedelta(seconds=feed.stale_after_seconds() + 1)
+
+    status, payload = _get(_database(tmp_path, ages))
+
+    assert status == 503
+    assert payload["stale"] == [feed.name]
+    assert payload["not_configured"] == []
+    entry = next(f for f in payload["feeds"] if f["name"] == feed.name)
+    assert entry["verdict"] == feeds.STALE
+
+
+def test_fresh_and_optional_are_not_the_same_word(tmp_path):
+    """`fresh` still means recording, for anything written against #158.
+
+    The payload grew a `verdict` and kept `fresh`, and this is what stops the
+    two from drifting into disagreement: every entry's boolean is exactly
+    "this feed's verdict is recording", including the optional one, whose
+    `not_configured` is deliberately NOT fresh and deliberately not stale
+    either.
+    """
+    ages = {other: timedelta(seconds=1) for other in REQUIRED_FEEDS}
+
+    _, payload = _get(_database(tmp_path, ages))
+
+    for entry in payload["feeds"]:
+        assert entry["fresh"] == (entry["verdict"] == feeds.RECORDING), entry["name"]
+    optional = [f["name"] for f in payload["feeds"] if f["optional"]]
+    assert optional == OPTIONAL_IDS
 
 
 def test_the_body_is_the_same_shape_on_200_and_503(tmp_path):
@@ -224,14 +324,34 @@ def test_each_window_follows_its_own_pollers_cadence(feed, tmp_path, monkeypatch
     A `/health` that restated the four numbers passes everything above and
     fails here.
     """
-    monkeypatch.setenv(POLL_SECONDS_ENV[feed.name], "7")
-    expected = feeds.stale_after_polls() * 7
+    probe = POLL_SECONDS_PROBE[feed.name]
+    monkeypatch.setenv(POLL_SECONDS_ENV[feed.name], str(probe))
+    expected = feeds.stale_after_polls() * probe
 
     _, payload = _get(_all_fresh(tmp_path))
 
     entry = next(f for f in payload["feeds"] if f["name"] == feed.name)
-    assert entry["poll_seconds"] == 7
+    assert entry["poll_seconds"] == probe
     assert entry["stale_after_seconds"] == expected
+
+
+def test_the_humidifiers_floor_reaches_health(tmp_path, monkeypatch):
+    """A cadence under the floor is reported as the floor, not as asked (#161).
+
+    The companion to the derivation test above and the reason it needs a
+    per-feed probe: this feed's cadence is clamped at five minutes, so
+    `/health` has to judge it against the interval the poller will really use.
+    Report the asked-for 7 s here and the window becomes 42 s for a feed that
+    writes a row every 300 s -- permanently red, on a healthy humidifier.
+    """
+    monkeypatch.setenv("AWAIR_HUMIDIFIER_POLL_SECONDS", "7")
+
+    status, payload = _get(_all_fresh(tmp_path))
+
+    entry = next(f for f in payload["feeds"] if f["name"] == "humidifier")
+    assert entry["poll_seconds"] == 300
+    assert entry["stale_after_seconds"] == feeds.stale_after_polls() * 300
+    assert (status, payload["stale"]) == (200, [])
 
 
 def test_only_the_named_feeds_window_moves(tmp_path, monkeypatch):

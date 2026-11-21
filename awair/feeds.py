@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from awair import basement, db, minisplit, outdoor, poller
+from awair import basement, db, humidifier, minisplit, outdoor, poller
 
 #: How many polls a feed may miss in a row before `/health` calls it stale.
 #:
@@ -73,6 +73,11 @@ class Feed:
 
     `head` is NULL for every feed but the mini split's, whose rows share one
     table keyed `(head, ts)`.
+
+    `optional` marks a feed whose poller needs configuration this repo cannot
+    supply -- a cloud login -- so an empty table is "not set up" rather than
+    "stopped recording". See `verdict`, which is where that distinction is
+    drawn and where its one blind spot is written down.
     """
 
     name: str
@@ -80,6 +85,7 @@ class Feed:
     table: str
     head: str | None
     poll_seconds: Callable[[], int]
+    optional: bool = False
 
     def stale_after_seconds(self) -> int:
         """How old this feed's newest reading may be and still count as fresh."""
@@ -120,7 +126,30 @@ FEEDS = (
         )
         for head, _ in minisplit.zones({})
     ),
+    # The VeSync humidifier (#161), and the one OPTIONAL feed here. Every
+    # other poller talks to something on the LAN and needs no secret, so
+    # "this feed has no rows" can only mean it stopped; this one needs an
+    # account login, and a box without one must not fail its own deploy
+    # check. See `verdict`.
+    Feed(
+        "humidifier",
+        "Great room humidifier",
+        "humidifier_readings",
+        None,
+        humidifier.poll_seconds,
+        optional=True,
+    ),
 )
+
+#: The three answers `/health` gives about one feed.
+#:
+#: `fresh` stays on the payload beside this -- it is `RECORDING`, published
+#: under the name #158 gave it -- so a consumer written against that endpoint
+#: before this one keeps working. The word is here because a boolean cannot
+#: say the third thing.
+RECORDING = "recording"
+STALE = "stale"
+NOT_CONFIGURED = "not_configured"
 
 
 def _z(moment: datetime) -> str:
@@ -157,6 +186,41 @@ def is_fresh(age_seconds: float | None, stale_after_seconds: float) -> bool:
     return -stale_after_seconds <= age_seconds <= stale_after_seconds
 
 
+def verdict(feed: Feed, age_seconds: float | None, stale_after_seconds: float) -> str:
+    """`RECORDING`, `STALE` or `NOT_CONFIGURED` for one feed (#161).
+
+    **How "not set up" is told apart from "stopped recording": by whether the
+    table has ever held a row.** An optional feed with no rows at all has
+    never recorded, which on a box with no VeSync login is exactly the truth
+    and is not a fault; an optional feed that has rows and has gone quiet
+    stopped recording, and is as red as any other feed. One row, ever, moves
+    a feed from the first case to the second permanently.
+
+    That rule is deliberately a property of the *database* rather than of the
+    environment, and the alternative is worth saying out loud: `/health` runs
+    in the web worker, which could read `AWAIR_VESYNC_EMAIL` and call the feed
+    configured on that basis. It would be the wrong test. The variable being
+    set in gunicorn's environment says nothing about whether the humidifier
+    unit is installed, enabled, or running -- and on a box where somebody set
+    the variable and never installed the unit, that test reads "configured,
+    recording nothing" and fails the deploy for ever with no poller to fix.
+    Rows on disk are the only evidence either process has that a feed is
+    real.
+
+    **The blind spot, stated rather than hidden:** a humidifier that IS
+    configured but has never managed one successful poll -- wrong password,
+    renamed device, an account that refuses every login -- reads as "not set
+    up" here and does not turn `/health` red. Its own unit logs a clear line
+    every poll (`awair.humidifier.poll_once`), and `systemctl --user status
+    awairelement-humidifier` is where that case is answerable. The trade is
+    deliberate: the alternative makes every box that will never have a
+    humidifier fail its deploy check.
+    """
+    if feed.optional and age_seconds is None:
+        return NOT_CONFIGURED
+    return RECORDING if is_fresh(age_seconds, stale_after_seconds) else STALE
+
+
 def feed_status(conn, feed: Feed, now: datetime) -> dict:
     """One feed's entry in the `/health` payload.
 
@@ -168,10 +232,15 @@ def feed_status(conn, feed: Feed, now: datetime) -> dict:
     every other clock this app publishes uses (`web._iso_utc` lands on the
     same shape from the other direction). Age is computed from the parsed
     datetime rather than the string, and rounded only for the payload.
+
+    `verdict` is the field to read since #161; `fresh` is kept beside it and
+    means exactly `verdict == RECORDING`, so the shape #158 published is
+    still there for anything already consuming it.
     """
     newest = db.newest_received_at(conn, feed.table, feed.head)
     stale_after = feed.stale_after_seconds()
     age = None if newest is None else (now - newest).total_seconds()
+    answer = verdict(feed, age, stale_after)
     return {
         "name": feed.name,
         "label": feed.label,
@@ -179,7 +248,9 @@ def feed_status(conn, feed: Feed, now: datetime) -> dict:
         "age_seconds": None if age is None else round(age, 1),
         "poll_seconds": feed.poll_seconds(),
         "stale_after_seconds": stale_after,
-        "fresh": is_fresh(age, stale_after),
+        "optional": feed.optional,
+        "verdict": answer,
+        "fresh": answer == RECORDING,
     }
 
 
@@ -191,14 +262,25 @@ def report(conn, now: datetime) -> dict:
     should be able to say: a deploy that fails wants "basement, minisplit-
     bedroom" in the failure, not a JSON document to walk.
 
+    `not_configured` is its own top-level list for the same reason, and it is
+    the half that must NOT fail a deploy (#161): a feed that has never
+    recorded and needs a login this repo does not hold is a box without a
+    humidifier, not a broken one. It is published rather than silently
+    omitted, so "we thought that was recording" is answerable from the same
+    one request.
+
     Takes `now` rather than reading the clock, so every feed in one response is
     judged against one instant and a test can place that instant.
     """
     statuses = [feed_status(conn, feed, now) for feed in FEEDS]
-    stale = [status["name"] for status in statuses if not status["fresh"]]
+    named = {
+        word: [s["name"] for s in statuses if s["verdict"] == word]
+        for word in (STALE, NOT_CONFIGURED)
+    }
     return {
-        "status": "stale" if stale else "ok",
+        "status": "stale" if named[STALE] else "ok",
         "checked_at": _z(now),
-        "stale": stale,
+        "stale": named[STALE],
+        "not_configured": named[NOT_CONFIGURED],
         "feeds": statuses,
     }

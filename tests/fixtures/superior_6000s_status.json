@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "A `getHumidifierStatus` response for a Levoit Superior 6000S, in the",
+    "shape pyvesync 3.5.1 parses: the outer bypassV2 envelope, then the",
+    "device's own code/result, whose inner object is a Superior6000SResult.",
+    "Hand-built from the library's model (pyvesync/models/humidifier_models.py)",
+    "and its Superior 6000S device class, NOT recorded from Tom's account --",
+    "#161 rules out anything that needs the real VeSync login to test.",
+    "Field values are a plausible great room on a winter evening: running in",
+    "humidity mode at mist level 5, 38 % in the room against a 45 % target,",
+    "71.4 F (the device reports tenths of a degree F as an integer), tank in",
+    "and full, filter at 92 %.",
+    "The keys are the library's, so a field this project reads that pyvesync",
+    "renames fails `tests/test_humidifier.py` at the library boundary rather",
+    "than silently storing NULL for ever."
+  ],
+  "code": 0,
+  "msg": "request success",
+  "result": {
+    "code": 0,
+    "result": {
+      "powerSwitch": 1,
+      "humidity": 38,
+      "targetHumidity": 45,
+      "virtualLevel": 5,
+      "mistLevel": 5,
+      "workMode": "humidity",
+      "waterLacksState": 0,
+      "waterTankLifted": 0,
+      "autoStopSwitch": 1,
+      "autoStopState": 0,
+      "screenSwitch": 1,
+      "screenState": 1,
+      "scheduleCount": 0,
+      "timerRemain": 0,
+      "errorCode": 0,
+      "autoPreference": 1,
+      "childLockSwitch": 0,
+      "filterLifePercent": 92,
+      "temperature": 714,
+      "dryingMode": {
+        "dryingLevel": 1,
+        "autoDryingSwitch": 1,
+        "dryingState": 2,
+        "dryingRemain": 0
+      }
+    }
+  }
+}

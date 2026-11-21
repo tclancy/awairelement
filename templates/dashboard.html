@@ -105,6 +105,57 @@
      the target dotted, so the pair reads apart from the head's solid line
      even where the colours do not. */
   --series-bedroom-setpoint: #52514e; --series-bedroom-target: #b8740b;
+  /* The humidifier (#161), on two cards: its own relative humidity on the
+     Main zone card and its dew point on the Dew point card. One colour per
+     PLACE, which is the rule `--series-basement` records, so this is the
+     humidifier wherever it appears.
+
+     Measured the way #139 and #156 measured theirs: minimum CIELAB dE76 to
+     every line it shares a card with, under normal vision AND simulated
+     deuteranopia (Vienot 1999), in both palettes, sweeping the hue circle for
+     the colour whose WORST of those numbers is largest. Its neighbours are
+     the Dew point card's five other places (the Awair's orange, the basement
+     magenta, the outdoor teal, the dining green, the bedroom violet) and the
+     Main zone card's zone line, dining line and dashed target.
+
+     This olive scores 32.2 light / 34.6 dark, nearest neighbour the Awair's
+     orange in both (32.2 / 34.6) with the dining green next at 32.6 / 36.2.
+     For scale: the worst pair this dashboard already ships is 20.5 (the
+     Bedroom card's old green beside its grey setpoint) and the temp card
+     carries a 5.9 that #156 recorded and did not fix.
+
+     The sweep's arithmetic winner was a crimson (#b80037 / #fd536a) at 33.6,
+     rejected on meaning rather than numbers: this palette's reds are the
+     alert colours (`--event-ceiling`, and the humidity card's own red), so a
+     crimson trace reads as a warning about the thing it is drawing. Second
+     was a terracotta at 33.6 whose nearest neighbour is the Awair orange it
+     would sit beside on both cards -- two oranges, which is the mistake #156
+     made with its first blue and caught on the card rather than in the
+     numbers.
+
+     Note what this colour is NOT measured against: the humidity card's red
+     (dE 17.5 light / 22.7 dark). The humidifier draws no line on that card,
+     so they never share one. Put one there and re-measure. */
+  --series-humidifier: #49611e;
+  /* The Main zone card's humidity target (#161). Dashed, and grey rather
+     than a sixth hue, because it is not a sensor: it is the line the other
+     three are being read against, the same role the Bedroom card's dashed
+     setpoint plays.
+
+     Deliberately a second NAME for `--series-bedroom-setpoint`'s value and
+     not a reference to it. They are two quantities on two cards -- a mini
+     split's commanded setpoint and this house's winter humidity target --
+     and tying them together would mean the next change to either one
+     silently moving the other.
+
+     Its neighbours on this card are the Awair orange (74.1 / 72.1), the
+     dining green (25.0 / 19.8) and the humidifier olive (38.1 / 39.0). The
+     green is the weak pair and is carried the way #156 carried the same
+     number: this line is DASHED and the sensors are solid, so the pair reads
+     apart where the colours do not. Amber (the Bedroom card's target colour)
+     was the obvious reuse and fails here outright -- 11.0 light / 18.4 dark
+     against the Awair orange it would sit beside. */
+  --series-humidity-target: #52514e;
   --event-ceiling: #d03b3b; --event-relative: #ec835a; --event-device: #898781;
 }
 @media (prefers-color-scheme: dark) {
@@ -120,6 +171,8 @@
     --series-bedroom-head: #7971fd;
     --series-minisplit-watts: #26beff;
     --series-bedroom-setpoint: #c3c2b7; --series-bedroom-target: #e6a23c;
+    --series-humidifier: #819952;
+    --series-humidity-target: #c3c2b7;
   }
 }
 * { box-sizing: border-box; }
@@ -289,6 +342,40 @@ main {
    one would go with it. */
 .card[data-overlay~="basement-humid"] .u-legend { --legend-rows: 4; }
 .card[data-overlay~="bedroom-humid"] .u-legend { --legend-rows: 4; }
+/* The Dew point card draws one line per PLACE -- six of them today (#161) --
+   so it is the same seven legend entries the temp card carries and takes the
+   same four rows. Not re-measured from scratch and it does not need to be:
+   this card's populated legend is strictly NARROWER than the one those
+   numbers came from. `Outdoor` against `Outdoor Temp`, and the same `51.1 °F`
+   shaped values, at the same font, the same card width and the same entry
+   count. Narrower entries cannot want more rows.
+
+   Keyed to the card rather than to one of its series, because unlike the
+   overlay cards this one's series are rendered FROM the server's list
+   (`web.DEWPOINT_PLACES`): there is no per-overlay marker to key on, and a
+   seventh feed should bring its line and its legend row together. Seven
+   places would want five rows at phone widths; `overflow: hidden` clips, as
+   it already does for the temp card below 330px. */
+.card[data-derived="dewpoint"] .u-legend { --legend-rows: 4; }
+/* The Main zone card has five legend entries (time, the zone sensor, the
+   humidifier, the dining head, Target) -- the Bedroom card's count, so the
+   Bedroom card's three rows. */
+.card[data-zone="main"] .u-legend { --legend-rows: 3; }
+/* The Main zone card's sentence: the three great room dew points side by
+   side, and the hours the zone spent below target last week.
+
+   Its own line under the header for the basement watch badge's reason -- a
+   header carrying two numbers has no room for five more, and this is a
+   sentence rather than a number. Unlike that badge it is never hidden, so it
+   needs no `[hidden]` rule and cannot shift the cards below it: a card that
+   is always one line taller is a layout, where one that grows is a jump.
+
+   No coloured square and no colour at all: this line names its three numbers
+   in words, and each number's colour is already carried by the line it came
+   from on the chart directly below. */
+.card .note {
+  margin: 0 0 4px; font-size: 12px; color: var(--ink-muted);
+}
 /* The Bedroom card has five legend entries (time, Head, Setpoint, Target,
    Draw) -- the same count as the precipitation card, so the same three rows.
    Keyed to that card by name rather than to `[data-room]`, because the Great
@@ -347,6 +434,34 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
     <div class="plot"></div>
   </section>
   {% endfor %}
+  {# The main zone's humidity against its target (#161). Hand-written like the
+     precipitation and room cards, for the same reason: it is not a metric
+     card, so `web.METRIC_OVERLAYS` cannot reach it. Everything variable about
+     it -- which sensor is the zone, that sensor's colour, the target numbers,
+     the shading spans -- arrives on `/api/humidity`; nothing about the house
+     is written here. #}
+  <section class="card" data-zone="main">
+    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    <p class="note"></p>
+    <div class="plot"></div>
+  </section>
+  {# One dew point per place (#161). The series are rendered from
+     `web.DEWPOINT_PLACES`, which is derived from `awair.feeds.FEEDS`, so a
+     seventh feed appears on this card without an edit here -- and
+     `dashboard.js` reads them back out of this markup rather than carrying a
+     second copy of the list, the same way it reads the pressed range button
+     instead of restating `DEFAULT_RANGE` (#108).
+
+     The spans are data, not content: `hidden` keeps them out of the page for
+     a reader and a screen reader both, and the chart's own legend is what
+     names these places on screen. #}
+  <section class="card" data-derived="dewpoint">
+    <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
+    <div class="plot"></div>
+    {% for place in dewpoint_places %}
+    <span class="place" hidden data-place="{{ place.key }}" data-label="{{ place.label }}" data-color="{{ place.color_var }}"></span>
+    {% endfor %}
+  </section>
   <section class="card" data-outdoor="precipitation" data-overlay="pressure">
     <h2><span class="dot"></span><span class="name"></span> <span class="unit"></span><span class="now"></span></h2>
     <div class="plot"></div>
@@ -406,6 +521,34 @@ footer { color: var(--ink-muted); font-size: 11.5px; padding: 0 20px 20px; }
   45–65 W. A break in it is a window the head reported no energy for, or the
   same bridge or mini-split-poller gap that breaks the temperature beside it; a
   flat zero is a head that drew nothing, which is a reading rather than a gap.
+  <b>Main zone humidity</b> is the great room — the room the wood stove is in —
+  against the target the house is held to in winter: <b>{{ '%g' % humidity_rule.target_warm }}%</b>, dropping to
+  <b>{{ '%g' % humidity_rule.target_cold }}%</b> when it is <b>{{ '%g' % (humidity_rule.cold_outdoor_temp | round(1)) }}&#8239;{{ temp_unit_symbol }}</b> or colder outside, because indoor
+  moisture condenses on the coldest window in the room and a cold pane cannot
+  carry as much. The dashed line is that target, and it steps where the outdoor
+  temperature crosses the threshold; with no outdoor reading it holds the
+  warmer target, so a dead outdoor poller cannot quietly relax it. Three
+  sensors are drawn because three sensors are in that one room and they
+  disagree: the <b>Awair</b> sits high above the fireplace, so it reads warmer
+  than living level and therefore a lower relative humidity for the same
+  moisture; the <b>humidifier</b> reads at the floor; the <b>dining</b> mini
+  split head reads at head height. Which one counts as the zone is a setting.
+  Shading is the humidifier not humidifying: <b>grey</b> is switched off,
+  <b>red</b> is out of water or the tank lifted out — a sag under a red span is
+  a refill, under a grey one a setting. A humidifier reporting nothing at all
+  is unshaded, because "we could not read it" is not "it was off". The hours
+  below target under the header are always the <b>last seven days</b> whatever
+  range is shown, and count only time we have readings for: a poller outage
+  contributes nothing, so the figure is a floor rather than an estimate.
+  <b>Dew point</b> is every place that records both a temperature and a
+  humidity, on one axis. It is the chart that makes a warm room comparable
+  with a cool one: the stove lowers the great room's relative humidity mostly
+  by <em>heating the air</em>, with no water having left the room, where dew
+  point moves only when the moisture does. In one open room the great room
+  sensors' dew points should roughly agree — a standing gap between them means
+  the air there is not mixing as freely as the room looks. All of them are
+  computed here from one formula, including the Awair's, which publishes its
+  own: six places read against six formulas would not be a comparison.
   A badge under the Temp card's header is
   the <b>basement watch</b>: the basement went above 62 °F during the hours the
   room is unoccupied, and the outdoor high of the 24 hours before that was

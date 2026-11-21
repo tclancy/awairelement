@@ -1,0 +1,32 @@
+# Dev reference copy — canonical unit is templated by the native-apps Ansible
+# role in the homelab repo (awairelement-humidifier.service.j2). Its own unit
+# so a VeSync outage can't stall the four local feeds, and vice versa: this is
+# the only poller here that talks to somebody's cloud, over an async HTTP
+# stack, on an account that rate-limits.
+#
+# Needs AWAIR_VESYNC_EMAIL and AWAIR_VESYNC_PASSWORD in the environment file.
+# With either one missing the poller logs one line and exits 0 without
+# touching the database — which is why this unit is the one that does NOT use
+# Restart=always.
+#
+# Manual install (non-Ansible boxes):
+#   ln -sf ~/sources/awairelement/systemd/awairelement-humidifier.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now awairelement-humidifier
+[Unit]
+Description=Awair Element humidifier (Levoit Superior 6000S via VeSync) poller
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/sources/awairelement
+ExecStart=%h/sources/awairelement/.venv/bin/python -m awair.humidifier
+EnvironmentFile=-%h/.config/awairelement/environment
+# `on-failure`, where the other four units say `always`, and the difference is
+# the whole of this feed's "not configured" state. A box with no VeSync login
+# exits 0 on purpose; under Restart=always that becomes a unit restarting
+# every 30 s for ever, writing the same line to the journal, on a box that is
+# behaving exactly as designed. A crash still restarts.
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
