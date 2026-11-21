@@ -40,7 +40,7 @@ going down cannot wedge the others:
   axis on the right, the way the precipitation card already carries pressure on
   an axis of its own (#42) — though pressure's is a *fixed* 28.5-31.0 inHg
   rather than anchored at zero, because a barometer has no meaningful zero and
-  a power draw does. The footer says which axis the draw is read against,
+  a power draw does. `docs/reading-the-dashboard.md` says which axis the draw is read against,
   because nothing on the chart does. **A head's humidity may never arrive.**
   Whether these units carry SmartThings' `relativeHumidityMeasurement` has
   never been confirmed — the heads scope found one illustrative line in

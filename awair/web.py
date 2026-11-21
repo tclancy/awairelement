@@ -1123,8 +1123,8 @@ def _main_zone_payload(rows, outdoor_rows, span_rows, grid, bucket_seconds, zone
         ),
         "below_target_days": main_zone.BELOW_TARGET_DAYS,
         # The three numbers #161 put in the environment, published so the card
-        # can label its own target line and the footer can state the rule
-        # instead of restating the defaults.
+        # can label its own target line with what is configured rather than
+        # the defaults.
         **_humidity_rule(unit),
     }
 
@@ -1132,10 +1132,10 @@ def _main_zone_payload(rows, outdoor_rows, span_rows, grid, bucket_seconds, zone
 def _humidity_rule(unit):
     """The target rule as configured: both targets and where it switches.
 
-    One reader for the payload and for the page's own explanation of the
-    card, so the sentence under the charts states the numbers in the
-    environment rather than the defaults they happened to have when it was
-    written. The threshold is in the display unit; the targets are percent.
+    Published in the humidity payload so the card states the numbers in the
+    environment rather than the defaults. The threshold is in the display
+    unit; the targets are percent. (The page's own prose explanation, which
+    also read this, moved to docs/reading-the-dashboard.md.)
     """
     return {
         "target_warm": main_zone.target(),
@@ -1216,9 +1216,6 @@ def create_app(db_path=None):
             # places lives in exactly one place -- here, derived from
             # `feeds.FEEDS`.
             dewpoint_places=DEWPOINT_PLACES,
-            # The humidity target as configured (#161), for the page's own
-            # explanation of the Main zone card.
-            humidity_rule=_humidity_rule(temp_unit()),
         )
 
     @app.get("/health")
@@ -1267,7 +1264,7 @@ def create_app(db_path=None):
             # before it, so reading from `since` leaves the first grid stamps
             # with nothing at-or-before them and draws up to one publish
             # interval of blank on a perfectly healthy poller -- which the
-            # footer promises means an outage. `carry_forward` clips to the
+            # docs/reading-the-dashboard.md promises means an outage. `carry_forward` clips to the
             # grid, so the extra rows cost one bucket's worth of scan.
             outdoor_rows = db.outdoor_readings_since(
                 conn,
