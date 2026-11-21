@@ -69,6 +69,12 @@ HTML_PATH = REPO / "templates" / "dashboard.html"
 # for that is `test_a_commented_out_declaration_reads_as_absent`.
 DASHBOARD_JS = strip_js_comments(JS_PATH.read_text())
 DASHBOARD_HTML = strip_markup_comments(HTML_PATH.read_text())
+# The page's own explanation of its cards. It was the dashboard's footer until
+# it outgrew the page; the tests that pinned what the footer told a reader now
+# pin the same sentences here. Whitespace is folded because the file is wrapped.
+READING_GUIDE = " ".join(
+    (HTML_PATH.parent.parent / "docs" / "reading-the-dashboard.md").read_text().split()
+)
 
 # One mini split row's worth of every column the series endpoints read, with a
 # window `minisplit.metered_watts` can measure -- so the watts series the
@@ -490,7 +496,7 @@ def test_the_metered_draw_is_declared_on_the_surfaces_it_still_needs():
     """The draw moved cards (#156) and kept the one surface that is about it.
 
     It is the only line on either room card not read against the card's own
-    axis, so the footer has to say which axis it IS read against: a reader who
+    axis, so the reading guide has to say which axis it IS read against: a reader who
     takes its height for a temperature gets a wrong answer and nothing on the
     chart tells them otherwise.
 
@@ -501,10 +507,9 @@ def test_the_metered_draw_is_declared_on_the_surfaces_it_still_needs():
     card it was measured on.
     """
     assert '"watts"' in DASHBOARD_JS, "no series is drawn on the watts scale"
-    footer = DASHBOARD_HTML[DASHBOARD_HTML.index("<footer>") :]
-    assert "right-hand axis" in footer, (
-        "the footer does not say the draw is read against the right-hand "
-        "axis, so its height reads as a temperature"
+    assert "right-hand axis" in READING_GUIDE, (
+        "docs/reading-the-dashboard.md does not say the draw is read against "
+        "the right-hand axis, so its height reads as a temperature"
     )
     assert "minisplit-watts" not in DASHBOARD_HTML.replace(
         "--series-minisplit-watts", ""
@@ -587,8 +592,8 @@ def test_the_overlay_lines_stay_out_of_the_card_headers():
     )
 
 
-def test_the_footer_tells_a_reader_what_a_break_in_each_line_means():
-    """Each line's gap has a different cause, and the footer is where it says so.
+def test_the_guide_tells_a_reader_what_a_break_in_each_line_means():
+    """Each line's gap has a different cause, and the reading guide is where it says so.
 
     The traces are nulled rather than spanned once their source goes stale, so
     a break is the normal rendering of an outage -- and several lines on one
@@ -596,13 +601,12 @@ def test_the_footer_tells_a_reader_what_a_break_in_each_line_means():
     card adds a cause the temperature cards do not have: a head that does not
     report humidity at all, which draws as nothing and is not an outage.
     """
-    footer = DASHBOARD_HTML[DASHBOARD_HTML.index("<footer>") :]
-    assert "mini split" in footer
-    assert "mini-split-poller gap" in footer
-    assert "outdoor-poller gap" in footer
-    assert "basement-poller gap" in footer
-    assert "does not report" in footer, (
-        "the footer does not tell a reader that a missing humidity line may "
+    assert "mini split" in READING_GUIDE
+    assert "mini-split-poller gap" in READING_GUIDE
+    assert "outdoor-poller gap" in READING_GUIDE
+    assert "basement-poller gap" in READING_GUIDE
+    assert "does not report" in READING_GUIDE, (
+        "the guide does not tell a reader that a missing humidity line may "
         "be a head with no such sensor rather than an outage (#156)"
     )
 

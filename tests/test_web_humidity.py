@@ -457,20 +457,12 @@ def test_the_two_cards_are_in_the_markup_and_drawn_by_the_js(seeded):
         assert marker.replace('"', "'") in DASHBOARD_JS or marker in DASHBOARD_JS
 
 
-def test_the_page_states_the_configured_target_not_the_defaults(seeded, monkeypatch):
-    """The explanation under the charts reads the same three variables.
+def test_the_page_no_longer_carries_its_own_fine_print(seeded):
+    """The explanation moved to docs/reading-the-dashboard.md; the page is charts.
 
-    Written as literals it would go on saying 40 / 35 after somebody moved
-    them, on the one page that exists to be read against those numbers.
+    The configured target still reaches the card through the humidity payload,
+    which `test_the_targets_are_published_for_the_card_to_label` pins.
     """
-    monkeypatch.setenv(main_zone.TARGET_ENV, "43")
-    monkeypatch.setenv(main_zone.COLD_TARGET_ENV, "31")
-    monkeypatch.setenv(main_zone.COLD_OUTDOOR_ENV, "-20")
-    monkeypatch.setenv("TEMPERATURE_UNIT", "C")
-
     page = create_app(str(seeded)).test_client().get("/").get_data(as_text=True)
 
-    assert "<b>43%</b>" in page
-    assert "<b>31%</b>" in page
-    assert "<b>-20&#8239;°C</b>" in page
-    assert "<b>40%</b>" not in page
+    assert "<footer" not in page
