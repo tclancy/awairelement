@@ -606,7 +606,19 @@ def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
     peak head temperature answers no "how bad did it get" question -- the
     card's question is whether the head is heating, which the draw answers.
 
-    A fourth chart factory moves `plots` and fails here whichever way it goes,
+    The fourth factory is the humidity view's (#161), which draws two cards
+    and reports no peak on either. Both refusals are decisions:
+
+    - **Dew point** has six places on one axis and so no single current
+      value, let alone a single extreme. A peak over all six would be
+      whichever place was wettest, unlabelled -- and the extreme that matters
+      on that card is a *gap between* two lines rather than a height.
+    - **Main zone humidity** is read against a target, so its interesting
+      extreme is the LOW and "peak" is the wrong end. The figure that answers
+      the question is already on the card: hours below target over the last
+      seven days, in its own sentence under the header.
+
+    A fifth chart factory moves `plots` and fails here whichever way it goes,
     which is the point: the next card has to decide, rather than inherit
     either answer by omission.
 
@@ -617,8 +629,8 @@ def test_the_range_peak_is_rendered_on_the_metric_cards_and_only_there(js_code):
     """
     plots = len(re.findall(r"\bnew uPlot\(", js_code))
     renders = len(re.findall(r"(?<!function )\bpeakSuffix\(", js_code))
-    assert plots == 3, (
-        f"{plots} chart factories, expected 3 — does the new one report a "
+    assert plots == 4, (
+        f"{plots} chart factories, expected 4 — does the new one report a "
         "range peak in its card header (#116)?"
     )
     assert renders == 1, (

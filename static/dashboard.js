@@ -923,6 +923,231 @@ const METRICS = {
     card.querySelector(".now").textContent = nowText;
   }
 
+  // ---------------------------------------------------------------------
+  // The humidity view (#161): the main zone against its target, and one dew
+  // point per place. Both cards are drawn from `/api/humidity`.
+  // ---------------------------------------------------------------------
+
+  // What each shading span is painted with. Two reasons, two colours, and
+  // both are colours this palette already has: `off` is the device grey the
+  // events table uses for a transport fact, `dry` is the ceiling red, because
+  // an empty reservoir is the one of the two a reader can do something about.
+  //
+  // Washes, not strokes, so the dE76 sweep that chose the line colours does
+  // not apply -- and the colour is never the only carrier: the card's own
+  // sentence and the legend name what happened.
+  const SPAN_COLORS = { off: "--event-device", dry: "--event-ceiling" };
+  const SPAN_ALPHA = 0.14;
+
+  // Wash the humidifier's off / out-of-water spans onto a chart. The sibling
+  // of `eventWashPlugin`, and deliberately a second function rather than a
+  // generalised one: that one reads `state.events` and filters by metric,
+  // this one is handed the spans it draws, and merging them would mean a
+  // parameter that selects which of two unrelated sources to read.
+  function spanWashPlugin(spans) {
+    return {
+      hooks: {
+        drawClear: (u) => {
+          if (!spans || !spans.length) return;
+          const ctx = u.ctx;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+          ctx.clip();
+          for (const span of spans) {
+            const color = cssVar(SPAN_COLORS[span.reason] || "--event-device");
+            const x0 = u.valToPos(span.start, "x", true);
+            const x1 = u.valToPos(span.end, "x", true);
+            ctx.fillStyle = hexToRgba(color, SPAN_ALPHA);
+            ctx.fillRect(x0, u.bbox.top, Math.max(x1 - x0, 2), u.bbox.height);
+          }
+          ctx.restore();
+        },
+      },
+    };
+  }
+
+  // The dew point card's places, read back out of the markup the server
+  // rendered them into (`web.DEWPOINT_PLACES`, derived from
+  // `awair.feeds.FEEDS`). The same rule the range buttons follow: the server
+  // owns the list, the DOM carries it, and this file holds no copy that
+  // could fall out of step -- so a seventh feed draws a seventh line with no
+  // edit here.
+  function dewPointPlaces(card) {
+    return [...card.querySelectorAll(".place")].map((el) => ({
+      key: el.dataset.place,
+      label: el.dataset.label,
+      colorVar: el.dataset.color,
+    }));
+  }
+
+  // One chart factory for both humidity-view cards. `lines` is resolved by
+  // each card's own wrapper below -- from the DOM for the dew point card,
+  // from the payload for the main zone card -- because that is the only thing
+  // the two differ in beyond their labels and their plugins.
+  //
+  // A `lines` entry's `trace` is the ARRAY, where `ROOM_CARDS` uses the same
+  // word for a key to look up on its payload. The difference is not
+  // carelessness: those two cards each read one object whose keys are their
+  // traces, and these two read several blocks of one payload (`dew_points`
+  // keyed by feed, `main_zone`'s four series), so there is no single object
+  // for a key to index into. Resolving before the factory is also what lets
+  // the dew point card's lines come from the DOM at all.
+  //
+  // Every line shares the card's one y axis, and both cards earn that: a dew
+  // point in degrees and a dew point in degrees, a humidity in percent and a
+  // target in percent. Nothing here declares a `scale`, which is the same
+  // claim the metric cards' overlay loop makes by the same absence.
+  function makeTracePlot(card, config) {
+    const plotEl = card.querySelector(".plot");
+    plotEl.innerHTML = "";
+    const data = [config.t];
+    const seriesConfig = [{ value: "{M}/{D} {h}:{mm}{aa}" }];
+    for (const line of config.lines) {
+      seriesConfig.push({
+        label: line.label,
+        stroke: cssVar(line.colorVar),
+        width: line.width || 1.5,
+        ...(line.dash ? { dash: line.dash } : {}),
+        value: (u, v) => (v == null ? "–" : v.toFixed(1) + " " + config.unit),
+        points: { show: false },
+        // The server nulls a trace once its source's last observation goes
+        // stale and never holds one across a gap, so a dead feed has to draw
+        // as a break. Spanned, it would draw as a straight line between two
+        // observations hours apart -- a wrong answer rather than a missing
+        // one.
+        spanGaps: false,
+      });
+      data.push(line.trace);
+    }
+    const plot = new uPlot(
+      {
+        width: plotEl.clientWidth || 320,
+        height: 150,
+        cursor: { sync: { key: sync.key }, points: { size: 7 } },
+        legend: { live: true },
+        scales: { x: { time: true } },
+        series: seriesConfig,
+        axes: [axisStyle(), { ...yAxisStyle(), size: 52 }],
+        plugins: [sunMoonMarkersPlugin(), touchCursorPlugin(), ...(config.plugins || [])],
+      },
+      data,
+      plotEl
+    );
+    state.plots.push(plot);
+    card.querySelector(".name").textContent = config.name;
+    card.querySelector(".unit").textContent = config.unit;
+    card.querySelector(".dot").style.background = cssVar(config.dotVar);
+    card.querySelector(".now").textContent = config.now;
+    return plot;
+  }
+
+  // The newest drawn value of a trace. Same shape as the room cards' own
+  // `latestOf`: the server has already nulled whatever must not be read as
+  // current, so "last non-null" is the newest value there is.
+  function latestOf(trace) {
+    return Array.isArray(trace)
+      ? [...trace].reverse().find((v) => v != null)
+      : null;
+  }
+
+  // One dew point per place: the card that makes a warm room comparable with
+  // a cool one. Relative humidity cannot be compared across temperatures --
+  // the stove drops the great room's reading by heating the air, with no
+  // water having left the room -- and a dew point can, because it moves with
+  // the moisture and stays put with the heat.
+  //
+  // No peak and no "now" number for one chosen place: six places on one axis
+  // have no single current value, and picking one for the header would be
+  // picking a favourite. The three that share a room are printed on the Main
+  // zone card's own line instead, where the comparison is the point.
+  function makeDewPointPlot(card, payload) {
+    makeTracePlot(card, {
+      name: "Dew point",
+      unit: payload.temp_unit_symbol,
+      dotVar: "--series-temp",
+      t: payload.t,
+      now: "",
+      lines: dewPointPlaces(card).map((place) => ({
+        label: place.label,
+        colorVar: place.colorVar,
+        trace: payload.dew_points[place.key],
+      })),
+    });
+  }
+
+  // The main zone card: the great room's humidity, the two other sensors in
+  // that room, and the target the house is being held to.
+  //
+  // The zone sensor's colour comes from the payload, not from this file: it
+  // follows `AWAIR_MAIN_ZONE_FEED`, so pointing that at the humidifier moves
+  // the colour with it rather than drawing two lines in one colour.
+  function makeMainZonePlot(card, payload) {
+    const zone = payload.main_zone;
+    const plot = makeTracePlot(card, {
+      name: "Main zone humidity",
+      unit: "%",
+      dotVar: zone.color_var,
+      t: payload.t,
+      now:
+        fmt(latestOf(zone.humid), 1) + " %" +
+        " · target " + fmt(latestOf(zone.target), 0) + " %",
+      lines: [
+        { label: zone.label, colorVar: zone.color_var, trace: zone.humid, width: 2 },
+        {
+          label: "Humidifier",
+          colorVar: "--series-humidifier",
+          trace: zone.humidifier_humid,
+        },
+        {
+          label: "Dining",
+          colorVar: "--series-dining-head",
+          trace: zone.dining_humid,
+        },
+        {
+          label: "Target",
+          colorVar: "--series-humidity-target",
+          trace: zone.target,
+          dash: [5, 3],
+        },
+      ],
+      plugins: [spanWashPlugin(zone.spans)],
+    });
+    card.querySelector(".note").textContent = zoneNote(zone, payload);
+    return plot;
+  }
+
+  // The card's sentence: the three dew points side by side, and the week's
+  // hours below target.
+  //
+  // The dew points are the comparison #161 asked for -- in one open room the
+  // three should roughly agree even when the three relative humidities do
+  // not, and a standing gap between them means the room is not mixing. They
+  // are words rather than a second chart because three numbers are not a
+  // shape.
+  //
+  // The hours figure is always the last seven days, whatever range button is
+  // pressed, and says so for that reason: the server computes it over its own
+  // fixed window (`main_zone.BELOW_TARGET_DAYS`), so a label without the
+  // window would read as a figure about the visible range.
+  function zoneNote(zone, payload) {
+    const unit = payload.temp_unit_symbol;
+    const dew = payload.dew_point_latest;
+    const places = [
+      [zone.label, dew[zone.name]],
+      ["humidifier", dew.humidifier],
+      ["dining", dew["minisplit-dining"]],
+    ];
+    const dewText = places
+      .map(([label, value]) => label + " " + fmt(value, 1))
+      .join(" · ");
+    return (
+      "Dew point: " + dewText + " " + unit +
+      " — " + fmt(zone.hours_below_target, 1) +
+      " h below target in the last " + zone.below_target_days + " days"
+    );
+  }
+
   // The room cards: one room, the mini split head that serves it, and that
   // head's metered draw (#156). The Bedroom card (scope 2026-10-31, step 4)
   // was the first of these and the Great room card is the second, built from
@@ -1084,16 +1309,22 @@ const METRICS = {
   }
 
   async function load() {
-    const [seriesRes, eventsRes, outdoorRes, bedroomRes] = await Promise.all([
-      fetch(`/api/series?range=${state.range}`),
-      fetch(`/api/events?range=${state.range}`),
-      fetch(`/api/outdoor-series?range=${state.range}`),
-      fetch(`/api/bedroom-series?range=${state.range}`),
-    ]);
+    const [seriesRes, eventsRes, outdoorRes, bedroomRes, humidityRes] =
+      await Promise.all([
+        fetch(`/api/series?range=${state.range}`),
+        fetch(`/api/events?range=${state.range}`),
+        fetch(`/api/outdoor-series?range=${state.range}`),
+        fetch(`/api/bedroom-series?range=${state.range}`),
+        // #161. In the same parallel batch as the other four, which is what
+        // keeps its 7-day "hours below target" read off the page's critical
+        // path -- see `web._hours_below_target`.
+        fetch(`/api/humidity?range=${state.range}`),
+      ]);
     const seriesPayload = await seriesRes.json();
     state.events = (await eventsRes.json()).events;
     const outdoorPayload = await outdoorRes.json();
     const bedroomPayload = await bedroomRes.json();
+    const humidityPayload = await humidityRes.json();
     state.dailyEvents = outdoorPayload.daily_events || [];
 
     state.plots.forEach((p) => p.destroy());
@@ -1132,6 +1363,17 @@ const METRICS = {
     for (const card of document.querySelectorAll(".card[data-room]")) {
       const config = ROOM_CARDS[card.dataset.room];
       if (config) makeRoomPlot(card, config, roomPayloads[card.dataset.room]);
+    }
+    // The humidity view's two cards (#161). Each queried separately rather
+    // than looped together: they are two different charts off one payload,
+    // and a shared loop would need a map from a marker attribute to a
+    // factory -- which is the `ROOM_CARDS` shape, and worth it there because
+    // those two cards really are one factory with different traces.
+    for (const card of document.querySelectorAll('.card[data-zone="main"]')) {
+      makeMainZonePlot(card, humidityPayload);
+    }
+    for (const card of document.querySelectorAll('.card[data-derived="dewpoint"]')) {
+      makeDewPointPlot(card, humidityPayload);
     }
     renderEvents();
     document.getElementById("updated").textContent =

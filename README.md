@@ -120,8 +120,14 @@ in [GLOSSARY.md](GLOSSARY.md).
   so if it was never enabled on your device you may not be able to turn it on
   now; this project can't help you re-enable it. `curl http://<device-ip>/air-data/latest`
   should return JSON.
-- **Python 3.13+** and [uv](https://github.com/astral-sh/uv). No other runtime
-  dependencies — the poller is stdlib-only; the dashboard uses Flask + gunicorn.
+- **Python 3.13+** and [uv](https://github.com/astral-sh/uv). Four of the five
+  pollers are stdlib-only; the dashboard uses Flask + gunicorn, and the
+  humidifier poller uses [`pyvesync`](https://github.com/webdjoe/pyvesync)
+  (MIT), which brings `aiohttp`, `mashumaro` and `orjson` with it. Nothing
+  else imports it — see [The humidifier feed](#the-humidifier-feed).
+- (Optional) a **VeSync account** with a Levoit humidifier on it, if you want
+  that feed. Without one the poller logs a line and exits, and `/health`
+  reports the feed as *not configured* rather than failing.
 - (Optional, for alerts) an **[ntfy](https://ntfy.sh) topic** — either the
   public server or your own. You'll need the topic name and, if the topic is
   protected, an access token.
@@ -181,6 +187,14 @@ omitted entirely to run without alerts.
 | `AWAIR_BASEMENT_POLL_SECONDS` | `60` | Seconds between basement polls. The module's own publish interval. |
 | `AWAIR_MINISPLIT_URL` | `http://127.0.0.1:8100/status` | The parsons-pulse climate bridge's status endpoint. Loopback-only, so the mini split poller has to run on the bridge's box. |
 | `AWAIR_MINISPLIT_POLL_SECONDS` | `300` | Seconds between mini split polls. The bridge's own control cycle — polling faster re-reads one report window. |
+| `AWAIR_VESYNC_EMAIL` | *(unset)* | The VeSync account the humidifier is on. **Both this and the password, or the poller does not run.** Never logged. |
+| `AWAIR_VESYNC_PASSWORD` | *(unset)* | That account's password. Never logged — see [The humidifier feed](#the-humidifier-feed). |
+| `AWAIR_HUMIDIFIER_NAME` | *(unset)* | Which humidifier, when the account has more than one. With exactly one, leave it unset. |
+| `AWAIR_HUMIDIFIER_POLL_SECONDS` | `300` | Seconds between humidifier polls, and **the floor**: a smaller value is logged and raised to 300. VeSync rate-limits per account. |
+| `AWAIR_MAIN_ZONE_FEED` | `awair` | Which feed speaks for the main zone on the humidity card. Any name from `/health`. |
+| `AWAIR_HUMIDITY_TARGET` | `40` | Main-zone relative humidity target, in percent. |
+| `AWAIR_HUMIDITY_TARGET_COLD` | `35` | The target when it is very cold out. |
+| `AWAIR_HUMIDITY_COLD_OUTDOOR_C` | `-12` | Outdoor temperature (**°C**, about 10 °F) at or below which the cold target applies. |
 | `AWAIR_HEALTH_STALE_POLLS` | `6` | How many polls a feed may miss in a row before `GET /health` calls it stale. Multiplied by **each feed's own** `*_POLL_SECONDS`, so one number here is four different windows. See [Is it still recording?](#is-it-still-recording) |
 | `AWAIR_WEB_SLOW_MS` | `1000` | Dashboard requests at or above this many milliseconds log at `WARNING` instead of `INFO`. See [Response times](#response-times). |
 
@@ -200,6 +214,16 @@ ingestion, so a wrong URL or 401 just gets logged.)
   24h median for 4 consecutive polls); tier 2 is a hard ceiling (CO2 > 1200,
   TVOC > 1000, PM2.5 > 35 for 2 polls). Hysteresis prevents flapping. See
   [SCOPE.md → "Spike Detection"](SCOPE.md) for the full math and tunables.
+- **The humidifier's own state** (#161) — one row per 5-minute poll of the
+  Levoit Superior 6000S on VeSync: its humidity and temperature, the target
+  it is set to, mist level, mode, on/off, water-empty, tank-lifted and filter
+  life. Optional, and absent cleanly: see [The humidifier feed](#the-humidifier-feed).
+- **A dew point per place, and a humidity target** (#161) — the great room's
+  humidity against 40% (35% when it is very cold out), with the humidifier's
+  own reading and the dining head's beside it, the stretches the humidifier
+  spent off or dry shaded, and hours below target over the last week. Plus a
+  dew point for every place that records a temperature and a humidity, which
+  is what lets a warm room be compared with a cool one.
 - **Device health alerts** — 10 consecutive fetch failures fire an
   "unreachable" event; 10 polls with an unchanged device timestamp fire a
   "stale" event (the wedged-but-HTTP-200 failure mode after some firmware
@@ -207,8 +231,9 @@ ingestion, so a wrong URL or 401 just gets logged.)
 - **Dashboard** — small multiples for CO2, TVOC, PM2.5, temp, humidity, and
   score over today, 7d or 30d, opening on today (#108). "Today" is since local
   midnight, not the last 24 h. Detected events overlay as shaded spans.
-  LAN-only by default (no auth). Three cards beside those six: the composite
-  precipitation/pressure card (#42) and the two **room** cards (#156).
+  LAN-only by default (no auth). Five cards beside those six: the composite
+  precipitation/pressure card (#42), the two **room** cards (#156), and the
+  **Main zone humidity** and **Dew point** cards (#161).
 - **Each card's range peak** (#116) — the header carries two numbers: the
   current reading, and `peak N`, the highest single reading over the range on
   screen. It exists because the card previously had no way to tell you that.
@@ -485,6 +510,7 @@ restated:
 | Awair Element | 30 s | 3 min |
 | basement sensor | 60 s | 6 min |
 | each mini split head | 300 s | 30 min |
+| humidifier | 300 s | 30 min |
 | outdoor weather | 900 s | 90 min |
 
 Six, and this repo's own numbers bracket it. Below it, the carry-forward
@@ -496,6 +522,25 @@ margin than a gap in a chart. Above it, the pollers' own ntfy alerting fires at
 needs: `minisplit.MAX_REPORT_WINDOW_SECONDS` is 800, so the bridge can
 legitimately leave 800 s between two rows, and two or three polls would call a
 healthy bridge dead.
+
+**One feed is allowed to be absent.** The humidifier needs a VeSync login
+this repo does not hold, so a box without one would otherwise fail its own
+deploy check for ever. `awair.feeds` marks that feed `optional`, and the rule
+is drawn on the **database**: a table that has *never* held a row reads as
+`not_configured` and is listed separately from `stale`, where a table that
+has rows and has gone quiet is as red as any other feed. One row, ever, moves
+it into the ordinary rules permanently.
+
+The rule is deliberately not "is `AWAIR_VESYNC_EMAIL` set in the web worker's
+environment". That variable says nothing about whether the humidifier unit is
+installed, enabled or running — and on a box where somebody set it and never
+installed the unit, it would fail the deploy for ever with no poller to fix.
+Rows on disk are the only evidence either process has that a feed is real.
+The blind spot that leaves, stated rather than hidden: a humidifier that *is*
+configured and has never managed one successful poll reads as not set up.
+Its own unit logs a clear line every poll, and
+`systemctl --user status awairelement-humidifier` is where that case is
+answerable.
 
 Two consequences worth knowing before the first 503:
 
@@ -512,9 +557,114 @@ Two consequences worth knowing before the first 503:
   templated in the homelab repo.
 
 
+## The humidifier feed
+
+The main floor's humidifier is a **Levoit Superior 6000S** on a VeSync
+account, and this records what it is doing: its own humidity and temperature,
+the target it is set to, mist level, mode, whether it is on, whether the tank
+is empty or lifted out, and filter life. One row per poll in
+`humidifier_readings`, deduplicated on the poll-minute the way the basement
+feed is — the device's state carries no clock of its own.
+
+Nothing here **changes** a humidifier setting. That is a later job (#160) and
+probably a different repo.
+
+```bash
+export AWAIR_VESYNC_EMAIL="you@example.com"
+export AWAIR_VESYNC_PASSWORD="…"          # never logged; see below
+uv run python -m awair.humidifier
+```
+
+**Both variables or nothing.** With either one missing the poller writes one
+line naming the two variables and exits 0, before it opens the database or
+imports `pyvesync`. That is a normal state — four of the five feeds are local
+and configuration-free — which is why its unit is the one that says
+`Restart=on-failure` rather than `Restart=always`, and why `/health` reports
+the feed as *not configured* rather than red.
+
+**Neither credential reaches a log line**, and that is enforced rather than
+intended. `pyvesync`'s own redaction stays on (`VeSync(redact=True)`, its
+default, which blanks `"email"` and `"password"` out of a debug-level request
+dump), and on top of it this poller installs a filter on the root logger's
+handlers that replaces either value with `##_REDACTED_##` anywhere in any
+record — including records the library writes, and including a traceback.
+Two guards because the one that is only a default is the one an upgrade can
+move. `tests/test_humidifier.py::test_no_log_line_anywhere_carries_either_credential`
+drives a whole poll cycle — a successful read, a device error, and a login
+failure whose *message* contains the password — through the real filter and
+asserts neither value survives.
+
+**Five minutes, and a back-off.** The cadence is `AWAIR_HUMIDIFIER_POLL_SECONDS`
+(default 300) and 300 is also the floor: a smaller value is logged and raised,
+because the limit here is somebody else's — VeSync rate-limits per account,
+and this process shares that account with every phone in the house. When the
+library reports a rate limit the poller doubles its wait (600 s, 1200 s,
+2400 s, capped at an hour) and resets on the first good poll. Only a quota
+refusal does that: a timeout or a server error costs one poll at the ordinary
+cadence, like every other feed here.
+
+**It runs in its own process, not a thread.** `pyvesync` 3.x is async-only
+and the other four pollers are plain blocking loops. A fifth process keeps
+the two shapes apart — a hung cloud read cannot stall a local feed, and vice
+versa — and the only bridge needed is the stop signal, which crosses with
+`asyncio.to_thread(stop.wait, delay)` so one clean-shutdown contract serves
+both. `pyvesync` is imported **lazily**, inside the poll loop, through
+`awair.vesync`: `awair.feeds` reads this poller's cadence and the Flask app
+imports `awair.feeds`, so a module-scope import would load an async HTTP
+stack into both gunicorn workers and four pollers that never make a VeSync
+call.
+
+### Moisture, not just humidity
+
+Relative humidity cannot be compared between two rooms at two temperatures.
+The wood stove lowers the great room's reading mostly by *heating the air* —
+the same water vapour fills a smaller fraction of what warm air could hold —
+so 35 % in a 23 °C great room and 45 % in a 16 °C basement are close to the
+same amount of water. **Dew point** can be compared: it moves when the
+moisture moves and stays put when only the heat does.
+
+So the dashboard computes one, from one formula, for every place that records
+both a temperature and a humidity — the Awair, the basement, each mini split
+head, the humidifier, outdoors — and draws them on one card. The Awair
+publishes its own `dew_point` and it is deliberately **not** what that card
+draws: six places read against six formulas would not be a comparison. The
+gap between the two is measured rather than assumed
+(`tests/test_dewpoint.py::test_the_devices_own_dew_point_agrees_with_ours`).
+
+### The main zone against a target
+
+`AWAIR_MAIN_ZONE_FEED` (default `awair`) names the feed that speaks for the
+great room. The Main zone card draws that sensor's humidity against the
+target — `AWAIR_HUMIDITY_TARGET`, 40 %, dropping to
+`AWAIR_HUMIDITY_TARGET_COLD`, 35 %, when it is at or below
+`AWAIR_HUMIDITY_COLD_OUTDOOR_C` (−12 °C, about 10 °F) outside, because indoor
+moisture condenses on the coldest window in the room and a cold pane cannot
+carry 40 %. The dashed target line **steps** where the weather crosses that
+threshold; with no outdoor reading it holds the warm target, so a dead
+outdoor poller cannot quietly relax it.
+
+Three sensors are drawn because three sensors are in that one room and they
+disagree. The Awair sits high above the fireplace, so it reads warmer than
+living level and therefore a lower relative humidity for the same moisture;
+the humidifier reads at the floor; the dining mini split head reads at head
+height. Their three dew points are printed side by side under the card's
+header — in one open room those should roughly agree even when the
+humidities do not, and a standing gap between them is worth seeing.
+
+Stretches where the humidifier was **off** (grey) or **out of water or had
+its tank lifted out** (red) are shaded, so a sag in the trace can be read as
+a refill or as a setting. A humidifier reporting nothing at all is unshaded:
+"we could not read it" is not "it was off".
+
+The card's other number is **hours below target in the last seven days**,
+always that window whatever range button is pressed. It counts only time
+there are readings for — a gap wider than the feed's own staleness window
+contributes nothing — so it is a floor rather than an estimate, which is the
+right direction for a figure a human reads as "how bad was last week".
+
 ## Running as a systemd user service
 
-The `systemd/` directory ships five unit files you can drop into
+The `systemd/` directory ships six unit files you can drop into
 `~/.config/systemd/user/`. They assume the checkout lives at
 `~/sources/awairelement` and read environment from
 `~/.config/awairelement/environment`.
@@ -528,6 +678,10 @@ ln -sf "$PWD/systemd/awairelement-web.service"   ~/.config/systemd/user/
 ln -sf "$PWD/systemd/awairelement-outdoor.service"   ~/.config/systemd/user/
 ln -sf "$PWD/systemd/awairelement-minisplit.service" ~/.config/systemd/user/
 ln -sf "$PWD/systemd/awairelement-basement.service"  ~/.config/systemd/user/
+# The humidifier one needs AWAIR_VESYNC_EMAIL and AWAIR_VESYNC_PASSWORD, and
+# is the one unit with Restart=on-failure rather than Restart=always: with no
+# login it exits 0 on purpose, and `always` would make that a crash loop.
+ln -sf "$PWD/systemd/awairelement-humidifier.service" ~/.config/systemd/user/
 
 cat > ~/.config/awairelement/environment <<'EOF'
 AWAIR_URL=http://192.168.1.42/air-data/latest
@@ -733,6 +887,10 @@ awair/
 ├── series.py    # server-side bucketing for the dashboard
 ├── minisplit.py # the mini split feed: one row per head per bridge cycle
 ├── basement.py  # the basement ESPHome sensor: one row per poll-minute
+├── humidifier.py # the humidifier feed: one row per poll, VeSync-free
+├── vesync.py    # the only module that imports pyvesync: log in, read the device
+├── dewpoint.py  # dew point from a temperature and a humidity (pure functions)
+├── main_zone.py # the humidity target, the zone's sensor, hours below target
 ├── units.py     # temperature conversion, in both directions
 ├── timing.py    # one log line + a Server-Timing header per web request
 ├── feeds.py     # what `/health` checks: one entry per recorded feed
